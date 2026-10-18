@@ -226,6 +226,53 @@ func TestStaticStageCanvasReusedAcrossFlightFrames(t *testing.T) {
 	}
 }
 
+func TestStageCanvasResizesWithWindowAndDPI(t *testing.T) {
+	now := time.Now()
+	store := routing.NewStore()
+	store.ApplyActive([]routing.LiveRequest{{
+		ID: 19, Agent: "codex", Provider: "qoder", RouteID: 1710,
+		Started: now, Millis: 600,
+	}})
+	model, _ := testModel(t, store.Snapshot(), Actions{})
+	tester := render(t, model, 1000, 760)
+	model.mu.RLock()
+	before := model.topology.stageCanvas
+	beforeW, beforeH := model.topology.stageCanvasW, model.topology.stageCanvasH
+	model.mu.RUnlock()
+	if before == nil || beforeW <= 0 || beforeH != 258 {
+		t.Fatalf("initial canvas = %v (%dx%d), want the stage card raster", before != nil, beforeW, beforeH)
+	}
+
+	tester.SetSize(1240, 900)
+	tester.Frame()
+	model.mu.RLock()
+	afterResize := model.topology.stageCanvas
+	resizedW, resizedH := model.topology.stageCanvasW, model.topology.stageCanvasH
+	model.mu.RUnlock()
+	if afterResize == before {
+		t.Fatal("window resize reused a canvas with the old raster size")
+	}
+	if resizedW <= beforeW || resizedH != beforeH {
+		t.Fatalf("resized canvas = %dx%d, want wider than %dx%d", resizedW, resizedH, beforeW, beforeH)
+	}
+	if gotW, gotH := afterResize.Size(); gotW != resizedW || gotH != resizedH {
+		t.Fatalf("actual canvas bitmap = %dx%d, tracked %dx%d", gotW, gotH, resizedW, resizedH)
+	}
+
+	tester.SetScale(2)
+	tester.Frame()
+	model.mu.RLock()
+	afterScale := model.topology.stageCanvas
+	scaledW, scaledH := model.topology.stageCanvasW, model.topology.stageCanvasH
+	model.mu.RUnlock()
+	if afterScale == afterResize {
+		t.Fatal("DPI change reused a canvas rendered for the old scale")
+	}
+	if scaledW != resizedW*2 || scaledH != resizedH*2 {
+		t.Fatalf("High-DPI canvas = %dx%d, want %dx%d", scaledW, scaledH, resizedW*2, resizedH*2)
+	}
+}
+
 func TestFlightPathSamplesByArcLength(t *testing.T) {
 	path := newFlightPath([]flightPoint{
 		{0, 0}, {100, 0}, {100, 10},
@@ -392,6 +439,76 @@ func TestStageCanvasMatchesHighDPIRaster(t *testing.T) {
 	}
 }
 
+func TestFlightGeometryCachesOutboundAndInboundPaths(t *testing.T) {
+	stage := flightStage{
+		agents: []nodeBox{{x: 10, y: 20, w: 124, h: 78}, {x: 10, y: 110, w: 124, h: 78}},
+		hub:    nodeBox{x: 200, y: 80, w: 124, h: 98},
+		accounts: []providerNode{
+			{Provider: "one"}, {Provider: "two"},
+		},
+		rows: []nodeBox{{x: 390, y: 30, w: 220, h: 44}, {x: 390, y: 90, w: 220, h: 44}},
+	}
+	first := newFlightGeometry(stage)
+	pathA := first.outboundPath(0, 0)
+	pathB := first.outboundPath(0, 0)
+	if pathA.length() <= 0 || pathA.length() != pathB.length() {
+		t.Fatalf("outbound cache returned inconsistent paths: %v vs %v", pathA.length(), pathB.length())
+	}
+	if &pathA.pts[0] != &pathB.pts[0] {
+		t.Fatal("outbound path was rebuilt within the same layout")
+	}
+	inboundA := first.inboundPath(0, 0)
+	inboundB := first.inboundPath(0, 0)
+	if &inboundA.pts[0] != &inboundB.pts[0] {
+		t.Fatal("inbound path was rebuilt within the same layout")
+	}
+
+	moved := stage
+	moved.agents = append([]nodeBox(nil), stage.agents...)
+	moved.agents[0].y += 10
+	if newFlightGeometry(moved).key == first.key {
+		t.Fatal("node movement did not invalidate the geometry key")
+	}
+}
+
+func TestActiveReplayWindowsIncludesReturnOnlyInterval(t *testing.T) {
+	windows := []replayFlightWindow{
+		{routeID: 1, start: 0, end: 1000 * time.Millisecond},
+		{routeID: 2, start: 500 * time.Millisecond, end: 5000 * time.Millisecond},
+		{routeID: 3, start: 2000 * time.Millisecond, end: 3000 * time.Millisecond},
+	}
+	ends := replayWindowEnds(windows)
+	active := activeReplayWindows(windows, ends, 3500*time.Millisecond)
+	if len(active) != 1 || active[0].routeID != 2 {
+		t.Fatalf("windows at 3.5s = %+v, want only route 2", active)
+	}
+	active = activeReplayWindows(windows, ends, 1500*time.Millisecond)
+	if len(active) != 1 || active[0].routeID != 2 {
+		t.Fatalf("windows at 1.5s = %+v, want route 2", active)
+	}
+	active = activeReplayWindows(windows, ends, 2500*time.Millisecond)
+	if len(active) != 2 || active[0].routeID != 2 || active[1].routeID != 3 {
+		t.Fatalf("windows at 2.5s = %+v, want routes 2 and 3", active)
+	}
+	if active := activeReplayWindows(windows, ends, 6000*time.Millisecond); len(active) != 0 {
+		t.Fatalf("windows after the timeline = %+v, want none", active)
+	}
+}
+
+func TestReplayWithoutTriesDoesNotSynthesizeFlight(t *testing.T) {
+	start := time.Date(2026, 10, 19, 4, 0, 0, 0, time.UTC)
+	routes := []routing.RouteView{{Route: routing.Route{
+		ID: 91, Time: start, Agent: "codex", Model: "qoder/model",
+		Provider: "qoder", Done: true, Status: 200, Millis: 2000,
+		HistoryDay: "2026-10-19",
+	}}}
+	timeline := routing.BuildDayReplay(routes, "2026-10-19")
+	windows := buildReplayFlightWindows(timeline, routes)
+	if len(windows) != 0 {
+		t.Fatalf("a trace without tries created flight windows: %+v", windows)
+	}
+}
+
 func TestTraceFlightAttemptsFollowRecordedOrder(t *testing.T) {
 	start := time.Date(2026, 10, 19, 1, 0, 0, 0, time.UTC)
 	rv := routing.RouteView{Route: routing.Route{
@@ -437,6 +554,10 @@ func TestReplayFlightPausesWithReplayClock(t *testing.T) {
 	store.ReplaceHistory([]routing.Route{{
 		ID: 77, Time: start, Agent: "codex", Model: "qoder/model",
 		Provider: "qoder", Done: true, Status: 200, Millis: 2000,
+		Tries: []routing.Try{{
+			ID: "qoder", Model: "qoder/model", Start: start,
+			Millis: 2000, Status: 200, Done: true,
+		}},
 	}})
 	model, _ := testModel(t, store.Snapshot(), Actions{})
 	model.setTab(tabHistory)
@@ -445,6 +566,9 @@ func TestReplayFlightPausesWithReplayClock(t *testing.T) {
 	model.replay.loaded = true
 	model.replay.builtKey = "test"
 	model.replay.timeline = routing.BuildDayReplay(store.Snapshot().Routes, model.historyDay)
+	routes := store.Snapshot().Routes
+	model.replay.windows = buildReplayFlightWindows(model.replay.timeline, routes)
+	model.replay.windowEnds = replayWindowEnds(model.replay.windows)
 	model.replay.position = 500 * time.Millisecond
 	model.replay.playing = false
 	model.mu.Unlock()
@@ -453,6 +577,112 @@ func TestReplayFlightPausesWithReplayClock(t *testing.T) {
 	if tester.FramePending() {
 		t.Fatal("a paused history replay requested animation frames")
 	}
+}
+
+func TestReplaySeekIntoReturnRebuildsInboundFlight(t *testing.T) {
+	start := time.Date(2026, 10, 19, 3, 0, 0, 0, time.UTC)
+	route := routing.Route{
+		ID: 88, Time: start, Agent: "claude", Model: "qoder/model",
+		Provider: "qoder", Done: true, Status: 200, Millis: 2000,
+		HistoryDay: start.Format("2006-01-02"),
+		Tries: []routing.Try{{
+			ID: "qoder", Model: "qoder/model", Start: start,
+			Millis: 2000, Status: 200, Done: true,
+		}},
+	}
+	store := routing.NewStore()
+	store.ReplaceHistory([]routing.Route{route})
+	model, _ := testModel(t, store.Snapshot(), Actions{})
+	model.setTab(tabHistory)
+	model.SetHistoryDay(start.Format("2006-01-02"))
+	tester := render(t, model, 1240, 900)
+	routes := store.Snapshot().Routes
+	attempts, total := traceFlightAttempts(routes[0])
+	phases := buildFlightPhases(attempts, total, true)
+	inbound := phases[len(phases)-1]
+	if inbound.kind != flightInbound {
+		t.Fatalf("last phase = %+v, want inbound", inbound)
+	}
+	position := time.Duration(route.Millis)*time.Millisecond + 200*time.Millisecond
+	if position <= total || position >= flightPhaseEnd(phases) {
+		t.Fatalf("seek position %v is not inside return leg %v..%v", position, total, flightPhaseEnd(phases))
+	}
+	model.seekReplay(position.Seconds())
+	tester.Frame()
+	model.mu.RLock()
+	flights := append([]flightTrack(nil), model.topology.flights...)
+	model.mu.RUnlock()
+	if len(flights) != 1 {
+		t.Fatalf("direct seek reconstructed %d flights, want 1", len(flights))
+	}
+	track := flights[0]
+	moment := flightMomentAt(track, start.Add(position))
+	if track.routeID != route.ID || !track.done || moment.phase.kind != flightInbound {
+		t.Fatalf("direct seek flight = %+v, moment = %+v; want inbound for route %d", track, moment, route.ID)
+	}
+	stage, active := model.replayTopologyState()
+	if !active || len(stage.routes) != 1 || stage.routes[0].ID != route.ID {
+		t.Fatalf("seek stage = %+v, active=%v; want route %d", stage.routes, active, route.ID)
+	}
+	if !tester.HasText("Claude Code") || tester.FramePending() {
+		t.Fatalf("paused seek rendered an unaddressable or animating stage: texts=%v pending=%v", tester.Texts(), tester.FramePending())
+	}
+}
+
+func TestRoutingStageKeepsAllConcurrentNodes(t *testing.T) {
+	now := time.Now()
+	store := routing.NewStore()
+	active := make([]routing.LiveRequest, 0, 8)
+	for i := 0; i < 8; i++ {
+		active = append(active, routing.LiveRequest{
+			ID: int64(100 + i), Agent: "agent-" + itoa(i),
+			Provider: "provider-" + itoa(i), Model: "provider-" + itoa(i) + "/model",
+			RouteID: int64(200 + i), Started: now, Millis: 600,
+		})
+	}
+	store.ApplyActive(active)
+	model, _ := testModel(t, store.Snapshot(), Actions{})
+	replay, replayActive := model.replayTopologyState()
+	agents := model.stageAgents(model.snapshot(), routing.RouteView{}, false, nil, replay, replayActive)
+	rows := model.stageAccountRows(routing.RouteView{}, false, model.snapshot().Live, nil, replayActive)
+	if len(agents) != len(active) {
+		t.Fatalf("stage agents = %d, want all %d concurrent agents", len(agents), len(active))
+	}
+	if len(rows) != len(active) {
+		t.Fatalf("stage rows = %d, want all %d concurrent providers", len(rows), len(active))
+	}
+	height := model.routingStageHeight(model.snapshot(), nil, routing.RouteView{}, false, now)
+	if height <= routingStageMinHeight {
+		t.Fatalf("stage height = %v, want growth for concurrent nodes", height)
+	}
+	tester := render(t, model, 1240, 1200)
+	model.mu.RLock()
+	canvasH := model.topology.stageCanvasH
+	model.mu.RUnlock()
+	if canvasH < int(height) {
+		t.Fatalf("stage canvas height = %d, want at least %.0f for all concurrent nodes", canvasH, height)
+	}
+
+	model.syncFlightTracks(model.snapshot(), model.snapshot().Routes, now)
+	model.mu.RLock()
+	flights := append([]flightTrack(nil), model.topology.flights...)
+	model.mu.RUnlock()
+	if len(flights) != len(active) {
+		t.Fatalf("flight tracks = %d, want %d", len(flights), len(active))
+	}
+	stage := layoutRoutingStage(ui.Rect{W: 900, H: height}, agents, rows)
+	for _, flight := range flights {
+		if indexAgentNode(agents, flight.agent) < 0 {
+			t.Errorf("active flight agent %q has no node", flight.agent)
+		}
+		if indexProviderNode(rows, flight.provider) < 0 {
+			t.Errorf("active flight provider %q has no node", flight.provider)
+		}
+	}
+	if len(stage.agents) != len(agents) || len(stage.rows) != len(rows) {
+		t.Fatalf("stage layout dropped nodes: %d agents, %d rows", len(stage.agents), len(stage.rows))
+	}
+	_ = tester
 }
 
 func TestCompletedHistoryShowsOrderTriesAndProvenance(t *testing.T) {

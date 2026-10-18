@@ -18,7 +18,6 @@ func (m *Model) View(c *ui.Context) {
 	s := m.snapshot()
 	now := c.Now()
 	width, _ := c.Size()
-	m.trackTopology(s)
 	routes := m.visibleRoutes(s, m.tabKind() == tabHistory)
 	m.syncReplay(s, now)
 	m.syncFlightTracks(s, routes, now)
@@ -168,6 +167,7 @@ func (m *Model) routingStageCard(c *ui.Context, s routing.Snapshot, routes []rou
 	if ok {
 		title = firstNonEmpty(routeGroupName(sel), sel.Model)
 	}
+	stageHeight := m.routingStageHeight(s, routes, sel, ok, now)
 	ui.Column(c).Radius(14).Background(p.Panel).Border(1, p.Line).Clip().Children(func() {
 		// The original Routing card opens with a two-line explanation of
 		// the actual routing mode, never with a dashboard title.
@@ -180,13 +180,27 @@ func (m *Model) routingStageCard(c *ui.Context, s routing.Snapshot, routes []rou
 			})
 			ui.Text(c, detail).FontSize(12).TextColor(p.Muted)
 		})
-		ui.Box(c).Height(258).Padding(8, 16).Draw(func(pt *ui.Painter, r ui.Rect) {
+		ui.Box(c).Height(stageHeight).Padding(8, 16).Draw(func(pt *ui.Painter, r ui.Rect) {
 			m.drawRoutingStageCanvas(pt, r, s, routes, sel, ok, p, now, history)
 		})
 		if ok {
 			m.routingStory(c, sel, p, loc)
 		}
 	})
+}
+
+// routingStageHeight lets concurrent agents and accounts use the space they
+// need rather than being silently clipped. It mirrors stageAgents and
+// stageAccountRows, including the replay return window.
+func (m *Model) routingStageHeight(s routing.Snapshot, routes []routing.RouteView, sel routing.RouteView, hasSel bool, now time.Time) float32 {
+	_ = now
+	replay, replayActive := m.replayTopologyState()
+	agents := m.stageAgents(s, sel, hasSel, routes, replay, replayActive)
+	rows := m.stageAccountRows(sel, hasSel, s.Live, replay.routes, replayActive)
+	if len(rows) == 0 {
+		rows = []providerNode{{}}
+	}
+	return max(routingStageMinHeight, routingStageContentHeight(len(agents), len(rows))+routingStagePadding*2)
 }
 
 func boolColor(v bool, yes, no ui.Color) ui.Color {

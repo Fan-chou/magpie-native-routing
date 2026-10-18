@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -26,6 +27,8 @@ func (m *Model) syncReplay(s routing.Snapshot, now time.Time) {
 	if m.replay.builtKey != key {
 		next := routing.BuildDayReplay(routes, day)
 		next.Duration = max(next.Duration, replayPresentationDuration(next, routes))
+		m.replay.windows = buildReplayFlightWindows(next, routes)
+		m.replay.windowEnds = replayWindowEnds(m.replay.windows)
 		hadTimeline := m.replay.loaded && m.replay.builtKey != ""
 		oldPosition := m.replay.position
 		m.replay.timeline = next
@@ -53,6 +56,76 @@ func (m *Model) syncReplay(s routing.Snapshot, now time.Time) {
 	m.mu.Unlock()
 }
 
+// buildReplayFlightWindows records the exact presentation interval of each
+// route's animated flight. The recorded request may have ended while the
+// answer is still flying home, so the window extends through the inbound
+// phase. Seeking into that interval can therefore rebuild the return bird
+// without having played the route before.
+func buildReplayFlightWindows(tl routing.ReplayTimeline, routes []routing.RouteView) []replayFlightWindow {
+	windows := make([]replayFlightWindow, 0, len(routes))
+	for _, rv := range routes {
+		if rv.ID == 0 || rv.Time.IsZero() || !hasFlightAttempt(rv) {
+			continue
+		}
+		attempts, total := traceFlightAttempts(rv)
+		phases := buildFlightPhases(attempts, total, true)
+		if len(phases) == 0 {
+			continue
+		}
+		start := rv.Time.Sub(tl.Start)
+		if start < 0 {
+			start = 0
+		}
+		windows = append(windows, replayFlightWindow{
+			routeID: rv.ID,
+			start:   start,
+			end:     start + flightPhaseEnd(phases),
+		})
+	}
+	sort.SliceStable(windows, func(i, j int) bool {
+		if windows[i].start == windows[j].start {
+			return windows[i].routeID < windows[j].routeID
+		}
+		return windows[i].start < windows[j].start
+	})
+	return windows
+}
+
+func replayWindowEnds(windows []replayFlightWindow) []time.Duration {
+	ends := make([]time.Duration, len(windows))
+	var maxEnd time.Duration
+	for i, w := range windows {
+		maxEnd = max(maxEnd, w.end)
+		ends[i] = maxEnd
+	}
+	return ends
+}
+
+// activeReplayWindows returns every flight whose route-time window contains
+// position. The prefix maximum lets a backward scan stop as soon as no
+// earlier window can still be alive.
+func activeReplayWindows(windows []replayFlightWindow, prefixEnd []time.Duration, position time.Duration) []replayFlightWindow {
+	if len(windows) == 0 || len(prefixEnd) != len(windows) {
+		return nil
+	}
+	firstFuture := sort.Search(len(windows), func(i int) bool {
+		return windows[i].start > position
+	})
+	var out []replayFlightWindow
+	for i := firstFuture - 1; i >= 0; i-- {
+		if prefixEnd[i] < position {
+			break
+		}
+		if position >= windows[i].start && position <= windows[i].end {
+			out = append(out, windows[i])
+		}
+	}
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out
+}
+
 // replayPresentationDuration keeps the replay clock running until every
 // bird that the last request launched has landed. It extends presentation
 // time only; recorded route durations and the replay provenance label do not
@@ -63,7 +136,7 @@ func replayPresentationDuration(tl routing.ReplayTimeline, routes []routing.Rout
 		return end
 	}
 	for _, rv := range routes {
-		if rv.ID == 0 || rv.Time.IsZero() {
+		if rv.ID == 0 || rv.Time.IsZero() || !hasFlightAttempt(rv) {
 			continue
 		}
 		attempts, total := traceFlightAttempts(rv)
@@ -75,6 +148,13 @@ func replayPresentationDuration(tl routing.ReplayTimeline, routes []routing.Rout
 		end = max(end, at+flightPhaseEnd(phases))
 	}
 	return end
+}
+
+func hasFlightAttempt(rv routing.RouteView) bool {
+	if len(rv.Tries) > 0 {
+		return true
+	}
+	return rv.Active && !rv.Time.IsZero()
 }
 
 // replayOffset returns the exact elapsed time at which a Route ID begins.

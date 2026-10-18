@@ -83,62 +83,61 @@ type Model struct {
 }
 
 type replayController struct {
-	timeline  routing.ReplayTimeline
-	day       string
-	playing   bool
-	speed     float64
-	position  time.Duration
-	lastTick  time.Time
-	builtKey  string
-	loaded    bool
-	pendingID int64
+	timeline   routing.ReplayTimeline
+	day        string
+	playing    bool
+	speed      float64
+	position   time.Duration
+	lastTick   time.Time
+	builtKey   string
+	loaded     bool
+	pendingID  int64
+	windows    []replayFlightWindow
+	windowEnds []time.Duration
+}
+
+// replayFlightWindow is the presentation interval during which a recorded
+// route owns a bird. It starts at Route.Time and ends after the last inbound
+// presentation leg, so seeking directly into the return still rebuilds it.
+type replayFlightWindow struct {
+	routeID int64
+	start   time.Duration
+	end     time.Duration
 }
 
 type topologyState struct {
-	agentFlight      map[int64]*flightState
 	flights          []flightTrack
 	frameAt          time.Time
-	stageKey         string
-	lastSelectedID   int64
 	stageCanvas      *ui.Canvas
 	stageCanvasKey   string
 	stageCanvasW     int
 	stageCanvasH     int
 	stageCanvasScale float32
+	flightGeometry   *flightGeometry
 	reduceMotion     bool
-	birdY            springValue
-	birdAlpha        springValue
-	lastVersion      uint64
 	layout           topologyFrameLayout
-}
-
-type flightState struct {
-	started time.Time
-	leg     int
-	legAt   time.Time
-	done    bool
 }
 
 // flightTrack is deliberately UI-only animation state. Its route id is the
 // exact Magpie Route ID and every timing input comes from the observed route.
 // It never creates a request that is absent from the snapshot.
 type flightTrack struct {
-	routeID     int64
-	agent       string
-	provider    string
-	firstSeen   time.Time
-	lastSeen    time.Time
-	removedAt   time.Time
-	doneAt      time.Time
-	returnDur   time.Duration
-	observed    time.Duration
-	total       time.Duration
-	attempts    []flightAttempt
-	phases      []flightPhase
-	flightStart time.Duration
-	inReplay    bool
-	failed      bool
-	done        bool
+	routeID   int64
+	agent     string
+	model     string
+	provider  string
+	firstSeen time.Time
+	lastSeen  time.Time
+	removedAt time.Time
+	doneAt    time.Time
+	returnDur time.Duration
+	observed  time.Duration
+	total     time.Duration
+	attempts  []flightAttempt
+	phases    []flightPhase
+	inReplay  bool
+	failed    bool
+	done      bool
 }
 
 // flightAttempt is the geometry-independent part of one recorded attempt.
@@ -183,7 +182,7 @@ func NewModel(store *routing.Store, settings config.AppSettings, paths config.Pa
 		draftURL: settings.GatewayURL, draftKey: settings.APIKey,
 		draftDataDir: settings.MagpieDir, draftTheme: settings.Theme,
 		draftLang:    settings.Language,
-		topology:     topologyState{agentFlight: map[int64]*flightState{}},
+		topology:     topologyState{},
 		splitPercent: 58,
 		requestSel:   -1,
 	}
