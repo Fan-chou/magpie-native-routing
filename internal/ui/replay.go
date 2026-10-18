@@ -25,6 +25,9 @@ func (m *Model) syncReplay(s routing.Snapshot, now time.Time) {
 	m.mu.Lock()
 	if m.replay.builtKey != key {
 		next := routing.BuildDayReplay(routes, day)
+		next.Duration = max(next.Duration, replayPresentationDuration(next, routes))
+		hadTimeline := m.replay.loaded && m.replay.builtKey != ""
+		oldPosition := m.replay.position
 		m.replay.timeline = next
 		if m.replay.playing && m.replay.position > next.Duration {
 			m.replay.position = 0
@@ -35,8 +38,62 @@ func (m *Model) syncReplay(s routing.Snapshot, now time.Time) {
 		if m.replay.position > m.replay.timeline.Duration {
 			m.replay.position = 0
 		}
+		if m.replay.pendingID != 0 {
+			offset := replayOffset(next, m.replay.pendingID)
+			m.replay.position = offset
+			m.replay.playing = false
+			m.replay.lastTick = time.Time{}
+			m.replay.pendingID = 0
+		} else if !hadTimeline {
+			m.replay.position = 0
+		} else if oldPosition < next.Duration {
+			m.replay.position = oldPosition
+		}
 	}
 	m.mu.Unlock()
+}
+
+// replayPresentationDuration keeps the replay clock running until every
+// bird that the last request launched has landed. It extends presentation
+// time only; recorded route durations and the replay provenance label do not
+// change.
+func replayPresentationDuration(tl routing.ReplayTimeline, routes []routing.RouteView) time.Duration {
+	end := tl.Duration
+	if tl.Start.IsZero() {
+		return end
+	}
+	for _, rv := range routes {
+		if rv.ID == 0 || rv.Time.IsZero() {
+			continue
+		}
+		attempts, total := traceFlightAttempts(rv)
+		phases := buildFlightPhases(attempts, total, true)
+		at := rv.Time.Sub(tl.Start)
+		if at < 0 {
+			at = 0
+		}
+		end = max(end, at+flightPhaseEnd(phases))
+	}
+	return end
+}
+
+// replayOffset returns the exact elapsed time at which a Route ID begins.
+// It returns zero only when that route is not in this completed day.
+func replayOffset(tl routing.ReplayTimeline, id int64) time.Duration {
+	for _, r := range tl.Routes {
+		if r.ID != id || r.Time.IsZero() || tl.Start.IsZero() {
+			continue
+		}
+		offset := r.Time.Sub(tl.Start)
+		if offset < 0 {
+			return 0
+		}
+		if tl.Duration > 0 && offset > tl.Duration {
+			return tl.Duration
+		}
+		return offset
+	}
+	return 0
 }
 
 func replaySource(s routing.Snapshot, day string, f routing.RouteFilter) (string, []routing.RouteView) {

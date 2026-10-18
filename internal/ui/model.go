@@ -83,22 +83,33 @@ type Model struct {
 }
 
 type replayController struct {
-	timeline routing.ReplayTimeline
-	day      string
-	playing  bool
-	speed    float64
-	position time.Duration
-	lastTick time.Time
-	builtKey string
-	loaded   bool
+	timeline  routing.ReplayTimeline
+	day       string
+	playing   bool
+	speed     float64
+	position  time.Duration
+	lastTick  time.Time
+	builtKey  string
+	loaded    bool
+	pendingID int64
 }
 
 type topologyState struct {
-	agentFlight map[int64]*flightState
-	birdY       springValue
-	birdAlpha   springValue
-	lastVersion uint64
-	layout      topologyFrameLayout
+	agentFlight      map[int64]*flightState
+	flights          []flightTrack
+	frameAt          time.Time
+	stageKey         string
+	lastSelectedID   int64
+	stageCanvas      *ui.Canvas
+	stageCanvasKey   string
+	stageCanvasW     int
+	stageCanvasH     int
+	stageCanvasScale float32
+	reduceMotion     bool
+	birdY            springValue
+	birdAlpha        springValue
+	lastVersion      uint64
+	layout           topologyFrameLayout
 }
 
 type flightState struct {
@@ -106,6 +117,61 @@ type flightState struct {
 	leg     int
 	legAt   time.Time
 	done    bool
+}
+
+// flightTrack is deliberately UI-only animation state. Its route id is the
+// exact Magpie Route ID and every timing input comes from the observed route.
+// It never creates a request that is absent from the snapshot.
+type flightTrack struct {
+	routeID     int64
+	agent       string
+	provider    string
+	firstSeen   time.Time
+	lastSeen    time.Time
+	removedAt   time.Time
+	doneAt      time.Time
+	returnDur   time.Duration
+	observed    time.Duration
+	total       time.Duration
+	attempts    []flightAttempt
+	phases      []flightPhase
+	flightStart time.Duration
+	inReplay    bool
+	failed      bool
+	done        bool
+}
+
+// flightAttempt is the geometry-independent part of one recorded attempt.
+// Times are relative to the route's start and come from Try.Start/Millis;
+// the painter maps the provider name to the account row currently on screen.
+type flightAttempt struct {
+	provider string
+	start    time.Duration
+	end      time.Duration
+	failed   bool
+	done     bool
+}
+
+type flightPhaseKind uint8
+
+const (
+	flightOutbound flightPhaseKind = iota
+	flightHold
+	flightRetryBack
+	flightRetryOut
+	flightInbound
+)
+
+// flightPhase is a presentation interval ordered from the recorded attempts.
+// Travel legs use short animation durations; the time left over is spent at
+// the account, preserving the real ordering and relative attempt lengths.
+type flightPhase struct {
+	kind     flightPhaseKind
+	provider string
+	start    time.Duration
+	end      time.Duration
+	failed   bool
+	final    bool
 }
 
 // NewModel constructs the native presentation model.
@@ -162,6 +228,28 @@ func (m *Model) SetHistoryDay(day string) {
 	if m.replay.day != day {
 		m.replay = replayController{speed: 1, day: day}
 	}
+	m.mu.Unlock()
+}
+
+// PlayRoute switches to the completed history, selects the exact Route ID
+// and positions the real timeline at that request's recorded start. It is
+// used by the story's Replay action; it never fabricates a timestamp.
+func (m *Model) PlayRoute(day string, id int64) {
+	m.mu.Lock()
+	if day != "" {
+		m.historyDay = day
+	}
+	if id != 0 {
+		m.selectedID = id
+		m.pinnedID = id
+		m.syncListSel = true
+	}
+	m.tab = tabHistory
+	if m.replay.day != day {
+		m.replay = replayController{speed: 1, day: day}
+	}
+	m.replay.pendingID = id
+	m.replay.loaded = false
 	m.mu.Unlock()
 }
 
@@ -531,17 +619,28 @@ func agentName(id string) string {
 func agentHue(id string) ui.Color {
 	switch strings.ToLower(id) {
 	case "codex":
-		return ui.Hex("#2b9b77")
+		return ui.Hex("#6366f1")
 	case "claude":
-		return ui.Hex("#c47846")
+		return ui.Hex("#d97757")
+	case "gemini":
+		return ui.Hex("#0ea5e9")
+	case "copilot":
+		return ui.Hex("#a855f7")
 	case "opencode":
-		return ui.Hex("#3f7fc2")
+		return ui.Hex("#eab308")
 	case "cursor":
-		return ui.Hex("#6a7d8f")
+		return ui.Hex("#14b8a6")
+	case "crush":
+		return ui.Hex("#ec4899")
+	case "goose":
+		return ui.Hex("#84cc16")
+	case "pi":
+		return ui.Hex("#10b981")
 	}
 	colors := []ui.Color{
-		ui.Hex("#2b9b77"), ui.Hex("#6f70c9"), ui.Hex("#c47846"),
-		ui.Hex("#2f8ea0"), ui.Hex("#9b6bb5"), ui.Hex("#7a8e3b"),
+		ui.Hex("#8b5cf6"), ui.Hex("#22c55e"), ui.Hex("#0d9488"),
+		ui.Hex("#0891b2"), ui.Hex("#ca8a04"), ui.Hex("#db2777"),
+		ui.Hex("#2563eb"), ui.Hex("#65a30d"),
 	}
 	var n uint32
 	for _, r := range id {
@@ -558,13 +657,22 @@ func providerRows(r routing.RouteView, hidden bool) []providerNode {
 	var out []providerNode
 	seen := map[string]int{}
 	add := func(provider, name, who, model, plan, status, note string, weight string, current, failed bool) {
-		key := strings.ToLower(strings.Join([]string{provider, name, who, model}, "\x00"))
+		// Fold rows for the same provider and model (the gateway may expose
+		// the candidate order and a try separately). Accounts of the same
+		// provider serving different models stay separate.
+		key := strings.ToLower(strings.Join([]string{provider, model}, "\x00"))
 		if i, ok := seen[key]; ok {
 			if current {
 				out[i].Current = true
 			}
 			if failed {
 				out[i].Failed = true
+			}
+			if status != "" {
+				out[i].Status = status
+			}
+			if note != "" {
+				out[i].Note = note
 			}
 			return
 		}
@@ -602,9 +710,21 @@ func providerRows(r routing.RouteView, hidden bool) []providerNode {
 			note = "barred"
 		}
 		add(provider, name, w.Who, w.Model, w.Plan, status, note, w.Fixed, current, failed)
+		if len(out) > i {
+			out[i].Fallback = w.Fallback
+			out[i].Rest = w.Rest != nil
+			out[i].Answered = i < len(r.Tries) && r.Tries[i].Done && !tryFailed(r.Tries[i])
+			out[i].WentOn = i < len(r.Tries) && r.Tries[i].Done && tryFailed(r.Tries[i]) && i+1 < len(r.Tries)
+		}
 	}
 	for _, tr := range r.Tries {
 		provider := providerOf(tr.Model)
+		if provider == "" {
+			provider = tr.ID
+		}
+		if len(r.Order) > 0 && providerMatchesOrder(r.Order, provider, tr.Model) {
+			continue
+		}
 		status := tryStatus(tr)
 		add(provider, provider, "", tr.Model, "", status, routing.TryFailure(tr), "",
 			r.Active && !tr.Done && !tryFailed(tr), tryFailed(tr))
@@ -622,13 +742,26 @@ func providerRows(r routing.RouteView, hidden bool) []providerNode {
 				r.Active, r.Status >= 400 || r.Error != "")
 		}
 	}
-	if len(r.Live) > 0 && out == nil {
+	if len(r.Live) > 0 && len(out) == 0 {
 		for _, l := range r.Live {
 			add(l.Provider, l.Provider, "", l.Model, "", string(l.Phase), "", "",
 				true, false)
 		}
 	}
 	return out
+}
+
+func providerMatchesOrder(order []routing.Weighed, provider, model string) bool {
+	for _, w := range order {
+		p := w.Provider
+		if p == "" {
+			p = providerOf(w.Model)
+		}
+		if p != "" && strings.EqualFold(p, provider) && (model == "" || w.Model == "" || strings.EqualFold(w.Model, model)) {
+			return true
+		}
+	}
+	return false
 }
 
 type providerNode struct {
@@ -642,6 +775,12 @@ type providerNode struct {
 	Weight   string
 	Current  bool
 	Failed   bool
+	// Fallback and Rest are actual fields of Magpie's Weighed/Try trace;
+	// they let the stage distinguish fallback members and resting accounts.
+	Fallback bool
+	Rest     bool
+	Answered bool
+	WentOn   bool
 }
 
 func providerOf(model string) string {

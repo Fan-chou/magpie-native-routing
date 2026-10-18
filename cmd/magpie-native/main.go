@@ -184,14 +184,16 @@ func runGUI(cfg config.AppSettings, paths config.Paths, opts options) error {
 
 	mygo.App.WhenReady(func() {
 		app.win = mygo.NewWindow(mygo.WindowOptions{
-			Title:           appTitle,
-			Width:           defaultWindowW,
-			Height:          defaultWindowH,
-			MinWidth:        minimumWindowW,
-			MinHeight:       minimumWindowH,
-			StateKey:        "magpie-native-routing",
-			BackgroundColor: "#f4f1ea",
-			Content:         mygui.View(app.model.View),
+			Title:                appTitle,
+			Width:                defaultWindowW,
+			Height:               defaultWindowH,
+			MinWidth:             minimumWindowW,
+			MinHeight:            minimumWindowH,
+			TitleBarStyle:        mygo.TitleBarHiddenInset,
+			TrafficLightPosition: &mygo.Point{X: 14, Y: 12},
+			StateKey:             "magpie-native-routing",
+			BackgroundColor:      "#f2f2f5",
+			Content:              mygui.View(app.model.View),
 		})
 		app.publishSnapshot()
 	})

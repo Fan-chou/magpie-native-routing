@@ -17,26 +17,34 @@ func (m *Model) View(c *ui.Context) {
 	}
 	s := m.snapshot()
 	now := c.Now()
+	width, _ := c.Size()
 	m.trackTopology(s)
+	routes := m.visibleRoutes(s, m.tabKind() == tabHistory)
 	m.syncReplay(s, now)
+	m.syncFlightTracks(s, routes, now)
+	m.mu.Lock()
+	m.topology.reduceMotion = c.Preferences().ReduceMotion
+	m.mu.Unlock()
 	p := colors(c, m.Settings().Theme)
 	c.SetTheme(themeFor(c, p))
 
 	ui.Column(c).Fill().Children(func() {
-		m.header(c, s, p)
-		ui.Box(c).Height(1).Background(p.LineSoft)
+		if c.TitleBar().Height > 0 {
+			ui.Box(c).Height(c.TitleBar().Height)
+		}
+		m.statusBanners(c, s, p)
 		ui.Box(c).Grow(1).Children(func() {
 			switch m.tabKind() {
 			case tabLive:
-				m.liveView(c, s, p, now)
+				m.routingHome(c, s, p, now, false, width)
 			case tabHistory:
-				m.historyView(c, s, p, now)
+				m.routingHome(c, s, p, now, true, width)
 			case tabGroups:
 				m.groupsView(c, s, p)
 			}
 		})
 		m.settingsModal(c, p)
-	})
+	}).DragWindow()
 }
 
 func (m *Model) tabKind() tabKind {
@@ -45,60 +53,10 @@ func (m *Model) tabKind() tabKind {
 	return m.tab
 }
 
-func (m *Model) header(c *ui.Context, s routing.Snapshot, p palette) {
+func (m *Model) statusBanners(c *ui.Context, s routing.Snapshot, p palette) {
 	loc := m.localization()
-	tab := m.tabKind()
-	ui.Row(c).Padding(14, 18).Gap(10).AlignItems(ui.Center).Children(func() {
-		ui.Row(c).Gap(9).AlignItems(ui.Center).Children(func() {
-			ui.Box(c).Size(30, 30).Radius(9).Background(p.AccentSoft).Draw(func(pt *ui.Painter, r ui.Rect) {
-				drawMagpieMark(pt, r, p.Accent, p.PanelRaised)
-			})
-			ui.Column(c).Gap(1).Children(func() {
-				ui.Text(c, loc.T("app.title")).Bold().FontSize(15)
-				ui.Text(c, loc.T("routing.subtitle")).FontSize(10).TextColor(p.Muted).NoWrap()
-			})
-		})
-		ui.Box(c).Width(12)
-		labels := []string{loc.T("nav.live"), loc.T("nav.history"), loc.T("nav.groups")}
-		idx := int(tab)
-		seg := ui.Segmented(c, &idx, labels...).Label(loc.T("app.title"))
-		if seg.Changed() {
-			m.setTab(tabKind(idx))
-			switch tabKind(idx) {
-			case tabLive:
-				m.setStatus("all", 0)
-			case tabHistory:
-				m.setStatus("completed", 1)
-				if m.actions.OpenDay != nil {
-					day := m.currentHistoryDay()
-					go m.actions.OpenDay(day)
-				}
-			}
-		}
-		ui.Spacer(c)
-		m.connectionPill(c, s, p, loc)
-		maskLabel := loc.T("app.hideAccounts")
-		if m.accountsMasked() {
-			maskLabel = loc.T("app.showAccounts")
-		}
-		if ui.Button(c.Key("mask-accounts"), maskLabel).Clicked() {
-			m.toggleAccountMask()
-		}
-		if ui.Button(c.Key("refresh"), loc.T("app.refresh")).Disabled(s.GatewayOnline && s.LastPoll.IsZero()).Clicked() {
-			if m.actions.Refresh != nil {
-				go m.actions.Refresh()
-			}
-			if m.actions.RefreshHistory != nil {
-				go m.actions.RefreshHistory()
-			}
-		}
-		if ui.Button(c.Key("settings"), loc.T("app.settings")).Clicked() {
-			m.setSettingsOpen(true)
-		}
-	})
-
 	if !s.GatewayOnline {
-		ui.Row(c).Padding(9, 18).Gap(8).AlignItems(ui.Center).Background(p.WarningSoft).Children(func() {
+		ui.Row(c).Padding(7, 18).Gap(8).AlignItems(ui.Center).Background(p.WarningSoft).Children(func() {
 			ui.Box(c).Size(7, 7).Radius(4).Background(p.Warning)
 			ui.Text(c, firstNonEmpty(s.GatewayError, loc.T("gateway.reconnecting"))).FontSize(11).TextColor(p.Text)
 			ui.Spacer(c)
@@ -109,7 +67,7 @@ func (m *Model) header(c *ui.Context, s routing.Snapshot, p palette) {
 		})
 	}
 	if s.GatewayWarning != "" {
-		ui.Row(c).Padding(7, 18).Gap(8).AlignItems(ui.Center).Background(p.PanelMuted).Children(func() {
+		ui.Row(c).Padding(6, 18).Gap(8).AlignItems(ui.Center).Background(p.PanelMuted).Children(func() {
 			ui.Text(c, loc.T("gateway.warning")).Bold().FontSize(10).TextColor(p.Warning)
 			ui.Text(c, s.GatewayWarning).FontSize(10).TextColor(p.Muted)
 		})
@@ -141,6 +99,464 @@ func (m *Model) liveView(c *ui.Context, s routing.Snapshot, p palette, now time.
 			func() { m.detailPane(c, s, routes, sel, ok, p) },
 		).Fill()
 	})
+}
+
+// routingHome reproduces Magpie's Routing page structure: one centered,
+// single-column workspace with a routing story card, then the request list
+// and account column. The selected request's detailed trail follows below;
+// it is not a permanent right-hand inspector.
+func (m *Model) routingHome(c *ui.Context, s routing.Snapshot, p palette, now time.Time, history bool, windowWidth float32) {
+	routes := m.visibleRoutes(s, history)
+	m.prepareListSelection(routes)
+	sel, ok := m.selectedRoute(routes)
+	ui.Box(c).Fill().Background(p.Canvas).Children(func() {
+		ui.Scroll(c).Fill().Children(func() {
+			ui.Column(c).WidthPercent(100).MaxWidth(1200).AlignSelf(ui.Center).Padding(14, 20, 24, 20).Gap(12).Children(func() {
+				m.routingPageHead(c, s, p, history)
+				if history {
+					m.replayBar(c, s, routes, p, now)
+				}
+				m.routingStageCard(c, s, routes, sel, ok, p, now, history)
+				m.routingRequestSection(c, s, routes, sel, ok, p, history, windowWidth)
+				m.routingGroupsSection(c, s, p)
+			})
+		})
+	})
+}
+
+func (m *Model) routingPageHead(c *ui.Context, s routing.Snapshot, p palette, history bool) {
+	loc := m.localization()
+	note := loc.T("routing.liveNote")
+	if history {
+		note = loc.T("routing.historyNote")
+	}
+	ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+		ui.Box(c).Size(6, 6).Radius(3).Background(p.Success)
+		ui.Text(c, "Routing").Bold().FontSize(13)
+		ui.Text(c, note).FontSize(11).TextColor(p.Muted)
+		ui.Spacer(c)
+		m.connectionPill(c, s, p, loc)
+		if ui.Button(c.Key("refresh"), loc.T("app.refresh")).Clicked() {
+			if m.actions.Refresh != nil {
+				go m.actions.Refresh()
+			}
+			if m.actions.RefreshHistory != nil {
+				go m.actions.RefreshHistory()
+			}
+		}
+		mask := loc.T("app.hideAccounts")
+		if m.accountsMasked() {
+			mask = loc.T("app.showAccounts")
+		}
+		if ui.Button(c.Key("mask"), mask).Clicked() {
+			m.toggleAccountMask()
+		}
+		if ui.Button(c.Key("settings"), loc.T("app.settings")).Clicked() {
+			m.setSettingsOpen(true)
+		}
+	})
+}
+
+func (m *Model) routingStageCard(c *ui.Context, s routing.Snapshot, routes []routing.RouteView, sel routing.RouteView, ok bool, p palette, now time.Time, history bool) {
+	loc := m.localization()
+	title := loc.T("routing.liveStage")
+	detail := loc.T("routing.decisionNote")
+	if history {
+		title = loc.T("routing.historyStage")
+		detail = loc.T("history.replayWarning")
+	}
+	if ok {
+		title = firstNonEmpty(routeGroupName(sel), sel.Model)
+	}
+	ui.Column(c).Radius(14).Background(p.Panel).Border(1, p.Line).Clip().Children(func() {
+		// The original Routing card opens with a two-line explanation of
+		// the actual routing mode, never with a dashboard title.
+		ui.Column(c).Padding(14, 16, 10, 16).Gap(3).Children(func() {
+			ui.Row(c).Gap(0).AlignItems(ui.Center).Wrap().Children(func() {
+				ui.Text(c, title).Bold().FontSize(13).TextColor(p.Text)
+				if ok && sel.Group != nil {
+					ui.Text(c, " · "+loc.T("app.group")+" · "+itoa(len(sel.Order))+" "+loc.T("routing.membersOn")).FontSize(11).TextColor(p.Muted)
+				}
+			})
+			ui.Text(c, detail).FontSize(12).TextColor(p.Muted)
+		})
+		ui.Box(c).Height(258).Padding(8, 16).Draw(func(pt *ui.Painter, r ui.Rect) {
+			m.drawRoutingStageCanvas(pt, r, s, routes, sel, ok, p, now, history)
+		})
+		if ok {
+			m.routingStory(c, sel, p, loc)
+		}
+	})
+}
+
+func boolColor(v bool, yes, no ui.Color) ui.Color {
+	if v {
+		return yes
+	}
+	return no
+}
+
+func routeGroupName(rv routing.RouteView) string {
+	if rv.Group == nil {
+		return ""
+	}
+	return firstNonEmpty(rv.Group.Name, rv.Group.ID)
+}
+
+func (m *Model) routingStory(c *ui.Context, rv routing.RouteView, p palette, loc Localization) {
+	fail := ""
+	for _, tr := range rv.Tries {
+		if reason := routing.TryFailure(tr); reason != "" {
+			fail = reason
+		}
+	}
+	ui.Column(c).Gap(7).Padding(10, 16).BorderWidth(1, 0, 0, 0).BorderColor(p.Line).Children(func() {
+		ui.Row(c).Gap(16).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, firstNonEmpty(fail, routingStoryText(rv, loc))).FontSize(13).TextColor(boolColor(fail != "", p.Danger, p.Text)).Grow(1)
+			metricStack(c, loc.T("app.requests"), itoa(len(rv.Tries)), p)
+			metricStack(c, loc.T("app.rerouted"), itoa(max(len(rv.Tries)-1, 0)), p)
+			metricStack(c, loc.T("app.failed"), boolText(fail != "", "1", "0"), p)
+		})
+		ui.Row(c).Gap(10).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, routingTracePhrase(rv, loc)).FontSize(11).TextColor(p.Muted)
+			ui.Text(c, durationText(routeMillis(rv))).FontSize(11).TextColor(p.Muted)
+			ui.Text(c, loc.T("app.ttft")+" "+durationText(rv.TTFT)).FontSize(11).TextColor(p.Muted)
+			ui.Text(c, tokenText(rv)+" "+loc.T("app.tokens")).FontSize(11).TextColor(p.Muted)
+			ui.Spacer(c)
+			if ui.Button(c, loc.T("app.replay")).Clicked() && rv.HistoryDay != "" {
+				m.PlayRoute(rv.HistoryDay, rv.ID)
+				if m.actions.OpenDay != nil {
+					go m.actions.OpenDay(rv.HistoryDay)
+				}
+			}
+		})
+		// The original "how the last request was routed" is a sentence
+		// list, not a dashboard table. Every line is derived only from the
+		// recorded Order/Tries of this exact route.
+		for i, tr := range rv.Tries {
+			line := loc.F("routing.tryStory", loc.T("routing.attempt")+" "+itoa(i+1)+" · "+agentName(rv.Agent), tryWho(tr, m.accountsMasked()), tryStatusText(tr), durationText(tr.Millis))
+			if reason := routing.TryFailure(tr); reason != "" {
+				line += " · " + reason
+			}
+			dot := p.Success
+			if tryFailed(tr) {
+				dot = p.Danger
+			} else if !tr.Done {
+				dot = p.Text
+			}
+			ui.Row(c).Gap(8).AlignItems(ui.Start).Children(func() {
+				ui.Box(c).Size(6, 6).Radius(3).Background(dot)
+				ui.Text(c, line).FontSize(11).TextColor(boolColor(tryFailed(tr), p.Danger, p.Muted)).Grow(1)
+				if i == len(rv.Tries)-1 {
+					ui.Text(c, loc.T("routing.answer")).FontSize(10).TextColor(p.Faint)
+				}
+			})
+		}
+	})
+}
+
+func tryWho(tr routing.Try, masked bool) string {
+	who := firstNonEmpty(tr.ID, providerOf(tr.Model), tr.Model)
+	if masked && who != "" {
+		who = maskWho(who)
+	}
+	return who
+}
+
+func tryStatusText(tr routing.Try) string {
+	if tr.Status > 0 {
+		return "HTTP " + itoa(tr.Status)
+	}
+	if !tr.Done {
+		return "…"
+	}
+	return ""
+}
+
+func metricStack(c *ui.Context, label, value string, p palette) {
+	ui.Column(c).Gap(1).AlignItems(ui.Start).Children(func() {
+		ui.Text(c, value).Bold().FontSize(19).TextColor(p.Text).NoWrap()
+		ui.Text(c, label).FontSize(11).TextColor(p.Muted).NoWrap()
+	})
+}
+
+// routingGroupsSection is the compact groups block that sits under the
+// requests on Magpie's Routing page. It shows only read facts; editing is
+// intentionally unavailable because providers.json is never written.
+func (m *Model) routingGroupsSection(c *ui.Context, s routing.Snapshot, p palette) {
+	loc := m.localization()
+	groups := routing.GroupViews(s.Config, s.Routes)
+	ui.Column(c).Gap(7).Children(func() {
+		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, loc.T("groups.title")).Bold().FontSize(12)
+			ui.Text(c, itoa(len(groups))).FontSize(10).TextColor(p.Muted)
+			ui.Spacer(c)
+			ui.Text(c, loc.T("groups.readOnly")).FontSize(10).TextColor(p.Faint)
+		})
+		if len(groups) == 0 {
+			ui.Box(c).Padding(10, 12).Radius(10).Background(p.Panel).Border(1, p.Line).Children(func() {
+				ui.Text(c, loc.T("groups.noGroups")).FontSize(11).TextColor(p.Muted)
+			})
+			return
+		}
+		for i, g := range groups {
+			if i >= 5 {
+				break
+			}
+			g := g
+			row := ui.Row(c).Padding(8, 12).Radius(8).Gap(10).AlignItems(ui.Center)
+			row.BorderWidth(1, 0, 0, 0).BorderColor(p.LineSoft)
+			row.Children(func() {
+				ui.Box(c).Size(7, 7).Radius(4).Background(boolColor(g.Auto, p.Faint, p.Text))
+				ui.Text(c, g.Name).FontSize(12).Bold().NoWrap()
+				ui.Text(c, g.Routing).FontSize(10.5).TextColor(p.Muted).NoWrap()
+				ui.Spacer(c)
+				ui.Text(c, itoa(len(g.Members))+" "+loc.T("groups.membersCount")).FontSize(10.5).TextColor(p.Muted).NoWrap()
+				ui.Text(c, itoa(g.Observed)+" "+loc.T("groups.observedRequests")).FontSize(10.5).TextColor(p.Faint).NoWrap()
+			})
+		}
+	})
+}
+
+func routingStoryText(rv routing.RouteView, loc Localization) string {
+	if rv.Group != nil && rv.Group.ID != "" {
+		return loc.F("routing.groupStory", agentName(rv.Agent), firstNonEmpty(rv.Group.Name, rv.Group.ID))
+	}
+	return loc.F("routing.routeStory", agentName(rv.Agent), firstNonEmpty(rv.Model, loc.T("status.noModel")))
+}
+
+func routingTracePhrase(rv routing.RouteView, loc Localization) string {
+	if !rv.CandidateOrderKnown {
+		return loc.T("routing.liveOnly")
+	}
+	return loc.F("routing.candidatesObserved", len(rv.Order), len(rv.Tries))
+}
+
+func (m *Model) routingTrailSection(c *ui.Context, rv routing.RouteView, p palette) {
+	loc := m.localization()
+	ui.Column(c).Radius(12).Background(p.Panel).Border(1, p.Line).Children(func() {
+		ui.Row(c).Padding(9, 12).Gap(8).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, loc.T("routing.trace")).Bold().FontSize(11)
+			ui.Text(c, traceSourceLabel(rv, loc)).FontSize(9).TextColor(p.Muted)
+			ui.Spacer(c)
+			ui.Text(c, replayClock(time.Duration(routeMillis(rv))*time.Millisecond)).FontSize(9).TextColor(p.Faint)
+		})
+		ui.Column(c).Padding(10, 12).Gap(7).Children(func() {
+			m.traceContents(c, rv, p, loc)
+		})
+	})
+}
+
+func (m *Model) traceContents(c *ui.Context, rv routing.RouteView, p palette, loc Localization) {
+	if !rv.CandidateOrderKnown {
+		notice(c, p, loc.T("routing.orderUnknown"))
+	}
+	for i, w := range rv.Order {
+		m.candidateRow(c, i, w, rv, p, loc)
+	}
+	if len(rv.Tries) > 0 {
+		ui.Divider(c)
+	}
+	for i, tr := range rv.Tries {
+		m.tryRow(c, i, tr, p, loc)
+	}
+}
+
+func (m *Model) routingRequestSection(c *ui.Context, s routing.Snapshot, routes []routing.RouteView, sel routing.RouteView, ok bool, p palette, history bool, windowWidth float32) {
+	loc := m.localization()
+	twoColumn := windowWidth >= 1120
+	listWidth := float32(100)
+	accountWidth := float32(100)
+	if twoColumn {
+		listWidth, accountWidth = 68, 31
+	}
+	ui.Column(c).Gap(7).Children(func() {
+		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, loc.T("routing.requests")).Bold().FontSize(12)
+			ui.Text(c, itoa(len(routes))).FontSize(9).TextColor(p.Muted)
+			if ok {
+				ui.Text(c, traceSourceLabel(sel, loc)).FontSize(10).TextColor(p.Muted).NoWrap()
+			}
+			ui.Spacer(c)
+			m.dayChips(c, s, p, history)
+			query := m.queryValue()
+			if ui.SearchField(c, &query).Label(loc.T("routing.requestList")).Changed() {
+				m.mu.Lock()
+				m.query = query
+				m.syncListSel = true
+				m.mu.Unlock()
+			}
+			statuses := []string{loc.T("app.all"), loc.T("app.active"), loc.T("app.completed"), loc.T("app.failed")}
+			idx := m.statusValue()
+			if ui.Segmented(c, &idx, statuses...).Label(loc.T("app.status")).Changed() {
+				m.setStatus([]string{"all", "active", "completed", "failed"}[idx], idx)
+			}
+		})
+		ui.Row(c).Gap(10).AlignItems(ui.Start).Children(func() {
+			m.routingRequestList(c, routes, p, listWidth)
+			if twoColumn {
+				m.routingAccountColumn(c, sel, ok, p, accountWidth)
+			}
+		})
+		if !twoColumn {
+			m.routingAccountColumn(c, sel, ok, p, 100)
+		}
+	})
+}
+
+func (m *Model) dayChips(c *ui.Context, s routing.Snapshot, p palette, history bool) {
+	loc := m.localization()
+	current := m.currentHistoryDay()
+	live := ui.Button(c.Key("day-live"), loc.T("history.live"))
+	live.Selected(!history)
+	if live.Clicked() {
+		m.setTab(tabLive)
+		m.setStatus("all", 0)
+	}
+	days := m.historyDays(s)
+	for i, d := range days {
+		if i >= 4 {
+			break
+		}
+		day := d.Day
+		label := day
+		if len(day) == 10 {
+			label = day[5:]
+		}
+		if day == time.Now().Format("2006-01-02") {
+			label = loc.T("status.today")
+		}
+		if d.Requests > 0 {
+			label += " " + itoa(d.Requests)
+		}
+		btn := ui.Button(c.Key("day-"+day), label)
+		btn.Selected(history && day == current)
+		if btn.Clicked() {
+			m.setTab(tabHistory)
+			m.setStatus("completed", 1)
+			m.SetHistoryDay(day)
+			m.mu.Lock()
+			m.syncListSel = true
+			m.mu.Unlock()
+			if m.actions.OpenDay != nil {
+				go m.actions.OpenDay(day)
+			}
+		}
+	}
+}
+
+func (m *Model) routingRequestList(c *ui.Context, routes []routing.RouteView, p palette, widthPercent float32) {
+	loc := m.localization()
+	if len(routes) == 0 {
+		ui.Box(c).WidthPercent(widthPercent).Height(140).Radius(10).Background(p.Panel).Border(1, p.Line).Center().Children(func() {
+			ui.Text(c, loc.T("status.empty")).FontSize(10).TextColor(p.Muted)
+		})
+		return
+	}
+	m.mu.Lock()
+	m.listState.Key = func(i int) any { return routes[i].ID }
+	m.listState.Label = func(i int) string { return routeLabel(routes[i]) }
+	m.listState.Selected = &m.requestSel
+	sel := m.requestSel
+	m.mu.Unlock()
+	list := ui.List(c, &m.listState, len(routes), func(i int) {
+		m.routingRequestRow(c, routes[i], i == sel, p)
+	}).WidthPercent(widthPercent).Height(360)
+	if list.Changed() {
+		m.commitListSelection(routes)
+	}
+}
+
+func (m *Model) routingRequestRow(c *ui.Context, rv routing.RouteView, selected bool, p palette) {
+	loc := m.localization()
+	status := statusKey(rv)
+	color := p.Success
+	if status == "active" {
+		color = p.Accent
+	} else if status == "failed" {
+		color = p.Danger
+	}
+	row := ui.Row(c).Padding(5, 8).Gap(9).AlignItems(ui.Center).Radius(8)
+	if selected {
+		row.Background(p.PanelMuted).Border(1, p.Line)
+	}
+	row.Children(func() {
+		ui.Text(c, clockText(rv.Time)).Width(44).FontSize(11).TextColor(p.Muted).NoWrap()
+		ui.Box(c).Size(8, 8).Radius(4).Background(agentHue(rv.Agent))
+		ui.Column(c).Width(210).Gap(1).Children(func() {
+			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, firstNonEmpty(routeGroupName(rv), rv.Model)).FontSize(12).TextColor(p.Text).NoWrap()
+				if rv.Group != nil {
+					ui.Box(c).Padding(0, 5).Radius(4).Background(p.PanelMuted).Children(func() {
+						ui.Text(c, loc.T("app.group")).FontSize(10).TextColor(p.Muted).NoWrap()
+					})
+				}
+			})
+			ui.Text(c, providerAccountText(rv, m.accountsMasked())).FontSize(10.5).TextColor(p.Muted).NoWrap()
+		})
+		ui.Box(c).Size(6, 6).Radius(3).Background(color)
+		ui.Text(c, statusMetric(rv, loc)).FontSize(10.5).TextColor(color).NoWrap()
+		ui.Spacer(c)
+		ui.Text(c, durationText(routeMillis(rv))+" · "+loc.T("app.ttft")+" "+durationText(rv.TTFT)+" · "+tokenText(rv)+" "+loc.T("app.tokens")).FontSize(10).TextColor(p.Muted).NoWrap()
+	})
+}
+
+func (m *Model) routingAccountColumn(c *ui.Context, rv routing.RouteView, ok bool, p palette, widthPercent float32) {
+	loc := m.localization()
+	ui.Column(c).WidthPercent(widthPercent).Gap(6).Children(func() {
+		ui.Row(c).Gap(7).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, loc.T("app.accounts")).Bold().FontSize(12)
+			ui.Text(c, loc.T("routing.readOnly")).FontSize(10).TextColor(p.Faint)
+		})
+		if !ok {
+			ui.Text(c, loc.T("routing.selectPrompt")).FontSize(9).TextColor(p.Muted)
+			return
+		}
+		rows := providerRows(rv, m.accountsMasked())
+		if len(rows) == 0 {
+			ui.Text(c, loc.T("status.noProvider")).FontSize(9).TextColor(p.Muted)
+		}
+		for i, row := range rows {
+			if i >= 6 {
+				break
+			}
+			ui.Column(c).Padding(8, 10).Radius(10).Background(p.Panel).Border(1, p.Line).Gap(4).Children(func() {
+				ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+					ui.Box(c).Size(8, 8).Radius(4).Background(boolColor(row.Failed, p.Danger, boolColor(row.Current, p.Text, p.Faint)))
+					ui.Text(c, firstNonEmpty(row.Name, row.Provider)).FontSize(12).Bold().NoWrap()
+					ui.Spacer(c)
+					ui.Text(c, filterDash(row.Status)).FontSize(10.5).TextColor(boolColor(row.Failed, p.Danger, p.Muted))
+				})
+				ui.Text(c, firstNonEmpty(row.Who, row.Model, row.Plan)).FontSize(10.5).TextColor(p.Muted).NoWrap()
+			})
+		}
+	})
+}
+
+func providerAccountText(rv routing.RouteView, masked bool) string {
+	for _, tr := range rv.Tries {
+		provider := providerOf(tr.Model)
+		if provider == "" {
+			continue
+		}
+		who := tr.ID
+		if who == "" {
+			who = tr.Served
+		}
+		if masked && who != "" {
+			who = maskWho(who)
+		}
+		return provider + " · " + firstNonEmpty(who, tr.Model)
+	}
+	return firstNonEmpty(rv.DisplayProvider(), "—")
+}
+
+func statusMetric(rv routing.RouteView, loc Localization) string {
+	status := selected(loc, statusKey(rv))
+	if rv.Status >= 400 {
+		return itoa(rv.Status) + " · " + status
+	}
+	return status
 }
 
 func (m *Model) topologyPane(c *ui.Context, s routing.Snapshot, routes []routing.RouteView, sel routing.RouteView, ok bool, p palette, now time.Time) {
@@ -287,6 +703,26 @@ func (m *Model) routeRow(c *ui.Context, rv routing.RouteView, selected bool, p p
 			ui.Text(c, clockText(rv.Time)).FontSize(8).TextColor(p.Faint).NoWrap()
 		})
 	})
+}
+
+func countRerouted(routes []routing.RouteView) int {
+	n := 0
+	for _, r := range routes {
+		if len(r.Tries) > 1 || r.Retried > 0 {
+			n++
+		}
+	}
+	return n
+}
+
+func countFailed(routes []routing.RouteView) int {
+	n := 0
+	for _, r := range routes {
+		if r.Status >= 400 || r.Error != "" {
+			n++
+		}
+	}
+	return n
 }
 
 func (m *Model) detailPane(c *ui.Context, s routing.Snapshot, routes []routing.RouteView, sel routing.RouteView, ok bool, p palette) {
@@ -619,27 +1055,29 @@ func (m *Model) replayBar(c *ui.Context, s routing.Snapshot, routes []routing.Ro
 func (m *Model) groupsView(c *ui.Context, s routing.Snapshot, p palette) {
 	loc := m.localization()
 	groups := routing.GroupViews(s.Config, s.Routes)
-	ui.Column(c).Fill().Padding(14).Gap(10).Children(func() {
-		ui.Row(c).Gap(10).AlignItems(ui.Center).Children(func() {
-			ui.Column(c).Gap(2).Children(func() {
-				ui.Text(c, loc.T("groups.title")).Bold().FontSize(16)
-				ui.Text(c, loc.T("groups.subtitle")).FontSize(10).TextColor(p.Muted)
-			})
-			ui.Spacer(c)
-			ui.Box(c).Padding(5, 9).Radius(6).Background(p.WarningSoft).Children(func() {
-				ui.Text(c, loc.T("groups.readOnly")).FontSize(9).TextColor(p.Warning)
+	ui.Box(c).Fill().Background(p.Canvas).Children(func() {
+		ui.Scroll(c).Fill().Children(func() {
+			ui.Column(c).WidthPercent(100).MaxWidth(1200).AlignSelf(ui.Center).Padding(14, 20, 24, 20).Gap(10).Children(func() {
+				ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+					ui.Text(c, "Routing").Bold().FontSize(13)
+					ui.Text(c, loc.T("groups.subtitle")).FontSize(11).TextColor(p.Muted)
+					ui.Spacer(c)
+					ui.Box(c).Padding(4, 8).Radius(6).Background(p.PanelMuted).Children(func() {
+						ui.Text(c, loc.T("groups.readOnly")).FontSize(10).TextColor(p.Muted)
+					})
+				})
+				if s.ConfigError != "" {
+					notice(c, p, loc.T("groups.configError")+": "+s.ConfigError)
+				}
+				if m.GroupNotice() != "" {
+					notice(c, p, m.GroupNotice())
+				}
+				ui.SplitPercent(c, &m.splitPercent,
+					func() { m.groupList(c, groups, p) },
+					func() { m.groupDetail(c, groups, p) },
+				).Height(560)
 			})
 		})
-		if s.ConfigError != "" {
-			notice(c, p, loc.T("groups.configError")+": "+s.ConfigError)
-		}
-		if m.GroupNotice() != "" {
-			notice(c, p, m.GroupNotice())
-		}
-		ui.SplitPercent(c, &m.splitPercent,
-			func() { m.groupList(c, groups, p) },
-			func() { m.groupDetail(c, groups, p) },
-		).Grow(1)
 	})
 }
 

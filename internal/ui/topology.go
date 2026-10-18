@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -29,6 +31,24 @@ func (b nodeBox) leftCenter() (float32, float32) {
 }
 
 func point(x, y float32) [2]float32 { return [2]float32{x, y} }
+
+// flightStage is the geometry and identity of the stage at this paint. It
+// keeps provider names paired with their boxes, so a retry can never land
+// on a different provider merely because two rows share a position.
+type flightStage struct {
+	agents   []nodeBox
+	hub      nodeBox
+	accounts []providerNode
+	rows     []nodeBox
+}
+
+func (s flightStage) providerBox(name string) *nodeBox {
+	i := indexProviderNode(s.accounts, name)
+	if i < 0 || i >= len(s.rows) {
+		return nil
+	}
+	return &s.rows[i]
+}
 
 func (m *Model) trackTopology(s routing.Snapshot) {
 	m.mu.Lock()
@@ -62,6 +82,415 @@ func (m *Model) trackTopology(s routing.Snapshot) {
 		}
 	}
 	m.topology.lastVersion = s.Version
+}
+
+// syncFlightTracks advances the stage animation from the immutable snapshot.
+// Only routes present in the live snapshot, or in flight at the history
+// replay cursor, receive a track. The timestamps and attempt boundaries are
+// copied from Magpie; no request or retry is synthesized here.
+func (m *Model) syncFlightTracks(s routing.Snapshot, routes []routing.RouteView, now time.Time) {
+	replay, replayActive := m.replayTopologyState()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.topology.frameAt.IsZero() || now.Before(m.topology.frameAt) {
+		m.topology.frameAt = now
+	}
+	byID := make(map[int64]*flightTrack, len(m.topology.flights))
+	for i := range m.topology.flights {
+		byID[m.topology.flights[i].routeID] = &m.topology.flights[i]
+	}
+	type input struct {
+		id          int64
+		agent       string
+		provider    string
+		failed      bool
+		done        bool
+		observed    time.Duration
+		total       time.Duration
+		attempts    []flightAttempt
+		phases      []flightPhase
+		flightStart time.Duration
+	}
+	var inputs []input
+	if replayActive {
+		routeByID := make(map[int64]routing.RouteView, len(s.Routes)+len(routes)+len(replay.routes))
+		for _, rv := range s.Routes {
+			routeByID[rv.ID] = rv
+		}
+		for _, rv := range routes {
+			routeByID[rv.ID] = rv
+		}
+		for _, rv := range replay.routes {
+			routeByID[rv.ID] = rv
+		}
+		seen := make(map[int64]bool)
+		addReplay := func(rv routing.RouteView, elapsed time.Duration) {
+			if rv.ID == 0 || rv.Time.IsZero() {
+				return
+			}
+			provider := firstNonEmpty(rv.Provider, rv.DisplayProvider())
+			attempts, total := traceFlightAttempts(rv)
+			if elapsed < 0 {
+				elapsed = 0
+			}
+			done := elapsed >= total
+			phases := buildFlightPhases(attempts, total, true)
+			recordedEnd := flightRecordedPhaseEnd(phases)
+			displayEnd := flightPhaseEnd(phases)
+			if elapsed > displayEnd {
+				return
+			}
+			// The replay ghost is complete once the recorded trace is
+			// over; the inbound leg below is presentation only. Keeping
+			// this true lets flightMomentAt continue along that leg.
+			done = elapsed >= recordedEnd
+			seen[rv.ID] = true
+			inputs = append(inputs, input{
+				id: rv.ID, agent: rv.Agent, provider: provider,
+				failed:      rv.Status >= 400 || rv.Error != "",
+				done:        done,
+				observed:    elapsed,
+				total:       total,
+				attempts:    attempts,
+				phases:      phases,
+				flightStart: rv.Time.Sub(replay.start),
+			})
+		}
+		for _, rv := range replay.routes {
+			offset := rv.Time.Sub(replay.start)
+			addReplay(rv, m.replay.position-offset)
+		}
+		// A route's flight may outlast its recorded request by the return
+		// leg. Keep only those tracks alive on the replay clock until their
+		// presentation timeline really ends; do not resurrect every route
+		// that the replay had already finished.
+		for _, old := range m.topology.flights {
+			if !old.inReplay || seen[old.routeID] {
+				continue
+			}
+			presentationEnd := old.flightStart
+			if len(old.phases) > 0 {
+				presentationEnd += flightPhaseEnd(old.phases)
+			}
+			if m.replay.position > presentationEnd {
+				continue
+			}
+			rv, ok := routeByID[old.routeID]
+			if !ok {
+				continue
+			}
+			addReplay(rv, m.replay.position-rv.Time.Sub(replay.start))
+		}
+	} else {
+		routeByID := make(map[int64]routing.RouteView, len(routes)+len(s.Routes))
+		for _, rv := range s.Routes {
+			routeByID[rv.ID] = rv
+		}
+		for _, rv := range routes {
+			routeByID[rv.ID] = rv
+		}
+		byRoute := map[int64][]routing.LiveRequest{}
+		for _, l := range s.Live {
+			if l.RouteID == 0 {
+				continue
+			}
+			byRoute[l.RouteID] = append(byRoute[l.RouteID], l)
+		}
+		for _, l := range s.Live {
+			if l.RouteID == 0 || byRoute[l.RouteID] == nil {
+				continue
+			}
+			delete(byRoute, l.RouteID)
+			elapsed := liveElapsedAt(l, now)
+			if rv, ok := routeByID[l.RouteID]; ok && len(rv.Tries) > 0 {
+				attempts, total := traceFlightAttempts(rv)
+				inputs = append(inputs, input{
+					id: l.RouteID, agent: l.Agent,
+					provider: firstNonEmpty(rv.Provider, l.Provider, rv.DisplayProvider()),
+					failed:   rv.Status >= 400 || rv.Error != "",
+					// Concurrency says this route is still active; a
+					// SessionRoute "done" race must not end its bird
+					// before the snapshot drops the request.
+					done:     false,
+					observed: elapsed,
+					total:    total,
+					attempts: attempts,
+					phases:   buildFlightPhases(attempts, total, false),
+				})
+				continue
+			}
+			outbound := clampDuration(elapsed, 620*time.Millisecond, 1400*time.Millisecond)
+			if elapsed < outbound {
+				outbound = max(elapsed, 620*time.Millisecond)
+			}
+			inputs = append(inputs, input{
+				id: l.RouteID, agent: l.Agent, provider: l.Provider,
+				observed: elapsed,
+				total:    max(elapsed+700*time.Millisecond, 1400*time.Millisecond),
+				attempts: []flightAttempt{{
+					provider: l.Provider, start: 0,
+					end: max(elapsed, 0),
+				}},
+				phases: []flightPhase{
+					{kind: flightOutbound, provider: l.Provider, start: 0, end: outbound},
+					{kind: flightHold, provider: l.Provider, start: outbound, end: max(elapsed, outbound)},
+				},
+			})
+		}
+	}
+	next := make([]flightTrack, 0, len(inputs))
+	for _, in := range inputs {
+		track, ok := byID[in.id]
+		if !ok {
+			track = &flightTrack{
+				routeID: in.id, agent: in.agent, provider: in.provider,
+				firstSeen: now.Add(-in.observed),
+			}
+		} else if replayActive {
+			// Replay position, not wall time, drives the bird. Re-anchor it
+			// each frame so pause and seeking freeze or jump truthfully.
+			track.firstSeen = now.Add(-in.observed)
+		}
+		track.agent = in.agent
+		if in.provider != "" {
+			track.provider = in.provider
+		}
+		track.lastSeen = now
+		track.failed = in.failed
+		track.done = in.done
+		if !track.done {
+			// A replay seek backwards or a still-running live request
+			// must not inherit a timed return from an earlier completion.
+			track.doneAt = time.Time{}
+			track.removedAt = time.Time{}
+		} else if !replayActive && track.doneAt.IsZero() {
+			track.doneAt = now
+		}
+		track.observed = in.observed
+		track.total = in.total
+		track.attempts = in.attempts
+		track.phases = in.phases
+		if replayActive {
+			track.flightStart = in.flightStart
+		}
+		track.returnDur = 700 * time.Millisecond
+		if len(in.phases) > 0 {
+			last := in.phases[len(in.phases)-1]
+			if last.kind == flightInbound {
+				track.returnDur = clampDuration(last.end-last.start, 420*time.Millisecond, 1400*time.Millisecond)
+			}
+		}
+		track.inReplay = replayActive
+		next = append(next, *track)
+	}
+	// A route that has left a live Gateway snapshot gets one return leg. It
+	// is never re-created from history or guessed to be active.
+	for i := range m.topology.flights {
+		old := m.topology.flights[i]
+		found := false
+		for j := range next {
+			if next[j].routeID == old.routeID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			if replayActive || old.inReplay {
+				presentationEnd := old.flightStart + flightPhaseEnd(old.phases)
+				if m.replay.position >= old.flightStart && m.replay.position <= presentationEnd {
+					next = append(next, old)
+				}
+				continue
+			}
+			if !old.done {
+				old.done = true
+				old.removedAt = now
+				old.doneAt = now
+				old.phases = buildFlightPhases(old.attempts, old.total, true)
+				old.returnDur = flightReturnDuration(old.phases)
+			}
+			if old.doneAt.IsZero() {
+				old.doneAt = now
+			}
+			if flightAlive(old, now) {
+				next = append(next, old)
+			}
+		}
+	}
+	m.topology.flights = next
+}
+
+func flightAlive(f flightTrack, now time.Time) bool {
+	if !f.done || f.inReplay {
+		return true
+	}
+	return now.Before(f.doneAt.Add(max(f.returnDur, 420*time.Millisecond) + 450*time.Millisecond))
+}
+
+// buildFlightPhases lays the recorded attempts onto the visual legs. The
+// outbound carrier keeps upstream's 1.4s rhythm; its hold ends at the real
+// Try end; a failed try returns through the gateway and a fresh carrier
+// continues. withReturn appends the separate 1.4s answer flight home for a
+// completed trace; a live request waits at its account until Gateway says it
+// is finished.
+func buildFlightPhases(attempts []flightAttempt, total time.Duration, withReturn bool) []flightPhase {
+	if len(attempts) == 0 {
+		return nil
+	}
+	out := make([]flightPhase, 0, len(attempts)*3+1)
+	cursor := time.Duration(0)
+	for i, a := range attempts {
+		if i == 0 {
+			// The request carrier leaves the agent at the route's start
+			// and takes 1.4s to reach the first account, as upstream's
+			// play() does even when the account answers sooner.
+			out = append(out, flightPhase{
+				kind: flightOutbound, provider: a.provider,
+				start: 0, end: 1400 * time.Millisecond,
+			})
+			cursor = 1400 * time.Millisecond
+		} else {
+			// A failed answer goes back to the gateway in 620ms, then a
+			// fresh carrier takes the request on in 900ms.
+			out = append(out,
+				flightPhase{kind: flightRetryBack, provider: attempts[i-1].provider, start: cursor, end: cursor + 620*time.Millisecond, failed: attempts[i-1].failed},
+				flightPhase{kind: flightRetryOut, provider: a.provider, start: cursor + 620*time.Millisecond, end: cursor + 1520*time.Millisecond},
+			)
+			cursor += 1520 * time.Millisecond
+		}
+		// The dot waits at the account until the recorded try ends. When
+		// a very short try has already ended before the bird arrives, the
+		// hold is instantaneous and the bird turns around.
+		holdEnd := max(a.end, cursor)
+		out = append(out, flightPhase{
+			kind: flightHold, provider: a.provider,
+			start: cursor, end: holdEnd, failed: a.failed, final: i == len(attempts)-1,
+		})
+		cursor = holdEnd
+	}
+	if withReturn {
+		out = append(out, flightPhase{
+			kind: flightInbound, provider: attempts[len(attempts)-1].provider,
+			start: cursor, end: cursor + 1400*time.Millisecond,
+			failed: attempts[len(attempts)-1].failed, final: true,
+		})
+	}
+	if len(out) == 0 {
+		// Keep an anchor at the route duration so a caller with malformed
+		// traces still has a bounded presentation interval.
+		out = append(out, flightPhase{kind: flightHold, start: 0, end: max(total, time.Millisecond)})
+	}
+	return out
+}
+
+func flightReturnDuration(phases []flightPhase) time.Duration {
+	for i := len(phases) - 1; i >= 0; i-- {
+		if phases[i].kind == flightInbound {
+			return clampDuration(phases[i].end-phases[i].start, 420*time.Millisecond, 1400*time.Millisecond)
+		}
+	}
+	return 1400 * time.Millisecond
+}
+
+func flightPhaseEnd(phases []flightPhase) time.Duration {
+	if len(phases) == 0 {
+		return 0
+	}
+	end := time.Duration(0)
+	for _, phase := range phases {
+		end = max(end, phase.end)
+	}
+	return end
+}
+
+// flightRecordedPhaseEnd is the point where the recorded request is over:
+// everything before the presentation-only inbound leg. The return flight
+// itself still plays after this on the wall or replay clock.
+func flightRecordedPhaseEnd(phases []flightPhase) time.Duration {
+	end := time.Duration(0)
+	for _, phase := range phases {
+		if phase.kind == flightInbound {
+			break
+		}
+		end = max(end, phase.end)
+	}
+	return end
+}
+
+// traceFlightAttempts returns the actual attempt chain in route-relative
+// time. A try begins at Try.Start (or the route start when omitted), waits
+// at its account for Try.Millis, and a failed try with another try after it
+// returns to the gateway before the next one departs.
+func traceFlightAttempts(rv routing.RouteView) ([]flightAttempt, time.Duration) {
+	total := time.Duration(max(rv.Millis, 0)) * time.Millisecond
+	out := make([]flightAttempt, 0, len(rv.Tries))
+	for _, tr := range rv.Tries {
+		start := time.Duration(0)
+		if !tr.Start.IsZero() && tr.Start.After(rv.Time) {
+			start = tr.Start.Sub(rv.Time)
+		}
+		end := start + time.Duration(max(tr.Millis, 0))*time.Millisecond
+		failed := tr.Status >= 400 || tr.Fail != "" || tr.Error != ""
+		out = append(out, flightAttempt{
+			provider: traceAttemptProvider(rv, tr),
+			start:    start, end: end, failed: failed, done: tr.Done,
+		})
+		if end > total {
+			total = end
+		}
+	}
+	if total <= 0 {
+		total = 1400 * time.Millisecond
+	}
+	return out, total
+}
+
+// traceAttemptProvider finds the provider that actually seated a Try. The
+// trace's Try.ID is the account/key/provider identity that rested after a
+// failure, not necessarily a provider id, so the recorded candidate order is
+// the authoritative mapping when it is available.
+func traceAttemptProvider(rv routing.RouteView, tr routing.Try) string {
+	for _, w := range rv.Order {
+		if tr.ID != "" && !strings.EqualFold(w.ID, tr.ID) {
+			continue
+		}
+		if tr.Model != "" && w.Model != "" && !strings.EqualFold(w.Model, tr.Model) {
+			continue
+		}
+		if provider := firstNonEmpty(w.Provider, providerOf(w.Model), w.ID); provider != "" {
+			return provider
+		}
+	}
+	for _, w := range rv.Order {
+		if tr.Model == "" || w.Model == "" || !strings.EqualFold(w.Model, tr.Model) {
+			continue
+		}
+		if provider := firstNonEmpty(w.Provider, providerOf(w.Model), w.ID); provider != "" {
+			return provider
+		}
+	}
+	return firstNonEmpty(providerOf(tr.Model), rv.Provider, tr.ID)
+}
+
+func clampDuration(v, lo, hi time.Duration) time.Duration {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+func liveElapsedAt(l routing.LiveRequest, now time.Time) time.Duration {
+	if l.Millis > 0 {
+		return time.Duration(l.Millis) * time.Millisecond
+	}
+	if l.Started.IsZero() || now.Before(l.Started) {
+		return 0
+	}
+	return now.Sub(l.Started)
 }
 
 func (m *Model) drawTopology(p *ui.Painter, r ui.Rect, s routing.Snapshot, routes []routing.RouteView, sel routing.RouteView, hasSel bool, pal palette, now time.Time) {
@@ -204,9 +633,1270 @@ type topologyActivity struct {
 	failed   bool
 }
 
+// drawRoutingStage renders the compact stage used by the page-level card:
+// agents at the left, the gateway in the middle, and the observed account
+// rows at the right. Its proportions follow Magpie's Routing page rather than
+// the earlier dashboard topology.
+func (m *Model) drawRoutingStage(p *ui.Painter, r ui.Rect, s routing.Snapshot, routes []routing.RouteView, sel routing.RouteView, hasSel bool, pal palette, now time.Time, history bool) {
+	if r.W < 200 || r.H < 140 {
+		return
+	}
+	replay, replayActive := m.replayTopologyState()
+	agents := m.stageAgents(s, sel, hasSel, routes, replay, replayActive)
+	if len(agents) == 0 {
+		p.Text(r.X+8, r.Y+r.H/2, m.localization().T("routing.noAgents"), 10, pal.Faint)
+		return
+	}
+	rows := m.stageAccountRows(sel, hasSel, s.Live, replay.routes, replayActive)
+	if len(rows) == 0 {
+		rows = []providerNode{{Name: m.localization().T("routing.noTrace")}}
+	}
+	if len(rows) > 5 {
+		rows = rows[:5]
+	}
+	// The upstream stage is a grid of 124px agent, 124px hub, then the
+	// account rows, with a 56px column gap and no dashboard chrome.
+	agentW := float32(124)
+	gap := min(float32(56), max(r.W*0.055, 24))
+	hubW := float32(124)
+	providerW := max(r.W-agentW-hubW-gap*2, 220)
+	total := agentW + gap + hubW + gap + providerW
+	startX := r.X + max((r.W-total)/2, 8)
+	centerY := r.Y + r.H/2
+
+	agentH := float32(78)
+	agentGap := float32(8)
+	top := centerY - (float32(len(agents))*agentH+float32(max(len(agents)-1, 0))*agentGap)/2
+	agentBoxes := make([]nodeBox, 0, len(agents))
+	for i := range agents {
+		agentBoxes = append(agentBoxes, nodeBox{x: startX, y: top + float32(i)*(agentH+agentGap), w: agentW, h: agentH})
+	}
+	hubX := startX + agentW + gap
+	hub := nodeBox{x: hubX, y: centerY - 49, w: hubW, h: 98}
+	rowsX := hubX + hubW + gap
+	rowH := float32(44)
+	rowGap := float32(7)
+	rowsTop := centerY - (float32(len(rows))*rowH+float32(max(len(rows)-1, 0))*rowGap)/2
+	rowBoxes := make([]nodeBox, 0, len(rows))
+	for i := range rows {
+		rowBoxes = append(rowBoxes, nodeBox{x: rowsX, y: rowsTop + float32(i)*(rowH+rowGap), w: providerW, h: rowH})
+	}
+
+	m.mu.Lock()
+	flights := append([]flightTrack(nil), m.topology.flights...)
+	lastFrame := m.topology.frameAt
+	m.mu.Unlock()
+
+	litAgents := map[string]bool{}
+	litRows := map[int]bool{}
+	provider := ""
+	if hasSel {
+		provider = firstNonEmpty(sel.Provider, sel.DisplayProvider())
+	}
+	activeFlight := false
+	stage := flightStage{agents: agentBoxes, hub: hub, accounts: rows, rows: rowBoxes}
+	for _, f := range flights {
+		if !flightAlive(f, now) {
+			continue
+		}
+		ai := indexAgentNode(agents, f.agent)
+		if ai < 0 {
+			continue
+		}
+		pi := -1
+		match := firstNonEmpty(f.provider, provider)
+		if match != "" {
+			pi = indexProviderNode(rows, match)
+		}
+		litAgents[strings.ToLower(agents[ai].ID)] = true
+		if pi >= 0 {
+			litRows[pi] = true
+		}
+		drawFlightWire(p, stage, stage.agents[ai], f, agentHue(f.agent), now)
+		drawFlightActor(p, stage, stage.agents[ai], f, agentHue(f.agent), pal, now, m.reduceMotionEnabled())
+		activeFlight = true
+	}
+	if !activeFlight && hasSel {
+		// No request is in flight. Keep the route that the log tells of lit
+		// and still, as the upstream page does after an answer.
+		ai := indexAgentNode(agents, sel.Agent)
+		pi := indexProviderNode(rows, provider)
+		if ai >= 0 {
+			ax, ay := agentBoxes[ai].rightCenter()
+			hx, hy := hub.leftCenter()
+			drawCubic(p, point(ax, ay), point(hx, hy), agentHue(sel.Agent), 1.8)
+			litAgents[strings.ToLower(agents[ai].ID)] = true
+			if pi >= 0 {
+				hx, hy = hub.rightCenter()
+				rx, ry := rowBoxes[pi].leftCenter()
+				drawCubic(p, point(hx, hy), point(rx, ry), agentHue(sel.Agent), 1.8)
+				litRows[pi] = true
+			}
+		}
+	}
+
+	for i, a := range agents {
+		drawRoutingAgentBox(p, agentBoxes[i].rect(), a, litAgents[strings.ToLower(a.ID)], pal)
+	}
+	drawRoutingHub(p, hub.rect(), s, m.Settings().GatewayURL, pal)
+	for i, row := range rows {
+		drawRoutingAccountRow(p, rowBoxes[i].rect(), row, litRows[i], pal)
+	}
+	if activeFlight && (lastFrame.IsZero() || now.Sub(lastFrame) >= 16*time.Millisecond) {
+		p.AnimationFrame()
+	}
+}
+
+// drawRoutingStageCanvas keeps the stage's static topology in a MyGo Canvas.
+// The canvas is drawn again only when the agent/account layout or a lit
+// route changes, while the moving birds and packets remain live painters.
+// This follows MyGo's own Canvas guidance for content that seldom changes.
+func (m *Model) drawRoutingStageCanvas(p *ui.Painter, r ui.Rect, s routing.Snapshot, routes []routing.RouteView, sel routing.RouteView, hasSel bool, pal palette, now time.Time, history bool) {
+	if r.W < 200 || r.H < 140 {
+		return
+	}
+	replay, replayActive := m.replayTopologyState()
+	agents := m.stageAgents(s, sel, hasSel, routes, replay, replayActive)
+	if len(agents) == 0 {
+		p.Text(r.X+8, r.Y+r.H/2, m.localization().T("routing.noAgents"), 10, pal.Faint)
+		return
+	}
+	rows := m.stageAccountRows(sel, hasSel, s.Live, replay.routes, replayActive)
+	if len(rows) == 0 {
+		rows = []providerNode{{Name: m.localization().T("routing.noTrace")}}
+	}
+	if len(rows) > 5 {
+		rows = rows[:5]
+	}
+	agentW := float32(124)
+	gap := min(float32(56), max(r.W*0.055, 24))
+	hubW := float32(124)
+	providerW := max(r.W-agentW-hubW-gap*2, 220)
+	total := agentW + gap + hubW + gap + providerW
+	// The Canvas has its own origin: all static geometry is in local card
+	// coordinates, while live flights below use the window's coordinates.
+	startX := max((r.W-total)/2, 8)
+	centerY := r.H / 2
+	agentH := float32(78)
+	agentGap := float32(8)
+	top := centerY - (float32(len(agents))*agentH+float32(max(len(agents)-1, 0))*agentGap)/2
+	agentBoxes := make([]nodeBox, 0, len(agents))
+	for i := range agents {
+		agentBoxes = append(agentBoxes, nodeBox{x: startX, y: top + float32(i)*(agentH+agentGap), w: agentW, h: agentH})
+	}
+	hubX := startX + agentW + gap
+	hub := nodeBox{x: hubX, y: centerY - 49, w: hubW, h: 98}
+	rowsX := hubX + hubW + gap
+	rowH := float32(44)
+	rowGap := float32(7)
+	rowsTop := centerY - (float32(len(rows))*rowH+float32(max(len(rows)-1, 0))*rowGap)/2
+	rowBoxes := make([]nodeBox, 0, len(rows))
+	for i := range rows {
+		rowBoxes = append(rowBoxes, nodeBox{x: rowsX, y: rowsTop + float32(i)*(rowH+rowGap), w: providerW, h: rowH})
+	}
+
+	provider := ""
+	if hasSel {
+		provider = firstNonEmpty(sel.Provider, sel.DisplayProvider())
+	}
+	gatewayURL := m.Settings().GatewayURL
+	litAgents := map[string]bool{}
+	litRows := map[int]bool{}
+	m.mu.Lock()
+	flights := append([]flightTrack(nil), m.topology.flights...)
+	for _, f := range flights {
+		if !flightAlive(f, now) {
+			continue
+		}
+		if ai := indexAgentNode(agents, f.agent); ai >= 0 {
+			litAgents[strings.ToLower(agents[ai].ID)] = true
+		}
+		if pi := indexProviderNode(rows, firstNonEmpty(f.provider, provider)); pi >= 0 {
+			litRows[pi] = true
+		}
+	}
+	if !activityVisible(flights, now) && hasSel {
+		if ai := indexAgentNode(agents, sel.Agent); ai >= 0 {
+			litAgents[strings.ToLower(agents[ai].ID)] = true
+		}
+		if pi := indexProviderNode(rows, provider); pi >= 0 {
+			litRows[pi] = true
+		}
+	}
+	stageKey := stageCanvasKey(agents, rows, provider, hasSel, pal, s.GatewayOnline, gatewayURL, litAgents, litRows)
+	scale := p.Scale()
+	if m.topology.stageCanvas == nil {
+		m.topology.stageCanvas = ui.NewCanvas(int(r.W*scale), int(r.H*scale))
+	}
+	redraw := m.topology.stageCanvasKey != stageKey ||
+		m.topology.stageCanvasW != int(r.W*scale) || m.topology.stageCanvasH != int(r.H*scale)
+	m.mu.Unlock()
+	if redraw {
+		m.topology.stageCanvas.Draw(p, func(cp *ui.Painter) {
+			cp.Transform(ui.Scaling(scale, scale), 0, 0, func() {
+				drawRoutingStatic(cp, ui.Rect{W: r.W, H: r.H}, agentBoxes, hub, rows, rowBoxes, agents, litAgents, litRows, s, gatewayURL, pal)
+			})
+		})
+		m.mu.Lock()
+		m.topology.stageCanvasKey = stageKey
+		m.topology.stageCanvasW = int(r.W * scale)
+		m.topology.stageCanvasH = int(r.H * scale)
+		m.mu.Unlock()
+	}
+	p.Image(m.topology.stageCanvas.Bitmap(), r, ui.FillBox)
+
+	// Draw the wires and their highlights over the static node layer, then
+	// the birds above both. This is the same layer order as upstream's
+	// rt-wires and rt-sky and keeps all moving geometry in the live painter.
+	activeFlight := false
+	local := flightStage{
+		agents:   offsetBoxes(agentBoxes, r.X, r.Y),
+		hub:      offsetBox(hub, r.X, r.Y),
+		accounts: rows,
+		rows:     offsetBoxes(rowBoxes, r.X, r.Y),
+	}
+	for _, f := range flights {
+		if !flightAlive(f, now) {
+			continue
+		}
+		ai := indexAgentNode(agents, f.agent)
+		if ai < 0 {
+			continue
+		}
+		drawFlightWire(p, local, local.agents[ai], f, agentHue(f.agent), now)
+		activeFlight = true
+	}
+	if !activeFlight && hasSel {
+		ai := indexAgentNode(agents, sel.Agent)
+		if ai >= 0 {
+			drawStillRoute(p, offsetBox(agentBoxes[ai], r.X, r.Y), offsetBox(hub, r.X, r.Y), offsetBoxes(rowBoxes, r.X, r.Y), indexProviderNode(rows, provider), agentHue(sel.Agent))
+		}
+	}
+	for _, f := range flights {
+		if !flightAlive(f, now) {
+			continue
+		}
+		ai := indexAgentNode(agents, f.agent)
+		if ai < 0 {
+			continue
+		}
+		drawFlightActor(p, local, local.agents[ai], f, agentHue(f.agent), pal, now, m.reduceMotionEnabled())
+	}
+	replayPlaying := false
+	if replayActive {
+		replayPlaying = replay.playing
+	}
+	if activeFlight && !m.reduceMotionEnabled() {
+		p.AnimationFrame()
+	}
+	if replayPlaying && !m.reduceMotionEnabled() {
+		// The replay clock itself moves even between flights; draw again so
+		// pause, seek and newly started returns stay in step with it.
+		p.AnimationFrame()
+	}
+}
+
+func activityVisible(flights []flightTrack, now time.Time) bool {
+	for _, f := range flights {
+		if flightAlive(f, now) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Model) reduceMotionEnabled() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.topology.reduceMotion
+}
+
+func offsetBox(b nodeBox, dx, dy float32) nodeBox {
+	b.x += dx
+	b.y += dy
+	return b
+}
+
+func offsetBoxes(boxes []nodeBox, dx, dy float32) []nodeBox {
+	out := make([]nodeBox, len(boxes))
+	for i := range boxes {
+		out[i] = offsetBox(boxes[i], dx, dy)
+	}
+	return out
+}
+
+func stageCanvasKey(agents []agentNode, rows []providerNode, provider string, hasSel bool, pal palette, online bool, gatewayURL string, litAgents map[string]bool, litRows map[int]bool) string {
+	var b strings.Builder
+	for _, a := range agents {
+		b.WriteString(a.ID)
+		b.WriteByte(0)
+		b.WriteString(a.Model)
+		b.WriteByte(0)
+		b.WriteString(fmt.Sprintf("%t/%d", a.Active, a.Requests))
+		b.WriteByte(0)
+	}
+	for _, r := range rows {
+		b.WriteString(r.Provider)
+		b.WriteByte(0)
+		b.WriteString(r.Name)
+		b.WriteByte(0)
+		b.WriteString(r.Model)
+		b.WriteByte(0)
+		b.WriteString(r.Status)
+		b.WriteByte(0)
+		b.WriteString(fmt.Sprintf("%t/%t/%t/%t/%t/%t", r.Current, r.Failed, r.Rest, r.Fallback, r.Answered, r.WentOn))
+		b.WriteByte(0)
+	}
+	b.WriteString(provider)
+	b.WriteByte(0)
+	if hasSel {
+		b.WriteByte(1)
+	}
+	for _, a := range agents {
+		if litAgents[strings.ToLower(a.ID)] {
+			b.WriteByte('A')
+			b.WriteString(a.ID)
+			b.WriteByte(0)
+		}
+	}
+	for i := range rows {
+		if litRows[i] {
+			b.WriteByte('R')
+			b.WriteString(itoa(i))
+			b.WriteByte(0)
+		}
+	}
+	b.WriteString(fmt.Sprintf("%v|%v|%v|%v|%t|%s", pal.Canvas, pal.Panel, pal.Line, pal.Text, online, gatewayURL))
+	return b.String()
+}
+
+func drawRoutingStatic(p *ui.Painter, r ui.Rect, agentsBoxes []nodeBox, hub nodeBox, rows []providerNode, rowsBoxes []nodeBox, agents []agentNode, litAgents map[string]bool, litRows map[int]bool, s routing.Snapshot, gatewayURL string, pal palette) {
+	for _, a := range agentsBoxes {
+		ax, ay := a.rightCenter()
+		hx, hy := hub.leftCenter()
+		drawCubic(p, point(ax, ay), point(hx, hy), pal.RouteIdle, 1.3)
+	}
+	for _, row := range rowsBoxes {
+		hx, hy := hub.rightCenter()
+		rx, ry := row.leftCenter()
+		drawCubic(p, point(hx, hy), point(rx, ry), pal.RouteIdle, 1.3)
+	}
+	for i, a := range agents {
+		drawRoutingAgentBox(p, agentsBoxes[i].rect(), a, litAgents[strings.ToLower(a.ID)], pal)
+	}
+	drawRoutingHub(p, hub.rect(), s, gatewayURL, pal)
+	for i, row := range rows {
+		drawRoutingAccountRow(p, rowsBoxes[i].rect(), row, litRows[i], pal)
+	}
+	_ = r
+}
+
+func drawStillRoute(p *ui.Painter, agent nodeBox, hub nodeBox, rows []nodeBox, providerIndex int, color ui.Color) {
+	ax, ay := agent.rightCenter()
+	hx, hy := hub.leftCenter()
+	drawCubic(p, point(ax, ay), point(hx, hy), color, 1.8)
+	if providerIndex >= 0 && providerIndex < len(rows) {
+		hx, hy = hub.rightCenter()
+		rx, ry := rows[providerIndex].leftCenter()
+		drawCubic(p, point(hx, hy), point(rx, ry), color, 1.8)
+	}
+}
+
+// stageAgents is the upstream stage's agent set, not the whole request
+// history: every agent with a request active in this exact snapshot, or the
+// one agent of the request told about when the gateway is idle. During a
+// replay it is every agent actually in flight at the replay cursor.
+func (m *Model) stageAgents(s routing.Snapshot, sel routing.RouteView, hasSel bool, routes []routing.RouteView, replay replayTopology, replayActive bool) []agentNode {
+	var out []agentNode
+	seen := map[string]bool{}
+	add := func(id, model string, active bool) {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return
+		}
+		key := strings.ToLower(id)
+		if seen[key] {
+			for i := range out {
+				if strings.EqualFold(out[i].ID, id) {
+					out[i].Active = out[i].Active || active
+					if out[i].Model == "" {
+						out[i].Model = model
+					}
+				}
+			}
+			return
+		}
+		seen[key] = true
+		out = append(out, agentNode{
+			ID: id, Name: agentName(id), Model: model, Active: active, Hue: agentHue(id),
+		})
+	}
+	if replayActive {
+		for _, rv := range replay.routes {
+			add(rv.Agent, rv.Model, true)
+		}
+	} else {
+		for _, l := range s.Live {
+			add(l.Agent, l.Model, true)
+		}
+	}
+	if len(out) == 0 && hasSel {
+		add(sel.Agent, sel.Model, sel.Active)
+	}
+	if len(out) == 0 && len(routes) > 0 {
+		add(routes[0].Agent, routes[0].Model, false)
+	}
+	if len(out) > 4 {
+		out = out[:4]
+	}
+	return out
+}
+
+// stageAccountRows is exactly the accounts of the request told about plus
+// the providers of requests currently active. It never blends every row in
+// the history into one fictitious candidate set.
+func (m *Model) stageAccountRows(sel routing.RouteView, hasSel bool, live []routing.LiveRequest, replay []routing.RouteView, replayActive bool) []providerNode {
+	var rows []providerNode
+	seen := map[string]bool{}
+	add := func(items []providerNode) {
+		for _, n := range items {
+			key := strings.ToLower(n.Provider + "\x00" + n.Name + "\x00" + n.Model + "\x00" + n.Who)
+			if key == "\x00\x00\x00\x00" || seen[key] {
+				continue
+			}
+			seen[key] = true
+			rows = append(rows, n)
+		}
+	}
+	if hasSel {
+		add(providerRows(sel, m.accountsMasked()))
+	}
+	if replayActive {
+		for _, rv := range replay {
+			add(providerRows(rv, m.accountsMasked()))
+		}
+	} else {
+		for _, l := range live {
+			if l.Provider == "" && l.Model == "" {
+				continue
+			}
+			add([]providerNode{{
+				Provider: l.Provider, Name: l.Provider, Model: l.Model,
+				Status: string(l.Phase), Current: true,
+			}})
+		}
+	}
+	return rows
+}
+
+func drawRoutingAgentBox(p *ui.Painter, r ui.Rect, a agentNode, lit bool, pal palette) {
+	border := pal.Line
+	if lit {
+		border = a.Hue
+	}
+	p.Fill(r, pal.Panel, 10)
+	width := float32(1)
+	if lit {
+		width = 1.6
+	}
+	p.Stroke(r, border, 10, width)
+	cx := r.X + r.W/2
+	p.Fill(ui.Rect{X: cx - 13, Y: r.Y + 8, W: 26, H: 26}, a.Hue.Alpha(0.16), 7)
+	p.Text(cx-8, r.Y+15, agentInitials(a.ID), 9, a.Hue)
+	drawTextCentered(p, agentName(a.ID), cx, r.Y+43, 12, pal.Text)
+	drawTextCentered(p, truncate(a.Model, 19), cx, r.Y+59, 10, pal.Muted)
+	if lit {
+		p.Fill(ui.Rect{X: r.X + r.W - 10, Y: r.Y + 8, W: 5, H: 5}, a.Hue, 3)
+	}
+}
+
+func drawTextCentered(p *ui.Painter, s string, cx, y, size float32, color ui.Color) {
+	width := float32(0)
+	for _, r := range s {
+		if r > 0x2e80 {
+			width += size
+		} else {
+			width += size * 0.56
+		}
+	}
+	p.Text(cx-width/2, y, s, size, color)
+}
+
+func drawRoutingHub(p *ui.Painter, r ui.Rect, s routing.Snapshot, gatewayURL string, pal palette) {
+	p.Fill(r, pal.Panel, 12)
+	p.Stroke(r, pal.Text, 12, 1.2)
+	cx := r.X + r.W/2
+	drawMagpieMark(p, ui.Rect{X: cx - 13, Y: r.Y + 9, W: 26, H: 26}, pal.Text, pal.Panel)
+	drawTextCentered(p, "magpie", cx, r.Y+45, 12, pal.Text)
+	drawTextCentered(p, gatewayURL, cx, r.Y+61, 10, pal.Muted)
+	chipW := float32(50)
+	status := "online"
+	color := pal.Success
+	if !s.GatewayOnline {
+		status = "offline"
+		color = pal.Danger
+	}
+	p.Fill(ui.Rect{X: cx - chipW/2, Y: r.Y + 69, W: chipW, H: 20}, pal.Text, 10)
+	drawTextCentered(p, status, cx, r.Y+73, 9, pal.Panel)
+	_ = color
+}
+
+func drawRoutingAccountRow(p *ui.Painter, r ui.Rect, n providerNode, active bool, pal palette) {
+	border := pal.Line
+	if n.Failed {
+		border = pal.Danger.Alpha(0.8)
+	} else if active {
+		border = pal.Text
+	} else if n.Answered {
+		border = pal.Success.Alpha(0.65)
+	} else if n.Rest {
+		border = pal.LineSoft
+	} else if n.Fallback {
+		border = pal.LineSoft
+	}
+	p.Fill(r, pal.Panel, 9)
+	width := float32(1)
+	if active || n.Answered || n.Failed {
+		width = 1.5
+	}
+	p.Stroke(r, border, 9, width)
+	dotColor := pal.Faint
+	if n.Failed {
+		dotColor = pal.Danger
+	} else if n.Answered {
+		dotColor = pal.Success
+	} else if active || n.Current {
+		dotColor = pal.Text
+	}
+	p.Fill(ui.Rect{X: r.X + 11, Y: r.Y + r.H/2 - 4, W: 8, H: 8}, dotColor, 4)
+	p.Text(r.X+28, r.Y+9, truncate(firstNonEmpty(n.Name, n.Provider), 24), 12, pal.Text)
+	model := firstNonEmpty(n.Model, n.Plan)
+	if model != "" {
+		model = " · " + truncate(model, 28)
+	}
+	p.Text(r.X+28, r.Y+25, truncate(firstNonEmpty(n.Who, "—"), 22)+model, 10.5, pal.Muted)
+	if n.Status != "" {
+		p.Text(r.X+r.W-82, r.Y+15, truncate(n.Status, 18), 10.5, boolColor(n.Failed, pal.Danger, pal.Muted))
+	}
+	if n.Fallback || n.Rest || n.WentOn {
+		tag := "fallback"
+		if n.Rest {
+			tag = "resting"
+		} else if n.WentOn {
+			tag = "re-route"
+		}
+		p.Text(r.X+r.W-68, r.Y+r.H-15, tag, 8.5, pal.Faint)
+	}
+}
+
+// flightPath is a polyline with cumulative arc lengths. Following distance
+// rather than Bézier parameter keeps the bird's speed even through bends.
+type flightPath struct {
+	pts []flightPoint
+	cum []float32
+}
+
+type flightPoint struct {
+	x, y float32
+}
+
+func newFlightPath(raw []flightPoint) flightPath {
+	var p flightPath
+	for _, pt := range raw {
+		if len(p.pts) > 0 {
+			prev := p.pts[len(p.pts)-1]
+			if math.Hypot(float64(pt.x-prev.x), float64(pt.y-prev.y)) < 0.05 {
+				continue
+			}
+			p.cum = append(p.cum, p.cum[len(p.cum)-1]+float32(math.Hypot(float64(pt.x-prev.x), float64(pt.y-prev.y))))
+		} else {
+			p.cum = append(p.cum, 0)
+		}
+		p.pts = append(p.pts, pt)
+	}
+	return p
+}
+
+func (p flightPath) length() float32 {
+	if len(p.cum) == 0 {
+		return 0
+	}
+	return p.cum[len(p.cum)-1]
+}
+
+func (p flightPath) at(distance float32) (x, y, angle float32, ok bool) {
+	if len(p.pts) == 0 {
+		return 0, 0, 0, false
+	}
+	if len(p.pts) == 1 {
+		return p.pts[0].x, p.pts[0].y, 0, true
+	}
+	distance = max(0, min(distance, p.length()))
+	i := 1
+	for i < len(p.cum) && p.cum[i] < distance {
+		i++
+	}
+	if i >= len(p.pts) {
+		i = len(p.pts) - 1
+	}
+	from, to := p.pts[i-1], p.pts[i]
+	seg := max(p.cum[i]-p.cum[i-1], 0.001)
+	t := max(0, min((distance-p.cum[i-1])/seg, 1))
+	x = from.x + (to.x-from.x)*t
+	y = from.y + (to.y-from.y)*t
+	angle = float32(math.Atan2(float64(to.y-from.y), float64(to.x-from.x)) * 180 / math.Pi)
+	return x, y, angle, true
+}
+
+func (p flightPath) reversed() flightPath {
+	raw := make([]flightPoint, len(p.pts))
+	for i := range p.pts {
+		raw[i] = p.pts[len(p.pts)-1-i]
+	}
+	return newFlightPath(raw)
+}
+
+func cubicFlightPoints(ax, ay, bx, by float32) []flightPoint {
+	const steps = 40
+	dx := max((bx-ax)*0.48, 22)
+	out := make([]flightPoint, 0, steps+1)
+	for i := 0; i <= steps; i++ {
+		t := float32(i) / steps
+		u := 1 - t
+		x := u*u*u*ax + 3*u*u*t*(ax+dx) + 3*u*t*t*(bx-dx) + t*t*t*bx
+		y := u*u*u*ay + 3*u*u*t*ay + 3*u*t*t*by + t*t*t*by
+		out = append(out, flightPoint{x, y})
+	}
+	return out
+}
+
+func stageOutboundPath(agent, hub nodeBox, provider *nodeBox) flightPath {
+	ax, ay := agent.rightCenter()
+	hlx, hly := hub.leftCenter()
+	hcx, hcy := hub.x+hub.w/2, hub.y+hub.h/2
+	raw := cubicFlightPoints(ax, ay, hlx, hly)
+	// The via across the hub is covered by the node, but gives the bird a
+	// continuous arc through it instead of jumping between two paths.
+	raw = append(raw[1:], cubicFlightPoints(hlx, hly, hcx, hcy)...)
+	if provider == nil {
+		return newFlightPath(raw)
+	}
+	hrx, hry := hub.rightCenter()
+	raw = append(raw[1:], cubicFlightPoints(hcx, hcy, hrx, hry)...)
+	px, py := provider.leftCenter()
+	raw = append(raw[1:], cubicFlightPoints(hrx, hry, px, py)...)
+	return newFlightPath(raw)
+}
+
+func agentToHubPath(agent, hub nodeBox) flightPath {
+	ax, ay := agent.rightCenter()
+	hlx, hly := hub.leftCenter()
+	return newFlightPath(cubicFlightPoints(ax, ay, hlx, hly))
+}
+
+func providerToHubPath(hub nodeBox, provider *nodeBox) flightPath {
+	if provider == nil {
+		return flightPath{}
+	}
+	px, py := provider.leftCenter()
+	hrx, hry := hub.rightCenter()
+	return newFlightPath(cubicFlightPoints(px, py, hrx, hry))
+}
+
+func hubToProviderPath(hub nodeBox, provider *nodeBox) flightPath {
+	if provider == nil {
+		return flightPath{}
+	}
+	hrx, hry := hub.rightCenter()
+	px, py := provider.leftCenter()
+	return newFlightPath(cubicFlightPoints(hrx, hry, px, py))
+}
+
+type flightMoment struct {
+	phase     flightPhase
+	elapsed   time.Duration
+	local     time.Duration
+	progress  float32
+	hasPhase  bool
+	returning bool
+	finished  bool
+}
+
+// flightMomentAt maps a track to its current real phase. Replay follows the
+// replay cursor; a live request follows monotonic frame time and then a
+// short return leg once the Gateway drops it. No untracked request is made.
+func flightMomentAt(f flightTrack, now time.Time) flightMoment {
+	elapsed := f.observed
+	if !f.inReplay {
+		if f.done {
+			if len(f.phases) > 0 {
+				elapsed = flightPhaseEnd(f.phases)
+			}
+			ret := now.Sub(f.doneAt)
+			if f.doneAt.IsZero() {
+				ret = now.Sub(f.lastSeen)
+			}
+			returnDur := max(f.returnDur, 420*time.Millisecond)
+			return flightMoment{
+				phase:    flightPhase{kind: flightInbound, provider: f.provider, failed: f.failed, final: true},
+				elapsed:  elapsed + max(ret, 0),
+				local:    max(ret, 0),
+				progress: cosineEase(clamp01(float32(ret) / float32(returnDur))),
+				hasPhase: true, returning: true,
+			}
+		}
+		elapsed = max(now.Sub(f.firstSeen), 0)
+	} else if f.done && len(f.phases) > 0 {
+		// Replay time keeps advancing after the recorded completion so
+		// the answer carrier can fly home. It is still the replay clock,
+		// never a fresh live observation.
+		elapsed = f.observed
+	}
+	for _, ph := range f.phases {
+		if elapsed < ph.start {
+			continue
+		}
+		if elapsed <= ph.end || ph == f.phases[len(f.phases)-1] {
+			span := max(ph.end-ph.start, time.Millisecond)
+			local := elapsed - ph.start
+			return flightMoment{
+				phase: ph, elapsed: elapsed, local: local,
+				progress: cosineEase(clamp01(float32(local) / float32(span))),
+				hasPhase: true, returning: ph.kind == flightInbound || ph.kind == flightRetryBack,
+			}
+		}
+	}
+	if f.done {
+		return flightMoment{finished: true}
+	}
+	if len(f.phases) > 0 {
+		ph := f.phases[len(f.phases)-1]
+		return flightMoment{phase: ph, elapsed: elapsed, progress: 1, hasPhase: true}
+	}
+	return flightMoment{}
+}
+
+// drawFlightWire paints the real route above the static node layer so the
+// lit agent-to-hub segment remains visible, as upstream's rt-wires do. The
+// source wire is solid once the route is over and a flowing dashed line
+// while the request or retry is actually in progress.
+func drawFlightWire(p *ui.Painter, stage flightStage, agent nodeBox, f flightTrack, color ui.Color, now time.Time) {
+	moment := flightMomentAt(f, now)
+	provider := stage.providerBox(firstNonEmpty(moment.phase.provider, f.provider))
+	var paths []flightPath
+	if moment.hasPhase {
+		switch moment.phase.kind {
+		case flightRetryBack:
+			paths = append(paths, providerToHubPath(stage.hub, provider))
+		case flightRetryOut:
+			paths = append(paths, hubToProviderPath(stage.hub, provider))
+		case flightInbound:
+			paths = append(paths, providerToHubPath(stage.hub, provider))
+			paths = append(paths, agentToHubPath(agent, stage.hub))
+		default:
+			paths = append(paths, agentToHubPath(agent, stage.hub))
+			paths = append(paths, hubToProviderPath(stage.hub, provider))
+		}
+	} else {
+		paths = append(paths, agentToHubPath(agent, stage.hub))
+		paths = append(paths, hubToProviderPath(stage.hub, provider))
+	}
+	live := !moment.finished && (!f.done || (f.inReplay && moment.phase.kind != flightInbound))
+	for _, path := range paths {
+		if path.length() <= 0 {
+			continue
+		}
+		if live {
+			drawFlowingPath(p, path, color, 1.45, now)
+		} else {
+			drawPolyline(p, flightPoints(path.pts), color.Alpha(0.9), 1.55)
+		}
+	}
+}
+
+// drawFlightActor paints the bird and its packet above the nodes: a request
+// dot out, a held request while an account answers, a failure back through
+// the gateway, and the answer home.
+func drawFlightActor(p *ui.Painter, stage flightStage, agent nodeBox, f flightTrack, agentColor ui.Color, pal palette, now time.Time, reduceMotion bool) {
+	moment := flightMomentAt(f, now)
+	provider := stage.providerBox(firstNonEmpty(moment.phase.provider, f.provider))
+	path := stageOutboundPath(agent, stage.hub, provider)
+	carry := magpieCarryRequest
+	outcome := packetOutcomeUnknown
+	if f.inReplay {
+		// History knows only the final outcome, so the result dot is a
+		// ring for success and red-filled for the final failure.
+		outcome = packetOutcomeOK
+		if f.failed {
+			outcome = packetOutcomeFailed
+		}
+	} else if moment.phase.failed {
+		outcome = packetOutcomeFailed
+	}
+	switch moment.phase.kind {
+	case flightRetryBack:
+		path = providerToHubPath(stage.hub, provider)
+		carry = magpieCarryResult
+	case flightRetryOut:
+		path = hubToProviderPath(stage.hub, provider)
+	case flightInbound:
+		// The outbound wingspan path includes the journey through the
+		// gateway. The answer starts at the account, goes through the
+		// gateway, and lands at the agent, as upstream's home() does.
+		path = stageOutboundPath(agent, stage.hub, provider).reversed()
+		carry = magpieCarryResult
+	}
+	if path.length() <= 0 {
+		return
+	}
+	switch moment.phase.kind {
+	case flightHold:
+		x, y, _, _ := path.at(path.length())
+		drawHeldPacket(p, x, y, agentColor, outcome, now)
+		// The carrier leaves as soon as it lets go of the request. Its
+		// 450ms exit mirrors .rt-flier.away.
+		if moment.local < 450*time.Millisecond {
+			pose := magpiePose{
+				x: x, y: y, scale: 0.72, aim: 0, flapAt: now,
+				body: pal.BirdBody, belly: pal.BirdBelly, far: pal.BirdWing,
+				appear:    1,
+				away:      float32(moment.local) / float32(450*time.Millisecond),
+				flapPhase: float32(moment.local%420) / 420,
+			}
+			drawMagpie(p, pose, agentColor, magpieCarryNone, outcome, reduceMotion)
+		}
+		return
+	case flightInbound:
+		if moment.progress >= 1 && !f.inReplay {
+			return
+		}
+		if moment.progress >= 1 && f.inReplay {
+			return
+		}
+	}
+	d := moment.progress * path.length()
+	x, y, _, ok := path.at(d)
+	if !ok {
+		return
+	}
+	aim, flip := pathAim(path, d)
+	// Upstream eases b._a 12% toward the path's tangent each frame. A
+	// 131ms time constant gives the same response at 60fps and holds it at
+	// other refresh rates, without depending on a fixed frame count.
+	if startAim, _ := pathAim(path, 0); ok {
+		const tau = 131 * time.Millisecond
+		k := 1 - float32(math.Exp(-float64(moment.local)/float64(tau)))
+		aim = startAim + shortestAngle(startAim, aim)*k
+	}
+	// Every flight leg gets a new bird, as upstream's bird("req") and
+	// bird("res") do; rtcome eases it in over 300ms.
+	appear := easeOut(clamp01(float32(moment.local) / float32(300*time.Millisecond)))
+	pose := magpiePose{
+		x: x, y: y, scale: 0.72, aim: aim, flip: flip, flapAt: now,
+		body: pal.BirdBody, belly: pal.BirdBelly, far: pal.BirdWing,
+		appear: appear, flapPhase: float32(moment.local%420) / 420,
+	}
+	drawMagpie(p, pose, agentColor, carry, outcome, reduceMotion)
+}
+
+func pathAim(path flightPath, distance float32) (aim, flip float32) {
+	distance = max(0, min(distance, path.length()))
+	prev := max(0, distance-3)
+	next := min(path.length(), distance+3)
+	x0, y0, _, ok0 := path.at(prev)
+	x1, y1, _, ok1 := path.at(next)
+	if !ok0 || !ok1 {
+		return 0, 1
+	}
+	vx, vy := x1-x0, y1-y0
+	flip = 1
+	if vx < 0 {
+		flip = -1
+	}
+	aim = float32(math.Atan2(float64(vy), math.Abs(float64(vx))) * 180 / math.Pi)
+	return max(-24, min(24, aim)), flip
+}
+
+func shortestAngle(from, to float32) float32 {
+	d := float32(math.Mod(float64(to-from+180), 360))
+	if d < 0 {
+		d += 360
+	}
+	return d - 180
+}
+
+func drawPolyline(p *ui.Painter, pts [][2]float32, color ui.Color, width float32) {
+	if len(pts) < 2 {
+		return
+	}
+	var path ui.Path
+	path.MoveTo(pts[0][0], pts[0][1])
+	for _, pt := range pts[1:] {
+		path.LineTo(pt[0], pt[1])
+	}
+	p.StrokePath(&path, width, color)
+}
+
+func smoothstep(t float32) float32 {
+	t = max(0, min(t, 1))
+	return t * t * (3 - 2*t)
+}
+
+// cubicBezierEase evaluates CSS's cubic-bezier(x1,y1,x2,y2) timing
+// function at progress t. The x axis is solved by Newton's method with a
+// bisection fallback, as browsers do for a monotone timing curve.
+func cubicBezierEase(x1, y1, x2, y2, t float32) float32 {
+	t = clamp01(t)
+	if t == 0 || t == 1 {
+		return t
+	}
+	bezier := func(a, b, u float32) float32 {
+		v := 1 - u
+		return 3*v*v*u*a + 3*v*u*u*b + u*u*u
+	}
+	slope := func(a, b, u float32) float32 {
+		v := 1 - u
+		return 3*v*v*a + 6*v*u*(b-a) + 3*u*u*(1-b)
+	}
+	u := t
+	for range 6 {
+		x := bezier(x1, x2, u) - t
+		if math.Abs(float64(x)) < 1e-5 {
+			return bezier(y1, y2, u)
+		}
+		d := slope(x1, x2, u)
+		if math.Abs(float64(d)) < 1e-5 {
+			break
+		}
+		u -= x / d
+		if u < 0 || u > 1 {
+			break
+		}
+	}
+	lo, hi := float32(0), float32(1)
+	for range 20 {
+		u = (lo + hi) / 2
+		if bezier(x1, x2, u) < t {
+			lo = u
+		} else {
+			hi = u
+		}
+	}
+	return bezier(y1, y2, (lo+hi)/2)
+}
+
+func easeOut(t float32) float32 {
+	return cubicBezierEase(0, 0, 0.58, 1, t)
+}
+
+func easeDefault(t float32) float32 {
+	return cubicBezierEase(0.25, 0.1, 0.25, 1, t)
+}
+
+func easeAway(t float32) float32 {
+	return cubicBezierEase(0.3, 0, 0.2, 1, t)
+}
+
+func cosineEase(t float32) float32 {
+	t = clamp01(t)
+	return (1 - float32(math.Cos(float64(t)*math.Pi))) / 2
+}
+
+func clamp01(v float32) float32 { return max(0, min(v, 1)) }
+
+func flightPoints(pts []flightPoint) [][2]float32 {
+	out := make([][2]float32, len(pts))
+	for i := range pts {
+		out[i] = [2]float32{pts[i].x, pts[i].y}
+	}
+	return out
+}
+
+type magpiePacket int
+
+const (
+	magpieCarryRequest magpiePacket = iota
+	magpieCarryResult
+	magpieCarryNone
+)
+
+// magpiePose is the complete per-frame pose of the native FLIER. Keeping it
+// independent of route state makes the drawing deterministic and testable.
+type magpiePose struct {
+	x, y   float32
+	scale  float32
+	aim    float32
+	flip   float32
+	flapAt time.Time
+	// flapPhase is this carrier's progress through rtflap's 420ms cycle.
+	// Each leg gets a fresh bird, so concurrent routes do not share one
+	// page-wide wing phase.
+	flapPhase float32
+	appear    float32
+	away      float32
+	body      ui.Color
+	belly     ui.Color
+	far       ui.Color
+	bob       float32
+}
+
+type packetOutcome uint8
+
+const (
+	packetOutcomeUnknown packetOutcome = iota
+	packetOutcomeOK
+	packetOutcomeFailed
+)
+
+// drawMagpie ports the upstream FLIER geometry and layer order: far wing,
+// tail, elliptical body and belly, round head, beak, then the near wing.
+// Both wings scale vertically around the shoulder, matching rtflap, rather
+// than moving independently shaped tips. Agent hue belongs to the packet,
+// not the bird; the bird itself uses the interface ink and card colors.
+func drawMagpie(p *ui.Painter, pose magpiePose, agentColor ui.Color, carry magpiePacket, outcome packetOutcome, reduceMotion bool) {
+	if pose.scale <= 0 {
+		return
+	}
+	aim := pose.aim
+	flip := pose.flip
+	if flip == 0 {
+		flip = 1
+	}
+	if aim > 90 || aim < -90 {
+		flip = -flip
+		if aim > 90 {
+			aim -= 180
+		} else {
+			aim += 180
+		}
+	}
+	aim = max(-24, min(24, aim))
+	appear := pose.appear
+	// CSS's transform order applies scale first and translate last. The
+	// native transform stack below is T * R * S, so an appearance zoom must
+	// also scale the rtcome offset to keep the same path.
+	scale := pose.scale * (0.85 + 0.15*appear)
+	offsetY := pose.bob
+	opacity := appear
+	if pose.away > 0 {
+		k := easeAway(pose.away)
+		scale *= 1 - 0.2*k
+		opacity *= 1 - k
+	}
+	if opacity <= 0.01 {
+		return
+	}
+	body := pose.body
+	if body == (ui.Color{}) {
+		body = ui.Hex("#ededf1")
+	}
+	belly := pose.belly
+	if belly == (ui.Color{}) {
+		belly = ui.Hex("#232327")
+	}
+	far := pose.far
+	if far == (ui.Color{}) {
+		far = body
+	}
+	// The upstream flier is authored around x=-6.5, y=3.2 and then scaled
+	// by 1.2. Bake that origin into the transform so the packet at the beak
+	// remains on the moving path.
+	phase := float32(0)
+	if !reduceMotion {
+		phase = pose.flapPhase
+		if phase == 0 && !pose.flapAt.IsZero() {
+			ms := pose.flapAt.UnixMilli()
+			if ms < 0 {
+				ms = -ms
+			}
+			phase = float32(ms%420) / 420
+		}
+	}
+	wing, skew := wingFrame(phase)
+	farWing, farSkew := wingFrame(phase - 0.03/0.42)
+	appearX := -6 * (1 - appear) * scale
+	appearY := -10 * (1 - appear) * scale
+	away := easeAway(pose.away)
+	awayX := 14 * away
+	awayY := -16 * away
+	// Match the original SVG's coordinate space: translate the whole bird to
+	// the path point, rotate there, then scale the local artwork. Scaling
+	// around pose.x/pose.y would push the negative local coordinates off the
+	// canvas, which made the earlier native FLIER invisible.
+	p.Transform(ui.Translation(pose.x+appearX+awayX, pose.y+offsetY+appearY+awayY), 0, 0, func() {
+		p.Transform(ui.Rotation(aim), 0, 0, func() {
+			p.Transform(ui.Scaling(scale*flip, scale), 0, 0, func() {
+				p.Transform(ui.Translation(-6.5, 3.2).Then(ui.Scaling(1.2, 1.2)), 0, 0, func() {
+					drawMagpieShape(p, body, belly, far, wing, skew, farWing, farSkew, opacity)
+				})
+			})
+		})
+	})
+	drawMagpiePacket(p, pose.x, pose.y, agentColor, belly, carry, outcome)
+}
+
+func wingFrame(phase float32) (scale, skew float32) {
+	// rtflap is cubic-bezier(.45,0,.3,1) with 0%, 100% at scaleY(1) and
+	// 55% at scaleY(-.62) skewX(-8deg).
+	phase -= float32(math.Floor(float64(phase)))
+	k := clamp01(phase)
+	if k <= 0.55 {
+		t := cubicBezierEase(0.45, 0, 0.3, 1, k/0.55)
+		return 1 - 1.62*t, -8 * t
+	}
+	t := cubicBezierEase(0.45, 0, 0.3, 1, (k-0.55)/0.45)
+	return -0.62 + 1.62*t, -8 * (1 - t)
+}
+
+func drawMagpieShape(p *ui.Painter, body, belly, far ui.Color, wing, skew, farWing, farSkew, opacity float32) {
+	alpha := func(c ui.Color) ui.Color { return c.Alpha(opacity) }
+	// far wing: transform around its shoulder (its bottom edge), then skew.
+	p.Transform(ui.Scaling(1, farWing).Then(ui.Skewing(farSkew, 0)), -12.5, -3.2, func() {
+		var wing ui.Path
+		wing.MoveTo(-14.5, -3.4)
+		wing.CubeTo(-16.5, -9.5, -14.2, -15, -8.6, -18.6)
+		wing.CubeTo(-9.4, -12.6, -9.6, -7.4, -9.2, -3.2)
+		wing.Close()
+		p.FillPath(&wing, alpha(body).Alpha(0.45))
+	})
+	var tail ui.Path
+	tail.MoveTo(-31.5, 3.1)
+	tail.LineTo(-18.6, -1.8)
+	tail.LineTo(-17.4, 1.2)
+	tail.LineTo(-30.8, 4.6)
+	tail.Close()
+	p.FillPath(&tail, alpha(body))
+
+	// Draw the upstream ellipse exactly as SVG does, using four cubic
+	// segments.
+	p.FillPath(ellipsePath(-12.2, -1.4, 7.6, 3.9), alpha(body))
+	p.FillPath(ellipsePath(-12.8, 0.4, 4.3, 1.6), alpha(belly))
+	var head ui.Path
+	head.Circle(-4.9, -3.7, 3.1)
+	p.FillPath(&head, alpha(body))
+	var beak ui.Path
+	beak.MoveTo(-2.3, -4.8)
+	beak.LineTo(1.4, -3.3)
+	beak.LineTo(-2.3, -2.2)
+	beak.Close()
+	p.FillPath(&beak, alpha(body))
+
+	p.Transform(ui.Scaling(1, wing).Then(ui.Skewing(skew, 0)), -13.1, -2.8, func() {
+		var near ui.Path
+		near.MoveTo(-15.6, -3.2)
+		near.CubeTo(-17.8, -10.2, -15.2, -16.4, -8.4, -20.4)
+		near.CubeTo(-9.3, -13.6, -9.4, -7.8, -8.8, -2.8)
+		near.Close()
+		p.FillPath(&near, alpha(body))
+		var bar ui.Path
+		bar.MoveTo(-14.6, -5.6)
+		bar.CubeTo(-15.4, -10.4, -13.8, -14.4, -10.4, -17.2)
+		p.StrokePath(&bar, 1.3, alpha(belly))
+	})
+}
+
+func ellipsePath(cx, cy, rx, ry float32) *ui.Path {
+	const k = 0.5522847498
+	var p ui.Path
+	p.MoveTo(cx+rx, cy)
+	p.CubeTo(cx+rx, cy+ry*k, cx+rx*k, cy+ry, cx, cy+ry)
+	p.CubeTo(cx-rx*k, cy+ry, cx-rx, cy+ry*k, cx-rx, cy)
+	p.CubeTo(cx-rx, cy-ry*k, cx-rx*k, cy-ry, cx, cy-ry)
+	p.CubeTo(cx+rx*k, cy-ry, cx+rx, cy-ry*k, cx+rx, cy)
+	p.Close()
+	return &p
+}
+
+func drawMagpiePacket(p *ui.Painter, x, y float32, agentColor, card ui.Color, carry magpiePacket, outcome packetOutcome) {
+	if carry == magpieCarryNone {
+		return
+	}
+	if agentColor == (ui.Color{}) {
+		agentColor = ui.Hex("#8b8b94")
+	}
+	r := float32(4.5)
+	if carry == magpieCarryResult {
+		r = 4
+	}
+	box := ui.Rect{X: x - r, Y: y - r, W: r * 2, H: r * 2}
+	p.Shadow(box, r, 0, 0, 3, 0, agentColor.Alpha(0.55))
+	switch carry {
+	case magpieCarryRequest:
+		p.Fill(box, agentColor, r)
+	case magpieCarryResult:
+		fill, stroke := card, agentColor
+		switch outcome {
+		case packetOutcomeFailed:
+			fill, stroke = agentColor, ui.Hex("#f28b82")
+		}
+		p.Fill(box, fill, r)
+		p.Stroke(box, stroke, r, 2.25)
+	}
+}
+
+// drawStillMagpie renders a deterministic frame of the same FLIER for tests
+// and snapshots. It carries no packet and does not depend on wall time.
+func drawStillMagpie(p *ui.Painter, x, y, scale float32, pal palette) {
+	drawMagpie(p, magpiePose{
+		x: x, y: y, scale: scale, flapAt: time.Unix(0, 0),
+		body: pal.BirdBody, belly: pal.BirdBelly, far: pal.BirdWing,
+		appear: 1,
+	}, ui.Hex("#6366f1"), magpieCarryNone, packetOutcomeUnknown, true)
+}
+
+func drawHeldPacket(p *ui.Painter, x, y float32, color ui.Color, outcome packetOutcome, now time.Time) {
+	pulse := float32(1)
+	if now.UnixMilli()%1200 > 600 {
+		pulse = 0.55
+	}
+	r := float32(4.5)
+	stroke := color
+	if outcome == packetOutcomeFailed {
+		stroke = ui.Hex("#f28b82")
+	}
+	p.Fill(ui.Rect{X: x - r - 2, Y: y - r - 2, W: (r + 2) * 2, H: (r + 2) * 2}, color.Alpha(0.10*pulse), r+2)
+	p.Fill(ui.Rect{X: x - r, Y: y - r, W: r * 2, H: r * 2}, color.Alpha(0.42*pulse), r)
+	p.Stroke(ui.Rect{X: x - r, Y: y - r, W: r * 2, H: r * 2}, stroke.Alpha(pulse), r, 2)
+}
+
+// drawFlowingPath paints a short dash that travels along the actual wire.
+// This is the native equivalent of rt-wires path.live's stroke-dashoffset
+// animation, and costs only the visible dash geometry per frame.
+func drawFlowingPath(p *ui.Painter, path flightPath, color ui.Color, width float32, now time.Time) {
+	const dash, gap float32 = 3, 5
+	period := dash + gap
+	offset := float32(now.UnixMilli()%700) / float32(700) * period
+	length := path.length()
+	for d := -offset; d < length; d += period {
+		from := max(d, 0)
+		to := min(d+dash, length)
+		drawFlightArc(p, path, from, to, color, width)
+	}
+}
+
+func drawFlightArc(p *ui.Painter, path flightPath, from, to float32, color ui.Color, width float32) {
+	if to-from < 0.4 {
+		return
+	}
+	var pts [][2]float32
+	const step = 2.0
+	for d := from; d < to; d += step {
+		x, y, _, ok := path.at(d)
+		if ok {
+			pts = append(pts, [2]float32{x, y})
+		}
+	}
+	x, y, _, ok := path.at(to)
+	if ok {
+		pts = append(pts, [2]float32{x, y})
+	}
+	drawPolyline(p, pts, color, width)
+}
+
 type replayTopology struct {
 	routes  []routing.RouteView
 	playing bool
+	start   time.Time
 }
 
 // replayTopologyState returns only routes that the real replay timeline says
@@ -223,13 +1913,13 @@ func (m *Model) replayTopologyState() (replayTopology, bool) {
 	}
 	_, inFlight := routing.ReplayVisibleRoutes(replay.timeline, replay.position)
 	if len(inFlight) == 0 {
-		return replayTopology{playing: replay.playing}, true
+		return replayTopology{playing: replay.playing, start: replay.timeline.Start}, true
 	}
 	byID := make(map[int64]routing.RouteView, len(snapshot.Routes))
 	for _, rv := range snapshot.Routes {
 		byID[rv.ID] = rv
 	}
-	out := replayTopology{playing: replay.playing}
+	out := replayTopology{playing: replay.playing, start: replay.timeline.Start}
 	for _, route := range inFlight {
 		if rv, ok := byID[route.ID]; ok {
 			out.routes = append(out.routes, rv)
