@@ -182,10 +182,29 @@ func replaySource(s routing.Snapshot, day string, f routing.RouteFilter) (string
 	var key strings.Builder
 	for _, r := range f.Apply(s.Routes) {
 		routes = append(routes, r)
-		fmt.Fprintf(&key, "%d/%d/%t/%d/%d/%s/%d/%s;", r.ID, len(r.Tries), r.Done,
-			r.Status, len(r.Order), r.Time.UTC().Format(time.RFC3339Nano), r.Millis, r.HistoryDay)
+		appendReplayTraceKey(&key, r)
 	}
 	return key.String(), routes
+}
+
+// appendReplayTraceKey fingerprints every field that can change a replay
+// flight phase or window. Try count alone is insufficient: a late history
+// append can fill in an existing try's start, target, duration or failure
+// while the route's count and status stay unchanged.
+func appendReplayTraceKey(b *strings.Builder, r routing.RouteView) {
+	fmt.Fprintf(b, "route:%d/%t/%t/%d/%d/%s/%d/%s/%s/%s;",
+		r.ID, r.Done, r.Active, r.Status, len(r.Order), r.Time.UTC().Format(time.RFC3339Nano),
+		r.Millis, r.HistoryDay, r.Provider, r.Error)
+	for i, w := range r.Order {
+		fmt.Fprintf(b, "o%d:%s/%s/%s/%s/%s;",
+			i, w.ID, w.Provider, w.Name, w.Who, w.Model)
+	}
+	for i, tr := range r.Tries {
+		fmt.Fprintf(b, "t%d:%s/%s/%s/%t/%d/%d/%d/%d/%s/%s/%s/%s/%t;",
+			i, tr.ID, tr.Model, tr.Served, tr.Done, tr.Status, tr.Millis,
+			tr.TTFT, tr.Again, tr.Start.UTC().Format(time.RFC3339Nano),
+			tr.Fail, tr.Error, tr.Fixed, tr.Gone)
+	}
 }
 
 func (m *Model) replayState(now time.Time) (routing.ReplayTimeline, bool, float64, time.Duration, routing.ReplayState) {

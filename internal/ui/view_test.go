@@ -629,6 +629,129 @@ func TestReplaySeekIntoReturnRebuildsInboundFlight(t *testing.T) {
 	}
 }
 
+func TestProviderNodeResolvesSameProviderByModelAccount(t *testing.T) {
+	rows := []providerNode{
+		{Provider: "openai", Name: "OpenAI", Model: "gpt-6", AccountID: "key-a", Who: "alice@example"},
+		{Provider: "openai", Name: "OpenAI", Model: "gpt-5.6", AccountID: "key-b", Who: "bob@example"},
+	}
+	cases := []struct {
+		target providerTarget
+		want   int
+	}{
+		{providerTarget{provider: "openai", model: "gpt-6", accountID: "key-a"}, 0},
+		{providerTarget{provider: "openai", model: "gpt-5.6", accountID: "key-b"}, 1},
+		{providerTarget{provider: "openai", model: "gpt-6", accountID: "key-b"}, 1},
+		{providerTarget{provider: "openai", model: "gpt-6"}, 0},
+		{providerTarget{provider: "openai", model: "gpt-5.6"}, 1},
+		{providerTarget{provider: "openai"}, -1},
+	}
+	for _, c := range cases {
+		if got := indexProviderNode(rows, c.target); got != c.want {
+			t.Errorf("indexProviderNode(%+v) = %d, want %d", c.target, got, c.want)
+		}
+	}
+}
+
+func TestProviderNodeRejectsAmbiguousSameProviderModel(t *testing.T) {
+	rows := []providerNode{
+		{Provider: "openai", Model: "gpt-6", AccountID: "key-a"},
+		{Provider: "openai", Model: "gpt-6", AccountID: "key-b"},
+	}
+	if got := indexProviderNode(rows, providerTarget{provider: "openai", model: "gpt-6"}); got != -1 {
+		t.Fatalf("ambiguous model resolved to row %d; want no endpoint", got)
+	}
+	if got := indexProviderNode(rows, providerTarget{provider: "openai", model: "gpt-6", accountID: "key-b"}); got != 1 {
+		t.Fatalf("exact account resolved to row %d, want row 1", got)
+	}
+}
+
+func TestTraceAttemptTargetKeepsProviderModelAndAccount(t *testing.T) {
+	start := time.Date(2026, 10, 19, 3, 30, 0, 0, time.UTC)
+	rv := routing.RouteView{Route: routing.Route{
+		Time: start, Millis: 1800,
+		Order: []routing.Weighed{
+			{ID: "key-a", Provider: "openai", Who: "alice@example", Model: "gpt-6"},
+			{ID: "key-b", Provider: "openai", Who: "bob@example", Model: "gpt-5.6"},
+		},
+		Tries: []routing.Try{
+			{ID: "key-a", Model: "gpt-6", Start: start, Millis: 400, Status: 429, Fail: "rate"},
+			{ID: "key-b", Model: "gpt-5.6", Start: start.Add(700 * time.Millisecond), Millis: 900, Status: 200, Done: true},
+		},
+	}}
+	attempts, _ := traceFlightAttempts(rv)
+	if len(attempts) != 2 {
+		t.Fatalf("attempts = %d, want 2", len(attempts))
+	}
+	want := []providerTarget{
+		{provider: "openai", model: "gpt-6", accountID: "key-a", who: "alice@example"},
+		{provider: "openai", model: "gpt-5.6", accountID: "key-b", who: "bob@example"},
+	}
+	for i, target := range want {
+		got := providerTarget{
+			provider: attempts[i].provider, model: attempts[i].model,
+			accountID: attempts[i].accountID, who: attempts[i].who,
+		}
+		if got != target {
+			t.Errorf("attempt %d target = %+v, want %+v", i, got, target)
+		}
+	}
+	rows := []providerNode{
+		{Provider: "openai", Model: "gpt-6", AccountID: "key-a", Who: "alice@example"},
+		{Provider: "openai", Model: "gpt-5.6", AccountID: "key-b", Who: "bob@example"},
+	}
+	phases := buildFlightPhases(attempts, 1800*time.Millisecond, true)
+	var retryOut, inbound int
+	for _, phase := range phases {
+		switch phase.kind {
+		case flightRetryOut:
+			retryOut = indexProviderNode(rows, targetForPhase(flightTrack{}, phase))
+		case flightInbound:
+			inbound = indexProviderNode(rows, targetForPhase(flightTrack{}, phase))
+		}
+	}
+	if retryOut != 1 || inbound != 1 {
+		t.Fatalf("retry landed on row %d and return on row %d, want both row 1", retryOut, inbound)
+	}
+}
+
+func TestReplayCacheKeyIncludesTryDetails(t *testing.T) {
+	start := time.Date(2026, 10, 19, 5, 0, 0, 0, time.UTC)
+	route := routing.Route{
+		ID: 901, Time: start, Agent: "codex", Session: "s", Model: "openai/gpt-6",
+		Provider: "openai", Done: true, Status: 200, Millis: 3000,
+		HistoryDay: "2026-10-19",
+		Tries: []routing.Try{{
+			ID: "key-a", Model: "gpt-6", Start: start, Millis: 3000, Status: 200, Done: true,
+		}},
+	}
+	before := routing.Snapshot{Routes: []routing.RouteView{{Route: route, Completeness: routing.Completeness{History: true}}}}
+	firstKey, _ := replaySource(before, "2026-10-19", routing.RouteFilter{})
+
+	changed := route
+	changed.Tries = append([]routing.Try(nil), route.Tries...)
+	changed.Tries[0].Start = start.Add(700 * time.Millisecond)
+	changed.Tries[0].Millis = 2200
+	after := routing.Snapshot{Routes: []routing.RouteView{{Route: changed, Completeness: routing.Completeness{History: true}}}}
+	secondKey, _ := replaySource(after, "2026-10-19", routing.RouteFilter{})
+	if firstKey == secondKey {
+		t.Fatal("replay cache key ignored a Try start/duration update")
+	}
+
+	changed.Tries[0].Model = "gpt-5.6"
+	changed.Tries[0].ID = "key-b"
+	thirdKey, _ := replaySource(after, "2026-10-19", routing.RouteFilter{})
+	if secondKey == thirdKey {
+		t.Fatal("replay cache key ignored a Try target update")
+	}
+
+	changed.Tries[0].Done = false
+	changed.Tries[0].Status = 0
+	fourthKey, _ := replaySource(after, "2026-10-19", routing.RouteFilter{})
+	if thirdKey == fourthKey {
+		t.Fatal("replay cache key ignored a Try completion update")
+	}
+}
+
 func TestRoutingStageKeepsAllConcurrentNodes(t *testing.T) {
 	now := time.Now()
 	store := routing.NewStore()
@@ -675,7 +798,7 @@ func TestRoutingStageKeepsAllConcurrentNodes(t *testing.T) {
 		if indexAgentNode(agents, flight.agent) < 0 {
 			t.Errorf("active flight agent %q has no node", flight.agent)
 		}
-		if indexProviderNode(rows, flight.provider) < 0 {
+		if indexProviderNode(rows, targetForPhase(flight, flightPhase{})) < 0 {
 			t.Errorf("active flight provider %q has no node", flight.provider)
 		}
 	}

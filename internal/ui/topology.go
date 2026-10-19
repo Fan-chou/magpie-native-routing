@@ -135,6 +135,12 @@ func stageIdentityKey(agents []agentNode, rows []providerNode, width, height flo
 		b.WriteByte(0)
 		b.WriteString(row.Name)
 		b.WriteByte(0)
+		b.WriteString(row.Model)
+		b.WriteByte(0)
+		b.WriteString(row.AccountID)
+		b.WriteByte(0)
+		b.WriteString(row.Who)
+		b.WriteByte(0)
 	}
 	return b.String()
 }
@@ -173,6 +179,35 @@ type flightPair struct {
 	provider int
 }
 
+// providerTarget is the exact endpoint a recorded attempt addresses. A
+// provider name alone cannot distinguish two models, or two accounts, under
+// the same provider.
+type providerTarget struct {
+	provider  string
+	model     string
+	accountID string
+	who       string
+}
+
+func targetForPhase(f flightTrack, phase flightPhase) providerTarget {
+	return providerTarget{
+		provider:  firstNonEmpty(phase.provider, f.provider),
+		model:     firstNonEmpty(phase.model, f.model),
+		accountID: firstNonEmpty(phase.accountID, f.accountID),
+		who:       firstNonEmpty(phase.who, f.who),
+	}
+}
+
+func targetForRoute(rv routing.RouteView) providerTarget {
+	if len(rv.Tries) > 0 {
+		return traceAttemptTarget(rv, rv.Tries[len(rv.Tries)-1])
+	}
+	return providerTarget{
+		provider: firstNonEmpty(rv.Provider, rv.DisplayProvider()),
+		model:    rv.Model,
+	}
+}
+
 func newFlightGeometry(stage flightStage) *flightGeometry {
 	key := flightStageKey(stage)
 	return newFlightGeometryKeyed(stage, key)
@@ -201,8 +236,8 @@ func newFlightGeometryKeyed(stage flightStage, key string) *flightGeometry {
 	return g
 }
 
-func (g *flightGeometry) providerIndex(name string) int {
-	return indexProviderNode(g.accounts, name)
+func (g *flightGeometry) providerIndex(target providerTarget) int {
+	return indexProviderNode(g.accounts, target)
 }
 
 func (g *flightGeometry) outboundPath(agentIndex, providerIndex int) flightPath {
@@ -246,7 +281,8 @@ func flightStageKey(stage flightStage) string {
 	for i, row := range stage.rows {
 		name := ""
 		if i < len(stage.accounts) {
-			name = stage.accounts[i].Provider + "\x00" + stage.accounts[i].Name
+			name = stage.accounts[i].Provider + "\x00" + stage.accounts[i].Name + "\x00" +
+				stage.accounts[i].Model + "\x00" + stage.accounts[i].AccountID
 		}
 		fmt.Fprintf(&b, "r:%.2f,%.2f,%.2f,%.2f:%s|", row.x, row.y, row.w, row.h, name)
 	}
@@ -270,16 +306,18 @@ func (m *Model) syncFlightTracks(s routing.Snapshot, routes []routing.RouteView,
 		byID[m.topology.flights[i].routeID] = &m.topology.flights[i]
 	}
 	type input struct {
-		id       int64
-		agent    string
-		model    string
-		provider string
-		failed   bool
-		done     bool
-		observed time.Duration
-		total    time.Duration
-		attempts []flightAttempt
-		phases   []flightPhase
+		id        int64
+		agent     string
+		model     string
+		provider  string
+		accountID string
+		who       string
+		failed    bool
+		done      bool
+		observed  time.Duration
+		total     time.Duration
+		attempts  []flightAttempt
+		phases    []flightPhase
 	}
 	var inputs []input
 	if replayActive {
@@ -287,7 +325,7 @@ func (m *Model) syncFlightTracks(s routing.Snapshot, routes []routing.RouteView,
 			if rv.ID == 0 || rv.Time.IsZero() {
 				return
 			}
-			provider := firstNonEmpty(rv.Provider, rv.DisplayProvider())
+			target := targetForRoute(rv)
 			attempts, total := traceFlightAttempts(rv)
 			if elapsed < 0 {
 				elapsed = 0
@@ -304,7 +342,8 @@ func (m *Model) syncFlightTracks(s routing.Snapshot, routes []routing.RouteView,
 			// this true lets flightMomentAt continue along that leg.
 			done = elapsed >= recordedEnd
 			inputs = append(inputs, input{
-				id: rv.ID, agent: rv.Agent, model: rv.Model, provider: provider,
+				id: rv.ID, agent: rv.Agent, model: rv.Model,
+				provider: target.provider, accountID: target.accountID, who: target.who,
 				failed:   rv.Status >= 400 || rv.Error != "",
 				done:     done,
 				observed: elapsed,
@@ -339,11 +378,14 @@ func (m *Model) syncFlightTracks(s routing.Snapshot, routes []routing.RouteView,
 			delete(byRoute, l.RouteID)
 			elapsed := liveElapsedAt(l, now)
 			if rv, ok := routeByID[l.RouteID]; ok && len(rv.Tries) > 0 {
+				target := targetForRoute(rv)
 				attempts, total := traceFlightAttempts(rv)
 				inputs = append(inputs, input{
 					id: l.RouteID, agent: l.Agent, model: l.Model,
-					provider: firstNonEmpty(rv.Provider, l.Provider, rv.DisplayProvider()),
-					failed:   rv.Status >= 400 || rv.Error != "",
+					provider:  firstNonEmpty(target.provider, l.Provider),
+					accountID: target.accountID,
+					who:       target.who,
+					failed:    rv.Status >= 400 || rv.Error != "",
 					// Concurrency says this route is still active; a
 					// SessionRoute "done" race must not end its bird
 					// before the snapshot drops the request.
@@ -364,12 +406,12 @@ func (m *Model) syncFlightTracks(s routing.Snapshot, routes []routing.RouteView,
 				observed: elapsed,
 				total:    max(elapsed+700*time.Millisecond, 1400*time.Millisecond),
 				attempts: []flightAttempt{{
-					provider: l.Provider, start: 0,
+					provider: l.Provider, model: l.Model, start: 0,
 					end: max(elapsed, 0),
 				}},
 				phases: []flightPhase{
-					{kind: flightOutbound, provider: l.Provider, start: 0, end: outbound},
-					{kind: flightHold, provider: l.Provider, start: outbound, end: max(elapsed, outbound)},
+					{kind: flightOutbound, provider: l.Provider, model: l.Model, start: 0, end: outbound},
+					{kind: flightHold, provider: l.Provider, model: l.Model, start: outbound, end: max(elapsed, outbound)},
 				},
 			})
 		}
@@ -380,6 +422,7 @@ func (m *Model) syncFlightTracks(s routing.Snapshot, routes []routing.RouteView,
 		if !ok {
 			track = &flightTrack{
 				routeID: in.id, agent: in.agent, provider: in.provider,
+				accountID: in.accountID, who: in.who,
 				firstSeen: now.Add(-in.observed),
 			}
 		} else if replayActive {
@@ -398,6 +441,8 @@ func (m *Model) syncFlightTracks(s routing.Snapshot, routes []routing.RouteView,
 			// prefix. Keep the real provider identity used by the row.
 			track.provider = fallback
 		}
+		track.accountID = firstNonEmpty(in.accountID, track.accountID)
+		track.who = firstNonEmpty(in.who, track.who)
 		track.lastSeen = now
 		track.failed = in.failed
 		track.done = in.done
@@ -481,16 +526,26 @@ func buildFlightPhases(attempts []flightAttempt, total time.Duration, withReturn
 			// and takes 1.4s to reach the first account, as upstream's
 			// play() does even when the account answers sooner.
 			out = append(out, flightPhase{
-				kind: flightOutbound, provider: a.provider,
+				kind: flightOutbound, provider: a.provider, model: a.model,
+				accountID: a.accountID, who: a.who,
 				start: 0, end: 1400 * time.Millisecond,
 			})
 			cursor = 1400 * time.Millisecond
 		} else {
 			// A failed answer goes back to the gateway in 620ms, then a
 			// fresh carrier takes the request on in 900ms.
+			prev := attempts[i-1]
 			out = append(out,
-				flightPhase{kind: flightRetryBack, provider: attempts[i-1].provider, start: cursor, end: cursor + 620*time.Millisecond, failed: attempts[i-1].failed},
-				flightPhase{kind: flightRetryOut, provider: a.provider, start: cursor + 620*time.Millisecond, end: cursor + 1520*time.Millisecond},
+				flightPhase{
+					kind: flightRetryBack, provider: prev.provider, model: prev.model,
+					accountID: prev.accountID, who: prev.who,
+					start: cursor, end: cursor + 620*time.Millisecond, failed: prev.failed,
+				},
+				flightPhase{
+					kind: flightRetryOut, provider: a.provider, model: a.model,
+					accountID: a.accountID, who: a.who,
+					start: cursor + 620*time.Millisecond, end: cursor + 1520*time.Millisecond,
+				},
 			)
 			cursor += 1520 * time.Millisecond
 		}
@@ -499,16 +554,19 @@ func buildFlightPhases(attempts []flightAttempt, total time.Duration, withReturn
 		// hold is instantaneous and the bird turns around.
 		holdEnd := max(a.end, cursor)
 		out = append(out, flightPhase{
-			kind: flightHold, provider: a.provider,
-			start: cursor, end: holdEnd, failed: a.failed, final: i == len(attempts)-1,
+			kind: flightHold, provider: a.provider, model: a.model,
+			accountID: a.accountID, who: a.who,
+			start: cursor, end: holdEnd, failed: a.failed,
 		})
 		cursor = holdEnd
 	}
 	if withReturn {
+		last := attempts[len(attempts)-1]
 		out = append(out, flightPhase{
-			kind: flightInbound, provider: attempts[len(attempts)-1].provider,
+			kind: flightInbound, provider: last.provider, model: last.model,
+			accountID: last.accountID, who: last.who,
 			start: cursor, end: cursor + 1400*time.Millisecond,
-			failed: attempts[len(attempts)-1].failed, final: true,
+			failed: last.failed,
 		})
 	}
 	if len(out) == 0 {
@@ -567,9 +625,11 @@ func traceFlightAttempts(rv routing.RouteView) ([]flightAttempt, time.Duration) 
 		}
 		end := start + time.Duration(max(tr.Millis, 0))*time.Millisecond
 		failed := tr.Status >= 400 || tr.Fail != "" || tr.Error != ""
+		target := traceAttemptTarget(rv, tr)
 		out = append(out, flightAttempt{
-			provider: traceAttemptProvider(rv, tr),
-			start:    start, end: end, failed: failed, done: tr.Done,
+			provider: target.provider, model: target.model,
+			accountID: target.accountID, who: target.who,
+			start: start, end: end, failed: failed, done: tr.Done,
 		})
 		if end > total {
 			total = end
@@ -581,11 +641,10 @@ func traceFlightAttempts(rv routing.RouteView) ([]flightAttempt, time.Duration) 
 	return out, total
 }
 
-// traceAttemptProvider finds the provider that actually seated a Try. The
-// trace's Try.ID is the account/key/provider identity that rested after a
-// failure, not necessarily a provider id, so the recorded candidate order is
-// the authoritative mapping when it is available.
-func traceAttemptProvider(rv routing.RouteView, tr routing.Try) string {
+// traceAttemptTarget finds the exact account row that actually seated a Try.
+// Try.ID identifies the account; Model identifies the model when the same
+// account can serve several. The recorded candidate order is authoritative.
+func traceAttemptTarget(rv routing.RouteView, tr routing.Try) providerTarget {
 	for _, w := range rv.Order {
 		if tr.ID != "" && !strings.EqualFold(w.ID, tr.ID) {
 			continue
@@ -594,7 +653,12 @@ func traceAttemptProvider(rv routing.RouteView, tr routing.Try) string {
 			continue
 		}
 		if provider := firstNonEmpty(w.Provider, providerOf(w.Model), w.ID); provider != "" {
-			return provider
+			return providerTarget{
+				provider:  provider,
+				model:     firstNonEmpty(w.Model, tr.Model),
+				accountID: firstNonEmpty(w.ID, tr.ID),
+				who:       w.Who,
+			}
 		}
 	}
 	for _, w := range rv.Order {
@@ -602,10 +666,19 @@ func traceAttemptProvider(rv routing.RouteView, tr routing.Try) string {
 			continue
 		}
 		if provider := firstNonEmpty(w.Provider, providerOf(w.Model), w.ID); provider != "" {
-			return provider
+			return providerTarget{
+				provider:  provider,
+				model:     w.Model,
+				accountID: firstNonEmpty(w.ID, tr.ID),
+				who:       w.Who,
+			}
 		}
 	}
-	return firstNonEmpty(providerOf(tr.Model), rv.Provider, tr.ID)
+	return providerTarget{
+		provider:  firstNonEmpty(providerOf(tr.Model), rv.Provider),
+		model:     firstNonEmpty(tr.Model, rv.Model),
+		accountID: firstNonEmpty(tr.ID, tr.Served),
+	}
 }
 
 func clampDuration(v, lo, hi time.Duration) time.Duration {
@@ -712,18 +785,20 @@ func (m *Model) drawTopology(p *ui.Painter, r ui.Rect, s routing.Snapshot, route
 	activities := make([]topologyActivity, 0, len(s.Live))
 	for _, l := range s.Live {
 		activities = append(activities, topologyActivity{
-			agent: l.Agent, provider: l.Provider, color: pal.Accent,
-			seed: int(l.ID % 997), animate: true,
+			agent: l.Agent, color: pal.Accent,
+			target: providerTarget{provider: l.Provider, model: l.Model},
+			seed:   int(l.ID % 997), animate: true,
 		})
 	}
 	for _, rv := range replay.routes {
+		target := targetForRoute(rv)
 		activity := topologyActivity{
-			agent: rv.Agent, provider: rv.Provider, color: agentHue(rv.Agent),
+			agent: rv.Agent, target: target, color: agentHue(rv.Agent),
 			seed: int(rv.ID % 997), animate: replay.playing,
 			failed: rv.Status >= 400 || rv.Error != "",
 		}
-		if activity.provider == "" {
-			activity.provider = rv.DisplayProvider()
+		if activity.target.provider == "" {
+			activity.target.provider = rv.DisplayProvider()
 		}
 		activities = append(activities, activity)
 	}
@@ -737,7 +812,7 @@ func (m *Model) drawTopology(p *ui.Painter, r ui.Rect, s routing.Snapshot, route
 		gx, gy := layout.gateway.leftCenter()
 		drawCubic(p, point(ax, ay), point(gx, gy), activity.color.Alpha(0.9), 2.2)
 		drawFlier(p, point(ax, ay), point(gx, gy), activity.color, now, activity.seed, activity.failed)
-		pi := indexProviderNode(providers, activity.provider)
+		pi := indexProviderNode(providers, activity.target)
 		if pi >= 0 {
 			gx, gy := layout.gateway.rightCenter()
 			px, py := layout.providers[pi].leftCenter()
@@ -765,12 +840,12 @@ func (m *Model) drawTopology(p *ui.Painter, r ui.Rect, s routing.Snapshot, route
 }
 
 type topologyActivity struct {
-	agent    string
-	provider string
-	color    ui.Color
-	seed     int
-	animate  bool
-	failed   bool
+	agent   string
+	target  providerTarget
+	color   ui.Color
+	seed    int
+	animate bool
+	failed  bool
 }
 
 // drawRoutingStageCanvas keeps the stage's static topology in a MyGo Canvas.
@@ -795,9 +870,9 @@ func (m *Model) drawRoutingStageCanvas(p *ui.Painter, r ui.Rect, s routing.Snaps
 	// coordinates, while live flights below use the window's coordinates.
 	localStage := layoutRoutingStage(ui.Rect{W: r.W, H: r.H}, agents, rows)
 
-	provider := ""
+	target := providerTarget{}
 	if hasSel {
-		provider = firstNonEmpty(sel.Provider, sel.DisplayProvider())
+		target = targetForRoute(sel)
 	}
 	gatewayURL := m.Settings().GatewayURL
 	litAgents := map[string]bool{}
@@ -811,7 +886,11 @@ func (m *Model) drawRoutingStageCanvas(p *ui.Painter, r ui.Rect, s routing.Snaps
 		if ai := indexAgentNode(agents, f.agent); ai >= 0 {
 			litAgents[strings.ToLower(agents[ai].ID)] = true
 		}
-		if pi := indexProviderNode(rows, firstNonEmpty(f.provider, provider)); pi >= 0 {
+		phase := flightPhase{}
+		if len(f.phases) > 0 {
+			phase = f.phases[len(f.phases)-1]
+		}
+		if pi := indexProviderNode(rows, targetForPhase(f, phase)); pi >= 0 {
 			litRows[pi] = true
 		}
 	}
@@ -819,11 +898,11 @@ func (m *Model) drawRoutingStageCanvas(p *ui.Painter, r ui.Rect, s routing.Snaps
 		if ai := indexAgentNode(agents, sel.Agent); ai >= 0 {
 			litAgents[strings.ToLower(agents[ai].ID)] = true
 		}
-		if pi := indexProviderNode(rows, provider); pi >= 0 {
+		if pi := indexProviderNode(rows, target); pi >= 0 {
 			litRows[pi] = true
 		}
 	}
-	stageKey := stageCanvasKey(agents, rows, provider, hasSel, pal, s.GatewayOnline, gatewayURL, litAgents, litRows)
+	stageKey := stageCanvasKey(agents, rows, target.provider, hasSel, pal, s.GatewayOnline, gatewayURL, litAgents, litRows)
 	scale := p.Scale()
 	pixelW, pixelH := int(math.Ceil(float64(r.W*scale))), int(math.Ceil(float64(r.H*scale)))
 	if m.topology.stageCanvas == nil || m.topology.stageCanvasW != pixelW ||
@@ -880,7 +959,7 @@ func (m *Model) drawRoutingStageCanvas(p *ui.Painter, r ui.Rect, s routing.Snaps
 		if !activeFlight && hasSel {
 			ai := indexAgentNode(agents, sel.Agent)
 			if ai >= 0 {
-				drawStillRoute(p, geometry.agents[ai], geometry.hub, geometry.rows, indexProviderNode(rows, provider), agentHue(sel.Agent))
+				drawStillRoute(p, geometry.agents[ai], geometry.hub, geometry.rows, indexProviderNode(rows, target), agentHue(sel.Agent))
 			}
 		}
 		for _, f := range flights {
@@ -936,6 +1015,16 @@ func stageCanvasKey(agents []agentNode, rows []providerNode, provider string, ha
 		b.WriteString(r.Name)
 		b.WriteByte(0)
 		b.WriteString(r.Model)
+		b.WriteByte(0)
+		b.WriteString(r.AccountID)
+		b.WriteByte(0)
+		b.WriteString(r.Who)
+		b.WriteByte(0)
+		b.WriteString(r.Plan)
+		b.WriteByte(0)
+		b.WriteString(r.Note)
+		b.WriteByte(0)
+		b.WriteString(r.Weight)
 		b.WriteByte(0)
 		b.WriteString(r.Status)
 		b.WriteByte(0)
@@ -1052,8 +1141,8 @@ func (m *Model) stageAccountRows(sel routing.RouteView, hasSel bool, live []rout
 	seen := map[string]bool{}
 	add := func(items []providerNode) {
 		for _, n := range items {
-			key := strings.ToLower(n.Provider + "\x00" + n.Name + "\x00" + n.Model + "\x00" + n.Who)
-			if key == "\x00\x00\x00\x00" || seen[key] {
+			key := strings.ToLower(n.Provider + "\x00" + n.Name + "\x00" + n.Model + "\x00" + n.AccountID)
+			if key == "\x00\x00\x00" || seen[key] {
 				continue
 			}
 			seen[key] = true
@@ -1353,7 +1442,10 @@ func flightMomentAt(f flightTrack, now time.Time) flightMoment {
 			}
 			returnDur := max(f.returnDur, 420*time.Millisecond)
 			return flightMoment{
-				phase:    flightPhase{kind: flightInbound, provider: f.provider, failed: f.failed, final: true},
+				phase: flightPhase{
+					kind: flightInbound, provider: f.provider, model: f.model,
+					accountID: f.accountID, who: f.who, failed: f.failed,
+				},
 				elapsed:  elapsed + max(ret, 0),
 				local:    max(ret, 0),
 				progress: cosineEase(clamp01(float32(ret) / float32(returnDur))),
@@ -1400,7 +1492,7 @@ func drawFlightWire(p *ui.Painter, geometry *flightGeometry, agentIndex int, f f
 		return
 	}
 	moment := flightMomentAt(f, now)
-	providerIndex := geometry.providerIndex(firstNonEmpty(moment.phase.provider, f.provider))
+	providerIndex := geometry.providerIndex(targetForPhase(f, moment.phase))
 	var wire [2]flightPath
 	count := 0
 	if moment.hasPhase {
@@ -1471,7 +1563,7 @@ func drawFlightActor(p *ui.Painter, geometry *flightGeometry, agentIndex int, f 
 		return
 	}
 	moment := flightMomentAt(f, now)
-	providerIndex := geometry.providerIndex(firstNonEmpty(moment.phase.provider, f.provider))
+	providerIndex := geometry.providerIndex(targetForPhase(f, moment.phase))
 	path := geometry.outboundPath(agentIndex, providerIndex)
 	carry := magpieCarryRequest
 	outcome := packetOutcomeUnknown
@@ -1996,21 +2088,58 @@ func indexAgentNode(agents []agentNode, id string) int {
 	return -1
 }
 
-func indexProviderNode(providers []providerNode, provider string) int {
-	provider = strings.TrimSpace(provider)
-	if provider == "" {
+func indexProviderNode(providers []providerNode, target providerTarget) int {
+	best, bestScore := -1, 0
+	ambiguous := false
+	for i := range providers {
+		score := providerMatchScore(providers[i], target)
+		if score <= 0 {
+			continue
+		}
+		switch {
+		case score > bestScore:
+			best, bestScore, ambiguous = i, score, false
+		case score == bestScore:
+			ambiguous = true
+		}
+	}
+	if ambiguous {
 		return -1
 	}
-	for i := range providers {
-		row := providers[i]
-		if strings.EqualFold(row.Provider, provider) {
-			return i
-		}
-		if row.Provider == "" && strings.EqualFold(providerOf(row.Model), provider) {
-			return i
-		}
+	return best
+}
+
+// providerMatchScore favors exact recorded account identity, then provider
+// and model. Who is display text and may be masked, so matching never relies
+// on it. A provider-only target can still resolve uniquely, but it never
+// silently chooses the first of two models or accounts under that provider.
+func providerMatchScore(row providerNode, target providerTarget) int {
+	provider := strings.TrimSpace(target.provider)
+	model := strings.TrimSpace(target.model)
+	account := strings.TrimSpace(target.accountID)
+	rowProvider := firstNonEmpty(row.Provider, providerOf(row.Model))
+	if provider != "" && rowProvider != "" && !strings.EqualFold(rowProvider, provider) {
+		return 0
 	}
-	return -1
+	score := 0
+	accountMatch := account != "" && row.AccountID != "" && strings.EqualFold(row.AccountID, account)
+	if accountMatch {
+		score += 100
+	}
+	if model != "" && row.Model != "" && strings.EqualFold(row.Model, model) {
+		score += 30
+	} else if model != "" && row.Model != "" && !accountMatch {
+		// A recorded account id is stronger evidence than a display model
+		// alias; without it, a different model row is not this endpoint.
+		return 0
+	}
+	if provider != "" && rowProvider != "" && strings.EqualFold(rowProvider, provider) {
+		score += 10
+	}
+	if score == 0 && provider == "" && model == "" {
+		return 0
+	}
+	return score
 }
 
 func providerRowsForTopology(sel routing.RouteView, hasSel bool, routes []routing.RouteView, live []routing.LiveRequest, hidden bool) []providerNode {
@@ -2018,8 +2147,8 @@ func providerRowsForTopology(sel routing.RouteView, hasSel bool, routes []routin
 	seen := map[string]bool{}
 	add := func(rows []providerNode) {
 		for _, row := range rows {
-			key := strings.ToLower(row.Provider + "\x00" + row.Name + "\x00" + row.Model)
-			if key == "\x00\x00" || seen[key] {
+			key := strings.ToLower(row.Provider + "\x00" + row.Name + "\x00" + row.Model + "\x00" + row.AccountID)
+			if key == "\x00\x00\x00" || seen[key] {
 				continue
 			}
 			seen[key] = true

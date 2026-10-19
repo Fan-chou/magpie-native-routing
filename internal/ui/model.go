@@ -126,6 +126,8 @@ type flightTrack struct {
 	agent     string
 	model     string
 	provider  string
+	accountID string
+	who       string
 	firstSeen time.Time
 	lastSeen  time.Time
 	removedAt time.Time
@@ -144,11 +146,14 @@ type flightTrack struct {
 // Times are relative to the route's start and come from Try.Start/Millis;
 // the painter maps the provider name to the account row currently on screen.
 type flightAttempt struct {
-	provider string
-	start    time.Duration
-	end      time.Duration
-	failed   bool
-	done     bool
+	provider  string
+	model     string
+	accountID string
+	who       string
+	start     time.Duration
+	end       time.Duration
+	failed    bool
+	done      bool
 }
 
 type flightPhaseKind uint8
@@ -165,12 +170,14 @@ const (
 // Travel legs use short animation durations; the time left over is spent at
 // the account, preserving the real ordering and relative attempt lengths.
 type flightPhase struct {
-	kind     flightPhaseKind
-	provider string
-	start    time.Duration
-	end      time.Duration
-	failed   bool
-	final    bool
+	kind      flightPhaseKind
+	provider  string
+	model     string
+	accountID string
+	who       string
+	start     time.Duration
+	end       time.Duration
+	failed    bool
 }
 
 // NewModel constructs the native presentation model.
@@ -655,11 +662,11 @@ func agentHue(id string) ui.Color {
 func providerRows(r routing.RouteView, hidden bool) []providerNode {
 	var out []providerNode
 	seen := map[string]int{}
-	add := func(provider, name, who, model, plan, status, note string, weight string, current, failed bool) {
+	add := func(provider, name, who, model, accountID, plan, status, note string, weight string, current, failed bool) {
 		// Fold rows for the same provider and model (the gateway may expose
 		// the candidate order and a try separately). Accounts of the same
 		// provider serving different models stay separate.
-		key := strings.ToLower(strings.Join([]string{provider, model}, "\x00"))
+		key := strings.ToLower(strings.Join([]string{provider, model, accountID}, "\x00"))
 		if i, ok := seen[key]; ok {
 			if current {
 				out[i].Current = true
@@ -675,14 +682,11 @@ func providerRows(r routing.RouteView, hidden bool) []providerNode {
 			}
 			return
 		}
-		displayWho := who
-		if hidden && who != "" {
-			displayWho = maskWho(who)
-		}
 		seen[key] = len(out)
 		out = append(out, providerNode{
-			Provider: provider, Name: name, Who: displayWho, Model: model, Plan: plan,
-			Status: status, Note: note, Weight: weight, Current: current, Failed: failed,
+			Provider: provider, Name: name, Who: who, Model: model, Plan: plan,
+			AccountID: accountID, Status: status, Note: note, Weight: weight,
+			Current: current, Failed: failed,
 		})
 	}
 	for i, w := range r.Order {
@@ -708,7 +712,7 @@ func providerRows(r routing.RouteView, hidden bool) []providerNode {
 		if w.Barred {
 			note = "barred"
 		}
-		add(provider, name, w.Who, w.Model, w.Plan, status, note, w.Fixed, current, failed)
+		add(provider, name, w.Who, w.Model, w.ID, w.Plan, status, note, w.Fixed, current, failed)
 		if len(out) > i {
 			out[i].Fallback = w.Fallback
 			out[i].Rest = w.Rest != nil
@@ -725,7 +729,7 @@ func providerRows(r routing.RouteView, hidden bool) []providerNode {
 			continue
 		}
 		status := tryStatus(tr)
-		add(provider, provider, "", tr.Model, "", status, routing.TryFailure(tr), "",
+		add(provider, provider, tr.Served, tr.Model, tr.ID, "", status, routing.TryFailure(tr), "",
 			r.Active && !tr.Done && !tryFailed(tr), tryFailed(tr))
 	}
 	if len(out) == 0 {
@@ -737,14 +741,22 @@ func providerRows(r routing.RouteView, hidden bool) []providerNode {
 			} else if r.Done {
 				status = "done"
 			}
-			add(provider, provider, "", r.Model, "", status, "", "",
+			add(provider, provider, "", r.Model, "", "", status, "", "",
 				r.Active, r.Status >= 400 || r.Error != "")
 		}
 	}
 	if len(r.Live) > 0 && len(out) == 0 {
 		for _, l := range r.Live {
-			add(l.Provider, l.Provider, "", l.Model, "", string(l.Phase), "", "",
+			// Concurrency exposes a session, not the provider account id.
+			add(l.Provider, l.Provider, "", l.Model, "", "", string(l.Phase), "", "",
 				true, false)
+		}
+	}
+	if hidden {
+		for i := range out {
+			if out[i].Who != "" {
+				out[i].Who = maskWho(out[i].Who)
+			}
 		}
 	}
 	return out
@@ -764,16 +776,17 @@ func providerMatchesOrder(order []routing.Weighed, provider, model string) bool 
 }
 
 type providerNode struct {
-	Provider string
-	Name     string
-	Who      string
-	Model    string
-	Plan     string
-	Status   string
-	Note     string
-	Weight   string
-	Current  bool
-	Failed   bool
+	Provider  string
+	Name      string
+	Who       string
+	Model     string
+	AccountID string
+	Plan      string
+	Status    string
+	Note      string
+	Weight    string
+	Current   bool
+	Failed    bool
 	// Fallback and Rest are actual fields of Magpie's Weighed/Try trace;
 	// they let the stage distinguish fallback members and resting accounts.
 	Fallback bool
