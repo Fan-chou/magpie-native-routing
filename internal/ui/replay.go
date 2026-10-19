@@ -18,13 +18,14 @@ func (m *Model) syncReplay(s routing.Snapshot, now time.Time) {
 	day := m.historyDay
 	tab := m.tab
 	cachedKey := m.replay.builtKey
+	speed := m.replay.speed
 	m.mu.RUnlock()
 	if tab != tabHistory || day == "" {
 		return
 	}
 
 	filter := m.filters()
-	key := replayFilterKey(s.Version, day, filter)
+	key := replayFilterKey(s.Version, day, filter, speed)
 	m.mu.Lock()
 	if key != cachedKey {
 		// Only filter and fingerprint the day when the identity of the
@@ -33,19 +34,20 @@ func (m *Model) syncReplay(s routing.Snapshot, now time.Time) {
 		// completed trace five times a second.
 		_, routes := replaySource(s, day, filter)
 		next := routing.BuildDayReplay(routes, day)
-		next.Duration = max(next.Duration, replayPresentationDuration(next, routes))
-		m.replay.windows = buildReplayFlightWindows(next, routes)
-		m.replay.windowEnds = replayWindowEnds(m.replay.windows)
+		next.Duration = max(next.Duration, replayPresentationDuration(next, routes, speed))
+		m.replay.baseWindows = buildReplayFlightWindows(next, routes, speed)
 		hadTimeline := m.replay.loaded && m.replay.builtKey != ""
 		oldPosition := m.replay.position
 		m.replay.timeline = next
-		if m.replay.playing && m.replay.position > next.Duration {
+		m.replay.applySeek()
+		duration := m.replay.timeline.Duration
+		if m.replay.playing && m.replay.position > duration {
 			m.replay.position = 0
 		}
 		m.replay.builtKey = key
 		m.replay.loaded = true
 		m.replay.day = day
-		if m.replay.position > m.replay.timeline.Duration {
+		if m.replay.position > duration {
 			m.replay.position = 0
 		}
 		if m.replay.pendingID != 0 {
@@ -54,10 +56,16 @@ func (m *Model) syncReplay(s routing.Snapshot, now time.Time) {
 			m.replay.playing = false
 			m.replay.lastTick = time.Time{}
 			m.replay.pendingID = 0
+			m.replay.seekAt = offset
+			m.replay.applySeek()
 		} else if !hadTimeline {
 			m.replay.position = 0
-		} else if oldPosition < next.Duration {
+		} else if oldPosition < duration {
 			m.replay.position = oldPosition
+		}
+		if m.replay.position < m.replay.seekAt {
+			m.replay.seekAt = 0
+			m.replay.applySeek()
 		}
 	}
 	m.mu.Unlock()
@@ -67,24 +75,28 @@ func (m *Model) syncReplay(s routing.Snapshot, now time.Time) {
 // Version changes whenever the Store commits real data; day and filter are
 // copied from the model's current controls. The version is part of the key so
 // no caller has to remember to invalidate a separate cache on every state
-// transition.
-func replayFilterKey(version uint64, day string, f routing.RouteFilter) string {
-	return fmt.Sprintf("%d\x00%s\x00%s\x00%s\x00%t", version, day, f.Query, f.Status, f.ActiveOnly)
+// transition. The speed is in it too: a flight's legs last wall time, so how
+// much replay time a bird spans depends on how fast the replay runs.
+func replayFilterKey(version uint64, day string, f routing.RouteFilter, speed float64) string {
+	return fmt.Sprintf("%d\x00%s\x00%s\x00%s\x00%t\x00%g", version, day, f.Query, f.Status, f.ActiveOnly, speed)
 }
 
 // buildReplayFlightWindows records the exact presentation interval of each
 // route's animated flight. The recorded request may have ended while the
 // answer is still flying home, so the window extends through the inbound
 // phase. Seeking into that interval can therefore rebuild the return bird
-// without having played the route before.
-func buildReplayFlightWindows(tl routing.ReplayTimeline, routes []routing.RouteView) []replayFlightWindow {
+// without having played the route before. Legs are wall time at any speed,
+// so a window spans the flight's display time times the speed.
+func buildReplayFlightWindows(tl routing.ReplayTimeline, routes []routing.RouteView, speed float64) []replayFlightWindow {
+	if speed <= 0 {
+		speed = 1
+	}
 	windows := make([]replayFlightWindow, 0, len(routes))
 	for _, rv := range routes {
 		if rv.ID == 0 || rv.Time.IsZero() || !hasFlightAttempt(rv) {
 			continue
 		}
-		attempts, total := traceFlightAttempts(rv)
-		phases := buildFlightPhases(attempts, total, true)
+		_, phases, display := replayFlightPlan(rv, speed, 0)
 		if len(phases) == 0 {
 			continue
 		}
@@ -92,10 +104,13 @@ func buildReplayFlightWindows(tl routing.ReplayTimeline, routes []routing.RouteV
 		if start < 0 {
 			start = 0
 		}
+		_, recorded := traceFlightAttempts(rv)
 		windows = append(windows, replayFlightWindow{
 			routeID: rv.ID,
 			start:   start,
-			end:     start + flightPhaseEnd(phases) + flightAwayDuration,
+			end:     start + time.Duration(float64(display)*speed),
+			recEnd:  start + recorded,
+			display: display,
 		})
 	}
 	sort.SliceStable(windows, func(i, j int) bool {
@@ -105,6 +120,38 @@ func buildReplayFlightWindows(tl routing.ReplayTimeline, routes []routing.RouteV
 		return windows[i].start < windows[j].start
 	})
 	return windows
+}
+
+// applySeek derives the flight windows after a seek to seekAt. A route in
+// flight there flies again from the agent, starting at seekAt; one already
+// over does not fly; later routes keep their recorded start. The timeline
+// runs on until the last restarted bird has landed.
+func (r *replayController) applySeek() {
+	speed := r.speed
+	if speed <= 0 {
+		speed = 1
+	}
+	out := make([]replayFlightWindow, 0, len(r.baseWindows))
+	for _, w := range r.baseWindows {
+		switch {
+		case w.start >= r.seekAt:
+			out = append(out, w)
+		case w.recEnd > r.seekAt:
+			w.shift = r.seekAt - w.start
+			w.start = r.seekAt
+			w.end = r.seekAt + time.Duration(float64(w.display)*speed)
+			out = append(out, w)
+			r.timeline.Duration = max(r.timeline.Duration, w.end)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].start == out[j].start {
+			return out[i].routeID < out[j].routeID
+		}
+		return out[i].start < out[j].start
+	})
+	r.windows = out
+	r.windowEnds = replayWindowEnds(out)
 }
 
 func replayWindowEnds(windows []replayFlightWindow) []time.Duration {
@@ -146,24 +193,44 @@ func activeReplayWindows(windows []replayFlightWindow, prefixEnd []time.Duration
 // bird that the last request launched has landed. It extends presentation
 // time only; recorded route durations and the replay provenance label do not
 // change.
-func replayPresentationDuration(tl routing.ReplayTimeline, routes []routing.RouteView) time.Duration {
+func replayPresentationDuration(tl routing.ReplayTimeline, routes []routing.RouteView, speed float64) time.Duration {
 	end := tl.Duration
 	if tl.Start.IsZero() {
 		return end
+	}
+	if speed <= 0 {
+		speed = 1
 	}
 	for _, rv := range routes {
 		if rv.ID == 0 || rv.Time.IsZero() || !hasFlightAttempt(rv) {
 			continue
 		}
-		attempts, total := traceFlightAttempts(rv)
-		phases := buildFlightPhases(attempts, total, true)
+		_, _, display := replayFlightPlan(rv, speed, 0)
 		at := rv.Time.Sub(tl.Start)
 		if at < 0 {
 			at = 0
 		}
-		end = max(end, at+flightPhaseEnd(phases)+flightAwayDuration)
+		end = max(end, at+time.Duration(float64(display)*speed))
 	}
 	return end
+}
+
+// replayNextFlightIn is how long until the replay reaches the next route's
+// start. The view is built again then, so that route's bird is made with its
+// leg just begun and leaves from the agent, not part way along a wire.
+func (m *Model) replayNextFlightIn(now time.Time) (time.Duration, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if !m.replay.playing || m.replay.speed <= 0 {
+		return 0, false
+	}
+	position := m.replayPositionAtLocked(now)
+	windows := m.replay.windows
+	i := sort.Search(len(windows), func(i int) bool { return windows[i].start > position })
+	if i == len(windows) {
+		return 0, false
+	}
+	return time.Duration(float64(windows[i].start-position) / m.replay.speed), true
 }
 
 func hasFlightAttempt(rv routing.RouteView) bool {
@@ -278,6 +345,8 @@ func (m *Model) toggleReplay(now time.Time) {
 		m.replay.position = 0
 		m.replay.playing = true
 		m.replay.lastTick = now
+		m.replay.seekAt = 0
+		m.replay.applySeek()
 	default:
 		m.replay.playing = true
 		m.replay.lastTick = now
@@ -290,6 +359,8 @@ func (m *Model) restartReplay(now time.Time) {
 	m.replay.position = 0
 	m.replay.playing = m.replay.timeline.Duration > 0
 	m.replay.lastTick = now
+	m.replay.seekAt = 0
+	m.replay.applySeek()
 	m.mu.Unlock()
 }
 
@@ -302,6 +373,13 @@ func (m *Model) seekReplay(seconds float64) {
 		}
 		if m.replay.position < 0 {
 			m.replay.position = 0
+		}
+		// As client.js's seek(): the flights end, and the requests in
+		// flight here fly again from where they are in their story.
+		m.replay.seekAt = m.replay.position
+		m.replay.applySeek()
+		if m.replay.playing {
+			m.replay.lastTick = time.Time{}
 		}
 	}
 	m.mu.Unlock()

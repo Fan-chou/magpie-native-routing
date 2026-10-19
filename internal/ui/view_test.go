@@ -352,16 +352,20 @@ func TestFlightPacingUsesTravelRateOnlyWhileTraveling(t *testing.T) {
 			t.Errorf("phase %d did not use the travel cadence", kind)
 		}
 	}
-	if flightTraveling(phase(flightHold), now.Add(100*time.Millisecond)) {
+	// The carrier's 450ms exit still moves; the long wait after it is still.
+	if !flightTraveling(phase(flightHold), now.Add(100*time.Millisecond)) {
+		t.Error("the carrier's exit at an account did not use the travel cadence")
+	}
+	if flightTraveling(phase(flightHold), now.Add(900*time.Millisecond)) {
 		t.Error("a provider hold used the travel cadence")
 	}
 }
 
-func TestProviderHoldDoesNotRequestAnimationFrames(t *testing.T) {
+func TestProviderHoldIsNotATravelLeg(t *testing.T) {
 	now := time.Now()
-	// A live request past the inbound leg is waiting at its account. The
-	// held packet is visible, but the retained painter must not keep
-	// scheduling animation frames for the whole upstream wait.
+	// A live request past its outbound leg is waiting at its account. The
+	// packet is held still there; only its wire's flow and its pulse keep
+	// the stage drawing, not a flight along a wire.
 	store := routing.NewStore()
 	store.ApplyActive([]routing.LiveRequest{{
 		ID: 41, Agent: "codex", Provider: "qoder", RouteID: 1741,
@@ -376,8 +380,11 @@ func TestProviderHoldDoesNotRequestAnimationFrames(t *testing.T) {
 	if len(flights) != 1 {
 		t.Fatalf("flight tracks = %d, want 1", len(flights))
 	}
-	moment := flightMomentAt(flights[0], now)
-	if !moment.hasPhase || moment.phase.kind != flightHold || flightTraveling(flights[0], now) {
+	// A bird first seen mid-request still flies its whole outbound leg
+	// first; once it has landed the packet waits at the account.
+	held := flights[0].firstSeen.Add(liveOutboundDuration + time.Second)
+	moment := flightMomentAt(flights[0], held)
+	if !moment.hasPhase || moment.phase.kind != flightHold || flightTraveling(flights[0], held) {
 		t.Fatalf("provider hold moment = %+v, want a static hold", moment)
 	}
 }
@@ -1092,7 +1099,7 @@ func TestReplayWithoutTriesDoesNotSynthesizeFlight(t *testing.T) {
 		HistoryDay: "2026-10-19",
 	}}}
 	timeline := routing.BuildDayReplay(routes, "2026-10-19")
-	windows := buildReplayFlightWindows(timeline, routes)
+	windows := buildReplayFlightWindows(timeline, routes, 1)
 	if len(windows) != 0 {
 		t.Fatalf("a trace without tries created flight windows: %+v", windows)
 	}
@@ -1160,7 +1167,7 @@ func TestReplayFlightPausesWithReplayClock(t *testing.T) {
 	model.replay.builtKey = "test"
 	model.replay.timeline = routing.BuildDayReplay(store.Snapshot().Routes, model.historyDay)
 	routes := store.Snapshot().Routes
-	model.replay.windows = buildReplayFlightWindows(model.replay.timeline, routes)
+	model.replay.windows = buildReplayFlightWindows(model.replay.timeline, routes, 1)
 	model.replay.windowEnds = replayWindowEnds(model.replay.windows)
 	model.replay.position = 500 * time.Millisecond
 	model.replay.playing = false
@@ -1210,7 +1217,7 @@ func TestReplayPauseStopsFramesWithLivePhaseFeedback(t *testing.T) {
 	}
 }
 
-func TestReplaySeekIntoReturnRebuildsInboundFlight(t *testing.T) {
+func TestReplaySeekAfterARequestEndedFliesNoBird(t *testing.T) {
 	start := time.Date(2026, 10, 19, 3, 0, 0, 0, time.UTC)
 	route := routing.Route{
 		ID: 88, Time: start, Agent: "claude", Model: "qoder/model",
@@ -1227,36 +1234,19 @@ func TestReplaySeekIntoReturnRebuildsInboundFlight(t *testing.T) {
 	model.setTab(tabHistory)
 	model.SetHistoryDay(start.Format("2006-01-02"))
 	tester := render(t, model, 1240, 900)
-	routes := store.Snapshot().Routes
-	attempts, total := traceFlightAttempts(routes[0])
-	phases := buildFlightPhases(attempts, total, true)
-	inbound := phases[len(phases)-1]
-	if inbound.kind != flightInbound {
-		t.Fatalf("last phase = %+v, want inbound", inbound)
-	}
-	position := time.Duration(route.Millis)*time.Millisecond + 200*time.Millisecond
-	if position <= total || position >= flightPhaseEnd(phases) {
-		t.Fatalf("seek position %v is not inside return leg %v..%v", position, total, flightPhaseEnd(phases))
-	}
-	model.seekReplay(position.Seconds())
+	// client.js's seek(): the flights end; a request already over at the
+	// new position is done and does not fly, even if its answer's
+	// presentation flight home would still have been in the air.
+	model.seekReplay((2*time.Second + 200*time.Millisecond).Seconds())
 	tester.Frame()
 	model.mu.RLock()
 	flights := append([]flightTrack(nil), model.topology.flights...)
 	model.mu.RUnlock()
-	if len(flights) != 1 {
-		t.Fatalf("direct seek reconstructed %d flights, want 1", len(flights))
+	if len(flights) != 0 {
+		t.Fatalf("seek past a finished request flew %d birds, want none", len(flights))
 	}
-	track := flights[0]
-	moment := currentFlightPhase(track, tester.Now())
-	if track.routeID != route.ID || !track.done || moment.phase.kind != flightInbound {
-		t.Fatalf("direct seek flight = %+v, moment = %+v; want inbound for route %d", track, moment, route.ID)
-	}
-	stage, active := model.replayTopologyState()
-	if !active || len(stage.routes) != 1 || stage.routes[0].ID != route.ID {
-		t.Fatalf("seek stage = %+v, active=%v; want route %d", stage.routes, active, route.ID)
-	}
-	if !tester.HasText("Claude Code") || tester.FramePending() {
-		t.Fatalf("paused seek rendered an unaddressable or animating stage: texts=%v pending=%v", tester.Texts(), tester.FramePending())
+	if tester.FramePending() {
+		t.Fatal("paused seek requested animation frames")
 	}
 }
 
@@ -1804,7 +1794,7 @@ func TestNarrowLayoutAndRequestSectionDoNotClip(t *testing.T) {
 	}
 }
 
-func TestReplaySeekIntoAwayTailKeepsInboundBirdAlive(t *testing.T) {
+func TestReplaySeekIntoARequestFliesItAgainFromTheAgent(t *testing.T) {
 	start := time.Date(2026, 10, 19, 3, 10, 0, 0, time.UTC)
 	route := routing.Route{
 		ID: 89, Time: start, Agent: "codex", Model: "qoder/model",
@@ -1817,33 +1807,26 @@ func TestReplaySeekIntoAwayTailKeepsInboundBirdAlive(t *testing.T) {
 	}
 	store := routing.NewStore()
 	store.ReplaceHistory([]routing.Route{route})
-	model, _ := testModel(t, store.Snapshot(), Actions{})
+	s := store.Snapshot()
+	model, _ := testModel(t, s, Actions{})
 	model.setTab(tabHistory)
 	model.SetHistoryDay(start.Format("2006-01-02"))
 	tester := render(t, model, 1240, 900)
-	routes := store.Snapshot().Routes
-	attempts, total := traceFlightAttempts(routes[0])
-	phases := buildFlightPhases(attempts, total, true)
-	end := flightPhaseEnd(phases)
-	position := end + 200*time.Millisecond
-	if position >= end+flightAwayDuration {
-		t.Fatalf("seek position %v is not inside the away tail", position)
-	}
-	model.seekReplay(position.Seconds())
+	// One second into a two-second request: as client.js's seek() plays
+	// it, the bird leaves the agent again, then flies the rest of the
+	// story (here, the answer that came a second later).
+	model.seekReplay(1)
 	tester.Frame()
-	model.mu.RLock()
-	flights := append([]flightTrack(nil), model.topology.flights...)
-	model.mu.RUnlock()
-	if len(flights) != 1 {
-		t.Fatalf("away-tail seek reconstructed %d flights, want 1", len(flights))
-	}
-	moment := currentFlightPhase(flights[0], tester.Now())
-	release := moment.local - (moment.phase.end - moment.phase.start)
-	if moment.phase.kind != flightInbound || moment.progress < 1 || release < 0 || release >= flightAwayDuration {
-		t.Fatalf("away-tail moment = %+v, want an inbound bird in its 450ms away tail", moment)
+	now := tester.Now()
+	model.syncFlightTracks(model.snapshot(), model.snapshot().Routes, now)
+	geometry, stage := stageFor(t, model, model.snapshot(), now)
+	f := trackFor(t, model, route.ID)
+	assertLeavesAgent(t, geometry, stage, f, now)
+	if last := f.phases[len(f.phases)-1]; last.kind != flightInbound {
+		t.Fatalf("restarted flight legs end with %+v, want the answer flying home", last)
 	}
 	if tester.FramePending() {
-		t.Fatal("paused away-tail seek requested animation frames")
+		t.Fatal("paused seek requested animation frames")
 	}
 }
 
@@ -2515,7 +2498,7 @@ func TestStaticStageBitmapKeyCoversDrawnInputs(t *testing.T) {
 	rows := []providerNode{{Provider: "p"}, {Provider: "q"}}
 	now := time.Now()
 	key := func(loc Localization, online bool, url, mode string, lit map[int]bool) string {
-		return staticStageBitmapKey(stage, flightStage{}, palette{}, rows, now, 0, 1, loc, online, url, mode, lit, 900, 400)
+		return staticStageBitmapKey(stage, flightStage{}, palette{}, rows, now, 0, 1, loc, online, url, mode, lit, nil, 900, 400)
 	}
 	en, zh := NewLocalization("en"), NewLocalization("zh")
 	base := key(en, true, "http://a", "smart", map[int]bool{0: true})
@@ -2534,9 +2517,9 @@ func TestStaticStageBitmapKeyCoversDrawnInputs(t *testing.T) {
 		}
 	}
 	// A resize must rebuild the bitmap even when the hub keeps its size.
-	wide := staticStageBitmapKey(stage, flightStage{}, palette{}, rows, now, 0, 1, en, true, "http://a", "smart", nil, 1000, 400)
-	narrower := staticStageBitmapKey(stage, flightStage{}, palette{}, rows, now, 0, 1, en, true, "http://a", "smart", nil, 800, 400)
-	taller := staticStageBitmapKey(stage, flightStage{}, palette{}, rows, now, 0, 1, en, true, "http://a", "smart", nil, 1000, 500)
+	wide := staticStageBitmapKey(stage, flightStage{}, palette{}, rows, now, 0, 1, en, true, "http://a", "smart", nil, nil, 1000, 400)
+	narrower := staticStageBitmapKey(stage, flightStage{}, palette{}, rows, now, 0, 1, en, true, "http://a", "smart", nil, nil, 800, 400)
+	taller := staticStageBitmapKey(stage, flightStage{}, palette{}, rows, now, 0, 1, en, true, "http://a", "smart", nil, nil, 1000, 500)
 	if wide == narrower || wide == taller {
 		t.Error("key ignores stage size")
 	}

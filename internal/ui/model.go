@@ -118,17 +118,23 @@ type uiViewCache struct {
 }
 
 type replayController struct {
-	timeline   routing.ReplayTimeline
-	day        string
-	playing    bool
-	speed      float64
-	position   time.Duration
-	lastTick   time.Time
-	builtKey   string
-	loaded     bool
-	pendingID  int64
-	windows    []replayFlightWindow
-	windowEnds []time.Duration
+	timeline  routing.ReplayTimeline
+	day       string
+	playing   bool
+	speed     float64
+	position  time.Duration
+	lastTick  time.Time
+	builtKey  string
+	loaded    bool
+	pendingID int64
+	// baseWindows are each route's flight from its recorded start. After a
+	// seek, windows replace the ones of routes in flight at seekAt with a
+	// flight that starts there, from the agent, as client.js's seek() plays
+	// them again; routes already over at seekAt do not fly.
+	baseWindows []replayFlightWindow
+	seekAt      time.Duration
+	windows     []replayFlightWindow
+	windowEnds  []time.Duration
 }
 
 // replayFlightWindow is the presentation interval during which a recorded
@@ -138,6 +144,12 @@ type replayFlightWindow struct {
 	routeID int64
 	start   time.Duration
 	end     time.Duration
+	// recEnd is when the recorded request ended, in replay time; display
+	// is its flight's length on the animation clock; shift is how far into
+	// the recorded request a flight restarted by a seek begins.
+	recEnd  time.Duration
+	display time.Duration
+	shift   time.Duration
 }
 
 type topologyState struct {
@@ -164,20 +176,32 @@ type topologyFeedback struct {
 }
 
 // flightTrack is deliberately UI-only animation state. Its route id is the
-// exact Magpie Route ID and every timing input comes from the observed route.
-// It never creates a request that is absent from the snapshot.
+// exact Magpie Route ID and every gate it waits on comes from the observed
+// route. It never creates a request that is absent from the snapshot.
+//
+// A live track is scheduled the way client.js's play() flies: legs of fixed
+// length on the animation clock (firstSeen), each starting when the one
+// before ends or when the trace says the next thing happened. Legs already
+// scheduled are never rewritten, so the bird always leaves one end of a wire
+// and lands at the other.
 type flightTrack struct {
-	routeID     int64
-	agent       string
-	model       string
-	provider    string
-	accountID   string
-	who         string
-	firstSeen   time.Time
-	lastSeen    time.Time
-	removedAt   time.Time
-	doneAt      time.Time
-	returnDur   time.Duration
+	routeID   int64
+	agent     string
+	model     string
+	provider  string
+	accountID string
+	who       string
+	firstSeen time.Time
+	lastSeen  time.Time
+	// where the live packet is (or is flying to), the attempt it is with or
+	// waits for at the hub, and when its last scheduled leg ends.
+	where flightWhere
+	step  int
+	from  time.Duration
+	// leftAt is when a live request waiting at magpie left the Gateway's
+	// snapshot before its trace said where it went; its bird waits there
+	// a while for the completed history.
+	leftAt      time.Time
 	observed    time.Duration
 	total       time.Duration
 	attempts    []flightAttempt
@@ -214,6 +238,19 @@ const (
 	flightRetryBack
 	flightRetryOut
 	flightInbound
+	// flightHubOut is client.js's via() leg: from where the agent wire meets
+	// magpie, across the hub, out along the account's wire. It follows a
+	// wait at magpie for routing to pick.
+	flightHubOut
+)
+
+type flightWhere uint8
+
+const (
+	flightAtNone flightWhere = iota
+	flightAtHub
+	flightAtRow
+	flightAtHome
 )
 
 // flightPhase is a presentation interval ordered from the recorded attempts.
@@ -228,6 +265,9 @@ type flightPhase struct {
 	start     time.Duration
 	end       time.Duration
 	failed    bool
+	// toHub marks a leg that flies to, or back from, magpie itself while
+	// routing has not picked an account: it addresses no row.
+	toHub bool
 }
 
 // NewModel constructs the native presentation model.
@@ -577,14 +617,58 @@ func (m *Model) prepareListSelection(routes []routing.RouteView) {
 		m.selectedID = routes[m.requestSel].ID
 	}
 	m.listRouteID = ids
+	if m.tab != tabLive {
+		return
+	}
+	// A request picked in the live list goes back to live once it has left
+	// the list, as client.js does (#1389): the stage stayed on one
+	// provider's request for hours while every request since went to
+	// another.
+	if m.pinnedID != 0 && indexRoute(routes, m.pinnedID) < 0 {
+		m.pinnedID = 0
+	}
+	// Live and not pinned, the stage and the list follow the request under
+	// way, else the newest: client.js's cur = newest(), and play()'s cur = r.
+	if m.pinnedID == 0 {
+		if shown, ok := liveShownRoute(routes); ok {
+			m.selectedID = shown.ID
+			m.requestSel = indexRoute(routes, shown.ID)
+		}
+	}
 }
 
+// commitListSelection is a request picked in the list. Live, it is
+// client.js's pick(): the stage stays on it (pinned) unless it is the one
+// shown live anyway.
 func (m *Model) commitListSelection(routes []routing.RouteView) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.requestSel >= 0 && m.requestSel < len(routes) {
-		m.selectedID = routes[m.requestSel].ID
+	if m.requestSel < 0 || m.requestSel >= len(routes) {
+		return
 	}
+	m.selectedID = routes[m.requestSel].ID
+	if m.tab != tabLive {
+		return
+	}
+	if shown, ok := liveShownRoute(routes); ok && shown.ID == m.selectedID {
+		m.pinnedID = 0
+	} else {
+		m.pinnedID = m.selectedID
+	}
+}
+
+// liveShownRoute is the request the live stage tells about: the newest one
+// under way, else the newest. Routes are newest first.
+func liveShownRoute(routes []routing.RouteView) (routing.RouteView, bool) {
+	for _, rv := range routes {
+		if rv.Active {
+			return rv, true
+		}
+	}
+	if len(routes) > 0 {
+		return routes[0], true
+	}
+	return routing.RouteView{}, false
 }
 
 func indexRoute(routes []routing.RouteView, id int64) int {
@@ -820,14 +904,19 @@ func (m *Model) groupViews(s routing.Snapshot) []routing.GroupView {
 	return groups
 }
 
+// selectedRoute is the request the stage and its story tell about: a pinned
+// one, else, live, the one under way or the newest, else the list's pick.
 func (m *Model) selectedRoute(routes []routing.RouteView) (routing.RouteView, bool) {
 	m.mu.RLock()
-	id := m.pinnedID
-	if id == 0 {
-		id = m.selectedID
-	}
+	pinned, selected, tab := m.pinnedID, m.selectedID, m.tab
 	m.mu.RUnlock()
-	return routing.SelectRoute(routes, id)
+	if pinned != 0 {
+		return routing.SelectRoute(routes, pinned)
+	}
+	if tab == tabLive {
+		return liveShownRoute(routes)
+	}
+	return routing.SelectRoute(routes, selected)
 }
 
 func (m *Model) togglePin(id int64) {
@@ -947,8 +1036,23 @@ func agentHue(id string) ui.Color {
 // live-only row exposes the provider the Gateway reported, not a guessed
 // order.
 func providerRows(r routing.RouteView, hidden bool) []providerNode {
+	return providerRowsSeeded(r, hidden, nil)
+}
+
+// providerRowsSeeded is providerRows starting from seed rows: the members of
+// a request's group while its candidate order is not known yet. Tries then
+// light the member they went to instead of adding rows of their own.
+func providerRowsSeeded(r routing.RouteView, hidden bool, seed []providerNode) []providerNode {
 	var out []providerNode
 	seen := map[string]int{}
+	for _, n := range seed {
+		key := strings.ToLower(strings.Join([]string{n.Provider, n.Model, n.AccountID}, "\x00"))
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = len(out)
+		out = append(out, n)
+	}
 	add := func(provider, name, who, model, accountID, plan, icon, status, note, weight, kind, routingMode string, current, failed bool) {
 		// Fold rows for the same provider and model (the gateway may expose
 		// the candidate order and a try separately). Accounts of the same
@@ -1011,6 +1115,7 @@ func providerRows(r routing.RouteView, hidden bool) []providerNode {
 			}
 			out[i].Known = w.Known
 			out[i].Used = w.Used
+			out[i].Unlisted = w.Unlisted
 		}
 	}
 	for ti, tr := range r.Tries {
@@ -1086,7 +1191,23 @@ func providerRows(r routing.RouteView, hidden bool) []providerNode {
 // providers.json is Magpie's own read-only source for a provider's logo and
 // display name. A trace value remains authoritative whenever it is present.
 func providerRowsWithConfig(r routing.RouteView, hidden bool, cfg routing.ConfigSnapshot) []providerNode {
-	rows := providerRows(r, hidden)
+	var seed []providerNode
+	if len(r.Order) == 0 {
+		// The public route API gives a request under way its group, not its
+		// weighed candidates; those arrive with the completed history. Until
+		// then the stage shows the group's enabled members from
+		// providers.json, so its rows do not shrink to the one try made and
+		// grow back when the request is over. They are members, not an
+		// observed order: CandidateOrderKnown stays false.
+		for _, member := range groupMembersOn(r, cfg) {
+			provider, model := splitModel(member)
+			if provider == "" {
+				continue
+			}
+			seed = append(seed, providerNode{Provider: provider, Name: provider, Model: model})
+		}
+	}
+	rows := providerRowsSeeded(r, hidden, seed)
 	for i := range rows {
 		info, ok := providerInfoByID(cfg, rows[i].Provider)
 		if !ok {
@@ -1102,6 +1223,99 @@ func providerRowsWithConfig(r routing.RouteView, hidden bool, cfg routing.Config
 		}
 	}
 	return rows
+}
+
+// routeGroupID is the routing group a request asked for: its trace's group,
+// else the "group/<id>" model the agent asked, which is all a request
+// without a session shows while under way.
+func routeGroupID(rv routing.RouteView) string {
+	if rv.Group != nil && rv.Group.ID != "" {
+		return rv.Group.ID
+	}
+	return groupAliasID(rv.Model)
+}
+
+// groupAliasID is the group id in a "group/<id>" model, else "".
+func groupAliasID(model string) string {
+	if len(model) > len("group/") && strings.EqualFold(model[:len("group/")], "group/") {
+		return model[len("group/"):]
+	}
+	return ""
+}
+
+// withConfigGroup fills in what a request's group reference lacks from the
+// group of that id in providers.json. A request under way names only its
+// group's id; its name, members and routing come with the completed
+// history, and the stage's title, story and mode must not change when they
+// do. What the trace says is never replaced.
+func withConfigGroup(rv routing.RouteView, cfg routing.ConfigSnapshot) routing.RouteView {
+	id := routeGroupID(rv)
+	if id == "" {
+		return rv
+	}
+	for _, g := range cfg.Groups {
+		if !strings.EqualFold(g.ID, id) {
+			continue
+		}
+		ref := routing.GroupRef{ID: g.ID}
+		if rv.Group != nil {
+			ref = *rv.Group
+		}
+		ref.Name = firstNonEmpty(ref.Name, g.Name)
+		ref.Routing = firstNonEmpty(ref.Routing, g.Routing)
+		ref.Affinity = firstNonEmpty(ref.Affinity, g.Affinity)
+		ref.Auto = ref.Auto || g.Auto
+		ref.Sink = ref.Sink || g.Sink
+		if len(ref.Members) == 0 {
+			ref.Members = append([]string(nil), groupMembersOn(rv, cfg)...)
+		}
+		if len(ref.Fast) == 0 {
+			ref.Fast = append([]string(nil), g.Fast...)
+		}
+		rv.Group = &ref
+		return rv
+	}
+	return rv
+}
+
+// groupMembersOn lists the enabled members of the routing group a request
+// asked for, as providers.json has them: "provider/model", a context
+// variant ("@1m") dropped, nested groups left out.
+func groupMembersOn(r routing.RouteView, cfg routing.ConfigSnapshot) []string {
+	id := routeGroupID(r)
+	if id == "" {
+		return nil
+	}
+	for _, g := range cfg.Groups {
+		if !strings.EqualFold(g.ID, id) {
+			continue
+		}
+		off := map[string]bool{}
+		for _, m := range g.Off {
+			off[strings.ToLower(m)] = true
+		}
+		levels := map[string]bool{"none": true, "minimal": true, "low": true, "medium": true, "high": true, "xhigh": true, "max": true}
+		for _, l := range g.Levels {
+			levels[strings.ToLower(l)] = true
+		}
+		var out []string
+		for _, m := range g.Members {
+			if off[strings.ToLower(m)] || strings.HasPrefix(strings.ToLower(m), "group/") {
+				continue
+			}
+			if i := strings.IndexByte(m, '@'); i > 0 {
+				m = m[:i]
+			}
+			// A member may fix its reasoning level ("qoder/dfmodel:none");
+			// the model itself may hold a colon ("selfllm:latest").
+			if i := strings.LastIndexByte(m, ':'); i > 0 && levels[strings.ToLower(m[i+1:])] {
+				m = m[:i]
+			}
+			out = append(out, m)
+		}
+		return out
+	}
+	return nil
 }
 
 func providerInfoByID(cfg routing.ConfigSnapshot, id string) (routing.ProviderInfo, bool) {
@@ -1149,8 +1363,11 @@ type providerNode struct {
 	Failed    bool
 	// Fallback and Rest are actual fields of Magpie's Weighed/Try trace;
 	// they let the stage distinguish fallback members and resting accounts.
-	Fallback  bool
-	Rest      bool
+	Fallback bool
+	Rest     bool
+	// Unlisted is a member the group no longer lists; its wire is drawn
+	// like a resting one.
+	Unlisted  bool
 	RestWhy   string
 	RestUntil time.Time
 	Answered  bool

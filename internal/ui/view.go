@@ -201,6 +201,7 @@ func (m *Model) routingHome(c *ui.Context, s routing.Snapshot, p palette, now ti
 	routes := m.viewRoutes(s, history)
 	m.prepareListSelection(routes)
 	sel, ok := m.selectedRoute(routes)
+	sel = withConfigGroup(sel, s.Config)
 	ui.Box(c).Fill().Background(p.Canvas).Children(func() {
 		ui.Scroll(c).Fill().TrackScroll(&m.pageScroll).Children(func() {
 			ui.Column(c).WidthPercent(100).MaxWidth(1200).AlignSelf(ui.Center).Padding(14, 20, 24, 20).Gap(12).Children(func() {
@@ -348,7 +349,7 @@ func (m *Model) routingStageCard(c *ui.Context, s routing.Snapshot, routes []rou
 			ui.Row(c).Gap(0).AlignItems(ui.Center).Wrap().Children(func() {
 				ui.Text(c, title).Bold().FontSize(13).TextColor(p.Text)
 				if ok && sel.Group != nil {
-					ui.Text(c, " · "+loc.T("app.group")+" · "+itoa(len(sel.Order))+" "+loc.T("routing.membersOn")).FontSize(11).TextColor(p.Muted)
+					ui.Text(c, " · "+loc.T("app.group")+" · "+itoa(groupMembersShown(sel, s.Config))+" "+loc.T("routing.membersOn")).FontSize(11).TextColor(p.Muted)
 				}
 			})
 			ui.Text(c, detail).FontSize(12.5).TextColor(p.Muted)
@@ -360,6 +361,11 @@ func (m *Model) routingStageCard(c *ui.Context, s routing.Snapshot, routes []rou
 		// Cards and idle wires are cached in the static Canvas while birds
 		// and live wires stay in the dynamic callback above it.
 		m.routingStageLayers(c, stageHeight, stage, s, p, history)
+		if wait, ok := m.liveTraceWaitIn(now); ok && !history {
+			// A bird waiting at magpie for a finished request's history
+			// flies home when the wait runs out, even if nothing arrives.
+			c.After(wait)
+		}
 		if m.accountMaskAnimating(now) {
 			// rtpii lasts 350ms. It is the only time the masked account text
 			// changes without a store update; request frames just for that
@@ -423,6 +429,15 @@ func boolColor(v bool, yes, no ui.Color) ui.Color {
 		return yes
 	}
 	return no
+}
+
+// groupMembersShown is how many members the stage says a group has on: the
+// weighed candidates once known, else the group's enabled members.
+func groupMembersShown(rv routing.RouteView, cfg routing.ConfigSnapshot) int {
+	if len(rv.Order) > 0 {
+		return len(rv.Order)
+	}
+	return len(groupMembersOn(rv, cfg))
 }
 
 func routeGroupName(rv routing.RouteView) string {
@@ -1273,8 +1288,13 @@ func (m *Model) replayBar(c *ui.Context, s routing.Snapshot, routes []routing.Ro
 			// the cursor to the retained route list and clock. A full tree
 			// build is far more expensive than a paint, so one second is
 			// enough for row/window membership while seeking and pause stay
-			// immediate through their click handlers.
-			c.After(time.Second)
+			// immediate through their click handlers. A route that starts
+			// sooner is built at its start, so its bird leaves the agent.
+			wait := time.Second
+			if next, ok := m.replayNextFlightIn(now); ok {
+				wait = clampDuration(next+time.Millisecond, time.Millisecond, time.Second)
+			}
+			c.After(wait)
 		}
 		_ = replayState
 		_ = routes
