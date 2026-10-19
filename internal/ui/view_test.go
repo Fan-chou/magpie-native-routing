@@ -7,9 +7,11 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
+	"weak"
 
 	"github.com/egoist/mygo/ui"
 
@@ -501,7 +503,7 @@ func TestFlightViaJoinsWiresWithoutHubCenterDetour(t *testing.T) {
 	agent := nodeBox{x: 10, y: 80, w: 124, h: 82}
 	hub := nodeBox{x: 190, y: 70, w: 124, h: 104}
 	provider := nodeBox{x: 370, y: 100, w: 260, h: 44}
-	path := stageOutboundPath(agent, hub, &provider, false)
+	path := stageOutboundPath([]nodeBox{agent}, 0, hub, &provider, false)
 	if len(path.pts) < 4 {
 		t.Fatalf("outbound path has only %d points", len(path.pts))
 	}
@@ -528,6 +530,157 @@ func TestFlightViaJoinsWiresWithoutHubCenterDetour(t *testing.T) {
 	lastBack := back.pts[len(back.pts)-1]
 	if math.Abs(float64(lastBack.x-ax)) > 0.01 || math.Abs(float64(lastBack.y-ay)) > 0.01 {
 		t.Fatalf("reverse path ends at (%v,%v), want agent anchor (%v,%v)", lastBack.x, lastBack.y, ax, ay)
+	}
+}
+
+func TestNarrowProviderLaneKeepsHubBottomAsItsStart(t *testing.T) {
+	hub := nodeBox{x: 260, y: 40, w: 180, h: 104}
+	agents := []nodeBox{{x: 20, y: 40, w: 210, h: 82}}
+	provider := nodeBox{x: 22, y: 220, w: 418, h: 44}
+	path := hubToNarrowProviderPath(hub, agents, &provider)
+	if len(path.pts) == 0 {
+		t.Fatal("narrow provider path is empty")
+	}
+	wantX, wantY := hub.x+hub.w/2, hub.y+hub.h
+	if dx, dy := path.pts[0].x-wantX, path.pts[0].y-wantY; math.Hypot(float64(dx), float64(dy)) > 0.01 {
+		t.Fatalf("narrow path starts at (%.1f,%.1f), want hub bottom (%.1f,%.1f)", path.pts[0].x, path.pts[0].y, wantX, wantY)
+	}
+	// The lane must descend below the lowest agent before it bends left.
+	lowest := agents[0].y + agents[0].h
+	seenBelowAgents := false
+	for _, pt := range path.pts {
+		if pt.y >= lowest-0.01 {
+			seenBelowAgents = true
+			break
+		}
+	}
+	if !seenBelowAgents {
+		t.Fatal("narrow path never reaches the lane below all agents")
+	}
+}
+
+func TestSideBySideNarrowStageUsesHorizontalAgentWire(t *testing.T) {
+	// At 560px the agents and hub are side by side. Upstream's
+	// `h.l > s.r` test therefore chooses the horizontal cubic, not a
+	// bottom-to-top line merely because the page is in its narrow layout.
+	agent := nodeBox{x: 2, y: 40, w: 210, h: 82}
+	hub := nodeBox{x: 240, y: 40, w: 210, h: 104}
+	wire := stageAgentHubPath(agent, hub)
+	wantX, wantY := agent.rightCenter()
+	if math.Hypot(float64(wire.pts[0].x-wantX), float64(wire.pts[0].y-wantY)) > 0.01 {
+		t.Fatalf("wire starts at %+v, want agent right center", wire.pts[0])
+	}
+	end := wire.pts[len(wire.pts)-1]
+	wantX, wantY = hub.leftCenter()
+	if math.Hypot(float64(end.x-wantX), float64(end.y-wantY)) > 0.01 {
+		t.Fatalf("wire ends at %+v, want hub left center", end)
+	}
+	if math.Abs(float64(end.x-wire.pts[0].x)) < 10 || math.Abs(float64(end.y-wire.pts[0].y)) > 20 {
+		t.Fatalf("side-by-side wire is not the shallow horizontal cubic: %+v -> %+v", wire.pts[0], end)
+	}
+}
+
+func TestNarrowOutboundUsesAllAgentsForTheLane(t *testing.T) {
+	narrow := flightStage{
+		narrow: true,
+		agents: []nodeBox{
+			{x: 20, y: 40, w: 210, h: 82},
+			{x: 20, y: 130, w: 210, h: 82},
+		},
+		hub:      nodeBox{x: 260, y: 40, w: 210, h: 104},
+		rows:     []nodeBox{{x: 22, y: 250, w: 448, h: 44}},
+		accounts: []providerNode{{Provider: "qoder", Model: "m"}},
+	}
+	geometry := newFlightGeometry(narrow)
+	first := geometry.outboundPath(0, 0)
+	shared := geometry.hubProvider[0]
+	if len(first.pts) < 3 || len(shared.pts) < 3 {
+		t.Fatalf("narrow paths are too short: flight=%d shared=%d", len(first.pts), len(shared.pts))
+	}
+	// The agent wire itself is selected from the real node rectangles. The
+	// outbound flight must begin at exactly that wire's first sample, rather
+	// than a separately recomputed anchor.
+	wantStart := geometry.agentHub[0].pts[0]
+	if math.Abs(float64(first.pts[0].x-wantStart.x)) > 0.01 || math.Abs(float64(first.pts[0].y-wantStart.y)) > 0.01 {
+		t.Fatalf("flight starts at %+v, want agent wire start %+v", first.pts[0], wantStart)
+	}
+	wire := geometry.agentHub[0]
+	wireEnd := wire.pts[len(wire.pts)-1]
+	wantEndX, wantEndY := narrow.hub.leftCenter()
+	if math.Abs(float64(wireEnd.x-wantEndX)) > 0.01 ||
+		math.Abs(float64(wireEnd.y-wantEndY)) > 0.01 {
+		t.Fatalf("agent wire ends at %+v, want hub left center", wireEnd)
+	}
+	sharedStart := shared.pts[0]
+	if math.Abs(float64(sharedStart.x-(narrow.hub.x+narrow.hub.w/2))) > 0.01 ||
+		math.Abs(float64(sharedStart.y-(narrow.hub.y+narrow.hub.h))) > 0.01 {
+		t.Fatalf("shared narrow wire starts at %+v, want hub bottom", sharedStart)
+	}
+	// The lane must pass below the lowest agent, not just the selected one.
+	lowest := narrow.agents[1].y + narrow.agents[1].h
+	reachesLowest := false
+	for _, pt := range shared.pts {
+		if pt.y >= lowest-0.01 {
+			reachesLowest = true
+			break
+		}
+	}
+	if !reachesLowest {
+		t.Fatalf("lane built from a single agent stopped above the lowest agent: %.1f", lowest)
+	}
+
+	// The provider-lane segment is shared geometry, not merely a matching
+	// start point. Every outbound flight must contain the full static wire
+	// after its via, otherwise an agent with a different vertical position
+	// can visibly leave the lane mid-flight.
+	containsPath := func(path, want flightPath) bool {
+		if len(want.pts) == 0 || len(path.pts) < len(want.pts) {
+			return false
+		}
+		for start := 0; start+len(want.pts) <= len(path.pts); start++ {
+			ok := true
+			for i, pt := range want.pts {
+				if got := path.pts[start+i]; math.Hypot(float64(got.x-pt.x), float64(got.y-pt.y)) > 0.02 {
+					ok = false
+					break
+				}
+			}
+			if ok {
+				return true
+			}
+		}
+		return false
+	}
+	for agentIndex := range narrow.agents {
+		if got := geometry.outboundPath(agentIndex, 0); !containsPath(got, shared) {
+			t.Fatalf("agent %d outbound path does not contain the shared provider lane", agentIndex)
+		}
+	}
+}
+
+func TestFlightTipTangentMatchesUpstreamSampling(t *testing.T) {
+	// tip(wire, true) walks back from the path's actual end. A vertical
+	// descent must therefore arrive pointing down, not right as the old
+	// start-tangent call did in via().
+	descending := newFlightPath([]flightPoint{{x: 100, y: 10}, {x: 100, y: 30}, {x: 100, y: 50}, {x: 100, y: 70}})
+	tx, ty := flightTipTangent(descending, true, false)
+	if math.Abs(float64(tx)) > 0.01 || math.Abs(float64(ty-1)) > 0.01 {
+		t.Fatalf("end tangent = (%.3f,%.3f), want (0,1)", tx, ty)
+	}
+	// The sample point is two DIPs from the endpoint, not simply the last
+	// segment, so a short final turn cannot skew the direction.
+	turning := newFlightPath([]flightPoint{{x: 100, y: 10}, {x: 100, y: 40}, {x: 100, y: 70}, {x: 130, y: 70}, {x: 160, y: 70}})
+	tx, ty = flightTipTangent(turning, true, false)
+	if math.Abs(float64(tx-1)) > 0.01 || math.Abs(float64(ty)) > 0.01 {
+		t.Fatalf("turning end tangent = (%.3f,%.3f), want (1,0)", tx, ty)
+	}
+	startTX, startTY := flightTipTangent(turning, false, false)
+	if math.Abs(float64(startTX)) > 0.01 || math.Abs(float64(startTY-1)) > 0.01 {
+		t.Fatalf("start tangent = (%.3f,%.3f), want (0,1)", startTX, startTY)
+	}
+	backTX, backTY := flightTipTangent(turning, true, true)
+	if math.Abs(float64(backTX+1)) > 0.01 || math.Abs(float64(backTY)) > 0.01 {
+		t.Fatalf("reversed end tangent = (%.3f,%.3f), want (-1,0)", backTX, backTY)
 	}
 }
 
@@ -763,6 +916,63 @@ func TestFlightFramesDoNotLayOutStaticStageText(t *testing.T) {
 	if after != key {
 		t.Fatal("flight frames invalidated the static stage bitmap")
 	}
+}
+
+func TestStaticStageReleasesReplacedBitmaps(t *testing.T) {
+	now := time.Now()
+	store := routing.NewStore()
+	store.ApplyActive([]routing.LiveRequest{{
+		ID: 31, Agent: "codex", Provider: "qoder", RouteID: 1731,
+		Started: now, Millis: 600,
+	}})
+	model, _ := testModel(t, store.Snapshot(), Actions{})
+	tester := render(t, model, 1240, 820)
+	tester.Frame()
+	model.mu.RLock()
+	first := model.topology.staticStage
+	model.mu.RUnlock()
+	if first == nil {
+		t.Fatal("static stage bitmap was not created")
+	}
+	refs := []weak.Pointer[ui.Bitmap]{weak.Make(first)}
+
+	// Exercise the same cache invalidation points as a long-running
+	// desktop session: theme, window size, and display scale.
+	cfg := model.Settings()
+	for i := 0; i < 8; i++ {
+		cfg.Theme = config.ThemeDark
+		if i%2 == 1 {
+			cfg.Theme = config.ThemeLight
+		}
+		model.SetSettings(cfg)
+		tester.SetSize(1000+i*20, 720+i*10)
+		tester.SetScale(1 + float32(i%2))
+		tester.Frame()
+		model.mu.RLock()
+		bitmap := model.topology.staticStage
+		model.mu.RUnlock()
+		if bitmap == nil {
+			t.Fatalf("static stage bitmap disappeared after refresh %d", i)
+		}
+		refs = append(refs, weak.Make(bitmap))
+	}
+
+	// The model retains only the newest bitmap. The older ones must not be
+	// kept alive by a hidden cache or by the renderer's last frame.
+	runtime.GC()
+	runtime.GC()
+	model.mu.RLock()
+	current := model.topology.staticStage
+	model.mu.RUnlock()
+	for i, ref := range refs[:len(refs)-1] {
+		if ref.Value() != nil {
+			t.Fatalf("old static stage bitmap %d survived cache replacement", i)
+		}
+	}
+	if refs[len(refs)-1].Value() == nil {
+		t.Fatal("the current static stage bitmap was collected")
+	}
+	runtime.KeepAlive(current)
 }
 
 func TestFlightGeometryCachesOutboundAndInboundPaths(t *testing.T) {

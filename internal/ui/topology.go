@@ -352,7 +352,7 @@ func newFlightGeometryKeyed(stage flightStage, key string) *flightGeometry {
 		inbound:        make(map[flightPair]flightPath),
 	}
 	for i := range stage.agents {
-		g.agentHub[i] = agentToHubPath(stage.agents[i], stage.hub)
+		g.agentHub[i] = stageAgentHubPath(stage.agents[i], stage.hub)
 		g.agentHubCenter[i] = g.agentHub[i]
 	}
 	for i := range stage.rows {
@@ -382,7 +382,7 @@ func (g *flightGeometry) outboundPath(agentIndex, providerIndex int) flightPath 
 	if path, ok := g.outbound[key]; ok {
 		return path
 	}
-	path := stageOutboundPath(g.agents[agentIndex], g.hub, &g.rows[providerIndex], g.narrow)
+	path := stageOutboundPath(g.agents, agentIndex, g.hub, &g.rows[providerIndex], g.narrow)
 	g.outbound[key] = path
 	return path
 }
@@ -1533,9 +1533,8 @@ func (m *Model) reduceMotionEnabled() bool {
 
 func drawRoutingStatic(p *ui.Painter, r ui.Rect, agentsBoxes []nodeBox, hub nodeBox, rows []providerNode, rowsBoxes []nodeBox, agents []agentNode, litRows map[int]bool, s routing.Snapshot, gatewayURL, mode string, pal palette, now time.Time, narrow bool, loc Localization, maskBlur, maskOpacity float32) {
 	for _, a := range agentsBoxes {
-		ax, ay := a.rightCenter()
-		hx, hy := hub.leftCenter()
-		drawCubic(p, point(ax, ay), point(hx, hy), pal.RouteIdle, 1.3)
+		path := stageAgentHubPath(a, hub)
+		drawFlightPath(p, path, pal.RouteIdle, 1.3)
 	}
 	for i := range rowsBoxes {
 		path := hubToProviderPath(hub, &rowsBoxes[i])
@@ -2694,16 +2693,18 @@ func cubicFlightPoints(ax, ay, bx, by float32) []flightPoint {
 	return out
 }
 
-func stageOutboundPath(agent, hub nodeBox, provider *nodeBox, narrow bool) flightPath {
-	ax, ay := agent.rightCenter()
-	hlx, hly := hub.leftCenter()
-	raw := cubicFlightPoints(ax, ay, hlx, hly)
+func stageOutboundPath(agents []nodeBox, agentIndex int, hub nodeBox, provider *nodeBox, narrow bool) flightPath {
+	if agentIndex < 0 || agentIndex >= len(agents) {
+		return flightPath{}
+	}
+	agentHub := stageAgentHubPath(agents[agentIndex], hub)
+	raw := append([]flightPoint(nil), agentHub.pts...)
 	if provider == nil {
 		return newFlightPath(raw)
 	}
 	var providerPath flightPath
 	if narrow {
-		providerPath = hubToNarrowProviderPath(hub, []nodeBox{agent}, provider)
+		providerPath = hubToNarrowProviderPath(hub, agents, provider)
 	} else {
 		providerPath = hubToProviderPath(hub, provider)
 	}
@@ -2712,34 +2713,46 @@ func stageOutboundPath(agent, hub nodeBox, provider *nodeBox, narrow bool) fligh
 	}
 	// client.js's via() joins the two actual wires with a shallow arc
 	// across the hub, instead of sending the bird through the hub center.
-	// The arc uses each wire's outgoing tangent, so it remains continuous
-	// in both wide and narrow layouts.
-	fromTX, fromTY := flightTangent(raw, 1)
-	toTX, toTY := flightTangent(providerPath.pts, 1)
-	via := viaFlightPoints(hlx, hly, fromTX, fromTY,
+	// It leaves along the direction in which the agent wire arrives and
+	// meets the direction in which the provider wire starts.
+	from := raw[len(raw)-1]
+	fromTX, fromTY := flightTipTangent(agentHub, true, false)
+	toTX, toTY := flightTipTangent(providerPath, false, false)
+	via := viaFlightPoints(from.x, from.y, fromTX, fromTY,
 		providerPath.pts[0].x, providerPath.pts[0].y, toTX, toTY)
 	raw = append(raw, via[1:]...)
 	raw = append(raw, providerPath.pts[1:]...)
 	return newFlightPath(raw)
 }
 
-// flightTangent returns the unit tangent just before/after a polyline
-// point. dir=1 points forward; dir=-1 points backward.
-func flightTangent(points []flightPoint, dir float32) (float32, float32) {
-	if len(points) < 2 {
-		return dir, 0
+// flightTipTangent mirrors client.js's tip(path, atEnd, back): it samples
+// two pixels in from the wire's end and returns the direction a flight
+// leaves or arrives with. Sampling the final polyline segment is not
+// accurate enough because its length changes with the curve's resolution.
+func flightTipTangent(path flightPath, atEnd, back bool) (float32, float32) {
+	length := path.length()
+	if length <= 0 {
+		return 1, 0
 	}
-	// The sampled paths have enough resolution that three points around
-	// either end give a stable tangent without depending on the exact
-	// control-point representation.
-	if dir >= 0 {
-		i := min(3, len(points)-1)
-		dx, dy := points[i].x-points[0].x, points[i].y-points[0].y
-		return normalizeVector(dx, dy, 1, 0)
+	anchor := float32(0)
+	inward := min(float32(2), length)
+	if atEnd {
+		anchor = length
+		inward = max(length-2, 0)
 	}
-	i := max(len(points)-4, 0)
-	dx, dy := points[i].x-points[len(points)-1].x, points[i].y-points[len(points)-1].y
-	return normalizeVector(dx, dy, -1, 0)
+	ax, ay, _, okA := path.at(anchor)
+	bx, by, _, okB := path.at(inward)
+	if !okA || !okB {
+		return 1, 0
+	}
+	dx, dy := bx-ax, by-ay
+	if atEnd {
+		dx, dy = ax-bx, ay-by
+	}
+	if back {
+		dx, dy = -dx, -dy
+	}
+	return normalizeVector(dx, dy, 1, 0)
 }
 
 func normalizeVector(dx, dy, fallbackX, fallbackY float32) (float32, float32) {
@@ -2790,10 +2803,27 @@ func cubicControlPoints(ax, ay, c1x, c1y, c2x, c2y, bx, by float32, steps int) [
 	return out
 }
 
-func agentToHubPath(agent, hub nodeBox) flightPath {
-	ax, ay := agent.rightCenter()
-	hlx, hly := hub.leftCenter()
-	return newFlightPath(cubicFlightPoints(ax, ay, hlx, hly))
+// stageAgentHubPath is client.js's agent wire. Upstream tests the node
+// rectangles, not the breakpoint: h.l > s.r means the hub is still to the
+// right, even in the max560 layout where the two sit side by side. Only a
+// hub that overlaps the agents horizontally uses the vertical bottom-to-top
+// wire.
+func stageAgentHubPath(agent, hub nodeBox) flightPath {
+	if hub.x > agent.x+agent.w {
+		ax, ay := agent.rightCenter()
+		hx, hy := hub.leftCenter()
+		mx := (agent.x + agent.w + hub.x) / 2
+		return newFlightPath(cubicControlPoints(
+			ax, ay,
+			mx, ay,
+			mx, hy,
+			hx, hy,
+			40,
+		))
+	}
+	ax, ay := agent.x+agent.w/2, agent.y+agent.h
+	hx, hy := hub.x+hub.w/2, hub.y
+	return newFlightPath([]flightPoint{{x: ax, y: ay}, {x: hx, y: hy}})
 }
 
 func providerToHubPath(hub nodeBox, provider *nodeBox) flightPath {
@@ -2833,9 +2863,18 @@ func hubToNarrowProviderPath(hub nodeBox, agents []nodeBox, provider *nodeBox) f
 	var raw []flightPoint
 	raw = append(raw, flightPoint{x: hcx, y: hcxBottom})
 	raw = append(raw, flightPoint{x: hcx, y: laneTop})
-	raw = append(raw[1:], cubicFlightPoints(hcx, laneTop, laneX, laneTop+24)...)
-	raw = append(raw[1:], flightPoint{x: laneX, y: py - 10})
-	raw = append(raw[1:], quadraticFlightPoints(laneX, py-10, laneX, py, px, py, 8)...)
+	// fromHub(): C h.cx y+22, x y+2, x y+24. The control points are
+	// asymmetric in the original SVG path; a generic midpoint cubic bends
+	// the lane differently and makes the bird leave the static wire.
+	raw = append(raw, cubicControlPoints(
+		hcx, laneTop,
+		hcx, laneTop+22,
+		laneX, laneTop+2,
+		laneX, laneTop+24,
+		32,
+	)[1:]...)
+	raw = append(raw, flightPoint{x: laneX, y: py - 10})
+	raw = append(raw, quadraticFlightPoints(laneX, py-10, laneX, py, px, py, 8)[1:]...)
 	return newFlightPath(raw)
 }
 
