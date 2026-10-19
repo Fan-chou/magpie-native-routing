@@ -120,6 +120,7 @@ go build -o bin/magpie-native ./cmd/magpie-native
 - 读取到真实 `~/.config/magpie/routing` 的 14 天历史，最新一天有真实记录。
 - `providers.json` 可读，路由组和自动组可展示。
 - 已实际启动原生窗口并确认拓扑、历史和详情界面渲染。
+- Agent、Provider 与 Gateway 图标复用上游 Magpie MIT 授权的真实 SVG/PNG 资产，来源与许可证记录在 `internal/ui/assets/icons/NOTICE.md`。
 
 ## 已实现
 
@@ -153,7 +154,7 @@ go build -o bin/magpie-native ./cmd/magpie-native
 
 静态层与动态层分离：
 
-- `ui.Canvas` 缓存 Agent、Gateway、Provider 卡片、静态曲线和文字，避免每帧重排/重绘拓扑。
+- `ui.Canvas` 缓存 Agent、Gateway、Provider 卡片、静态曲线和卡片底；文字、真实品牌图标和状态胶囊位于动态层，避免首帧文字采样问题，同时不因状态文字更新重建整张拓扑。
 - 动态层只绘制飞鸟、请求圆点、流动虚线与选中路径高亮。
 - 位置按路径累计弧长采样，而不是按贝塞尔 `t` 采样，避免转弯处速度突跳。
 - 每只鸟、每个飞行段独立使用阶段时钟；支持多请求并发和回放暂停。
@@ -183,4 +184,4 @@ internal/testutil/   仅用于测试的明确合成样本
 - Magpie: https://github.com/yetone/magpie
 - MyGo: https://github.com/egoist/mygo
 
-独立集成项目，与上游无官方关联。未直接复制上游界面资源或专有源码。
+独立集成项目，与上游无官方关联。`internal/ui/assets/icons/` 中使用上游 MIT 授权的品牌图标，归属和许可证见该目录的 `NOTICE.md`；未复制上游其他专有源码。

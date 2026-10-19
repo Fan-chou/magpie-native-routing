@@ -34,8 +34,24 @@ func (b nodeBox) leftCenter() (float32, float32) {
 func point(x, y float32) [2]float32 { return [2]float32{x, y} }
 
 const (
-	routingStageMinHeight = float32(258)
-	routingStagePadding   = float32(20)
+	// .rt-stage's own 22px top and bottom padding plus the tallest default
+	// node (the hub's 104px). Growing it further leaves the large empty
+	// band the earlier native layout showed above and below the stage.
+	routingStageMinHeight = float32(148)
+	routingStagePadding   = float32(22)
+	// routing narrow breakpoint follows the stage's own content box, as
+	// client.js's ResizeObserver does on .rt (not the whole window).
+	routingStageNarrowWidth = float32(560)
+	routingStageRowWidth    = float32(460)
+	routingStageAgentWidth  = float32(124)
+	routingStageHubWidth    = float32(124)
+	routingStageColumnGap   = float32(56)
+	routingStageNarrowGap   = float32(28)
+	routingStageAgentH      = float32(82)
+	routingStageAgentGap    = float32(10)
+	routingStageRowH        = float32(44)
+	routingStageRowGap      = float32(7)
+	routingStageHubH        = float32(104)
 )
 
 type routingStageSizing struct {
@@ -45,26 +61,30 @@ type routingStageSizing struct {
 	rowGap   float32
 }
 
-// routingStageSizing compacts node spacing as concurrency rises instead of
-// hiding requests. The stage grows to fit every observed agent and provider
-// row, with all active flights remaining addressable by their real identity.
+// routingStageSizing compacts rows only when there are more than fit the
+// original proportions. Upstream's normal card is never changed merely to
+// squeeze one more row in: the stage grows first, then the denser classes
+// used by .rt-srcs.many and .rt-accts keep every endpoint addressable.
 func routingStageMetrics(agentCount, rowCount int) routingStageSizing {
-	m := routingStageSizing{agentH: 78, agentGap: 8, rowH: 44, rowGap: 7}
+	m := routingStageSizing{
+		agentH: routingStageAgentH, agentGap: routingStageAgentGap,
+		rowH: routingStageRowH, rowGap: routingStageRowGap,
+	}
 	switch {
 	case agentCount > 12:
-		m.agentH, m.agentGap = 48, 3
+		m.agentH, m.agentGap = 54, 4
 	case agentCount > 8:
-		m.agentH, m.agentGap = 58, 5
+		m.agentH, m.agentGap = 62, 5
 	case agentCount > 4:
-		m.agentH, m.agentGap = 68, 6
+		m.agentH, m.agentGap = 70, 7
 	}
 	switch {
 	case rowCount > 12:
-		m.rowH, m.rowGap = 30, 3
+		m.rowH, m.rowGap = 32, 3
 	case rowCount > 8:
-		m.rowH, m.rowGap = 34, 4
+		m.rowH, m.rowGap = 37, 4
 	case rowCount > 5:
-		m.rowH, m.rowGap = 38, 5
+		m.rowH, m.rowGap = 41, 5
 	}
 	return m
 }
@@ -81,22 +101,31 @@ func routingStageContentHeight(agentCount, rowCount int) float32 {
 	return max(
 		stageStackHeight(agentCount, metrics.agentH, metrics.agentGap),
 		stageStackHeight(rowCount, metrics.rowH, metrics.rowGap),
-		98,
+		routingStageHubH,
 	)
 }
 
-// layoutRoutingStage returns geometry in the coordinate space of r. A canvas
-// pass calls it with a local rect and the live layer offsets the result to
-// window coordinates.
+// layoutRoutingStage returns geometry in the coordinate space of r. The
+// wide layout is the original CSS grid exactly: 124px for agents, 124px for
+// the hub, 56px gaps and the flexible column for accounts. At or below 560px
+// the stage becomes two columns, agents beside the hub and accounts below,
+// with the lane down the left that client.js's fromHub() draws.
+//
+// The same function feeds the static canvas, the live birds and the route
+// wires, so no coordinate is recomputed for one layer and not another.
 func layoutRoutingStage(r ui.Rect, agents []agentNode, rows []providerNode) flightStage {
-	agentW := float32(124)
-	gap := min(float32(56), max(r.W*0.055, 24))
-	hubW := float32(124)
-	providerW := max(r.W-agentW-hubW-gap*2, 220)
-	total := agentW + gap + hubW + gap + providerW
-	startX := r.X + max((r.W-total)/2, 8)
-	centerY := r.Y + r.H/2
 	metrics := routingStageMetrics(len(agents), len(rows))
+	content := nodeBox{x: r.X + 2, y: r.Y + 16, w: max(r.W-4, 0), h: max(r.H-32, 0)}
+	if content.w <= routingStageNarrowWidth {
+		return layoutNarrowRoutingStage(content, agents, rows, metrics)
+	}
+	return layoutWideRoutingStage(content, agents, rows, metrics)
+}
+
+func layoutWideRoutingStage(r nodeBox, agents []agentNode, rows []providerNode, metrics routingStageSizing) flightStage {
+	providerW := max(r.w-routingStageAgentWidth-routingStageHubWidth-2*routingStageColumnGap, 160)
+	startX := r.x + max((r.w-(routingStageAgentWidth+routingStageHubWidth+2*routingStageColumnGap+providerW))/2, 0)
+	centerY := r.y + r.h/2
 
 	agentStack := stageStackHeight(len(agents), metrics.agentH, metrics.agentGap)
 	agentTop := centerY - agentStack/2
@@ -104,13 +133,12 @@ func layoutRoutingStage(r ui.Rect, agents []agentNode, rows []providerNode) flig
 	for i := range agents {
 		agentBoxes = append(agentBoxes, nodeBox{
 			x: startX, y: agentTop + float32(i)*(metrics.agentH+metrics.agentGap),
-			w: agentW, h: metrics.agentH,
+			w: routingStageAgentWidth, h: metrics.agentH,
 		})
 	}
-
-	hubX := startX + agentW + gap
-	hub := nodeBox{x: hubX, y: centerY - 49, w: hubW, h: 98}
-	rowsX := hubX + hubW + gap
+	hubX := startX + routingStageAgentWidth + routingStageColumnGap
+	hub := nodeBox{x: hubX, y: centerY - routingStageHubH/2, w: routingStageHubWidth, h: routingStageHubH}
+	rowsX := hubX + routingStageHubWidth + routingStageColumnGap
 	rowStack := stageStackHeight(len(rows), metrics.rowH, metrics.rowGap)
 	rowsTop := centerY - rowStack/2
 	rowBoxes := make([]nodeBox, 0, len(rows))
@@ -121,6 +149,38 @@ func layoutRoutingStage(r ui.Rect, agents []agentNode, rows []providerNode) flig
 		})
 	}
 	return flightStage{agents: agentBoxes, hub: hub, accounts: rows, rows: rowBoxes}
+}
+
+// layoutNarrowRoutingStage is the .rt.max560 grid: 1fr 1fr with 28px
+// between them and 26px between its rows. Agents and hub share the first
+// row; the provider list is grid-column 1 / -1 below, 22px in from the left
+// for the lane that client.js's fromHub() draws.
+func layoutNarrowRoutingStage(r nodeBox, agents []agentNode, rows []providerNode, metrics routingStageSizing) flightStage {
+	colW := max((r.w-routingStageNarrowGap)/2, 96)
+	agentStack := stageStackHeight(len(agents), metrics.agentH, metrics.agentGap)
+	topRowH := max(agentStack, routingStageHubH)
+	top := r.y
+	agentTop := top + (topRowH-agentStack)/2
+	agentBoxes := make([]nodeBox, 0, len(agents))
+	for i := range agents {
+		agentBoxes = append(agentBoxes, nodeBox{
+			x: r.x, y: agentTop + float32(i)*(metrics.agentH+metrics.agentGap),
+			w: colW, h: metrics.agentH,
+		})
+	}
+	hub := nodeBox{x: r.x + colW + routingStageNarrowGap, y: top + (topRowH-routingStageHubH)/2, w: colW, h: routingStageHubH}
+
+	rowsTop := top + topRowH + 26
+	rowsX := r.x + 22
+	rowsW := max(r.w-22, 160)
+	rowBoxes := make([]nodeBox, 0, len(rows))
+	for i := range rows {
+		rowBoxes = append(rowBoxes, nodeBox{
+			x: rowsX, y: rowsTop + float32(i)*(metrics.rowH+metrics.rowGap),
+			w: rowsW, h: metrics.rowH,
+		})
+	}
+	return flightStage{agents: agentBoxes, hub: hub, accounts: rows, rows: rowBoxes, narrow: true}
 }
 
 func stageIdentityKey(agents []agentNode, rows []providerNode, width, height float32) string {
@@ -153,14 +213,16 @@ type flightStage struct {
 	hub      nodeBox
 	accounts []providerNode
 	rows     []nodeBox
+	narrow   bool
 }
 
 // flightGeometry owns every curve that can be flown on one stage layout.
 // The paths are rebuilt only when a node moves, resizes, or changes
 // identity; animation frames then reuse the exact same arc-length tables.
 type flightGeometry struct {
-	key string
-	hub nodeBox
+	key    string
+	hub    nodeBox
+	narrow bool
 
 	agents   []nodeBox
 	accounts []providerNode
@@ -217,6 +279,7 @@ func newFlightGeometryKeyed(stage flightStage, key string) *flightGeometry {
 	g := &flightGeometry{
 		hub: stage.hub, agents: stage.agents,
 		accounts: stage.accounts, rows: stage.rows,
+		narrow:         stage.narrow,
 		agentHub:       make([]flightPath, len(stage.agents)),
 		agentHubCenter: make([]flightPath, len(stage.agents)),
 		providerHub:    make([]flightPath, len(stage.rows)),
@@ -229,8 +292,12 @@ func newFlightGeometryKeyed(stage flightStage, key string) *flightGeometry {
 		g.agentHubCenter[i] = g.agentHub[i]
 	}
 	for i := range stage.rows {
-		g.providerHub[i] = providerToHubPath(stage.hub, &stage.rows[i])
-		g.hubProvider[i] = hubToProviderPath(stage.hub, &stage.rows[i])
+		if stage.narrow {
+			g.hubProvider[i] = hubToNarrowProviderPath(stage.hub, stage.agents, &stage.rows[i])
+		} else {
+			g.hubProvider[i] = hubToProviderPath(stage.hub, &stage.rows[i])
+		}
+		g.providerHub[i] = g.hubProvider[i].reversed()
 	}
 	g.key = key
 	return g
@@ -251,7 +318,7 @@ func (g *flightGeometry) outboundPath(agentIndex, providerIndex int) flightPath 
 	if path, ok := g.outbound[key]; ok {
 		return path
 	}
-	path := stageOutboundPath(g.agents[agentIndex], g.hub, &g.rows[providerIndex])
+	path := stageOutboundPath(g.agents[agentIndex], g.hub, &g.rows[providerIndex], g.narrow)
 	g.outbound[key] = path
 	return path
 }
@@ -267,6 +334,9 @@ func (g *flightGeometry) inboundPath(agentIndex, providerIndex int) flightPath {
 	if path, ok := g.inbound[key]; ok {
 		return path
 	}
+	// A return follows the outbound route backwards. The prior version
+	// rebuilt a reversed pair of cubic legs with a different control
+	// direction, so the bird visibly changed lane at the hub.
 	path := g.outboundPath(agentIndex, providerIndex).reversed()
 	g.inbound[key] = path
 	return path
@@ -274,7 +344,7 @@ func (g *flightGeometry) inboundPath(agentIndex, providerIndex int) flightPath {
 
 func flightStageKey(stage flightStage) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "hub:%.2f,%.2f,%.2f,%.2f|", stage.hub.x, stage.hub.y, stage.hub.w, stage.hub.h)
+	fmt.Fprintf(&b, "n:%t|hub:%.2f,%.2f,%.2f,%.2f|", stage.narrow, stage.hub.x, stage.hub.y, stage.hub.w, stage.hub.h)
 	for _, box := range stage.agents {
 		fmt.Fprintf(&b, "a:%.2f,%.2f,%.2f,%.2f|", box.x, box.y, box.w, box.h)
 	}
@@ -466,6 +536,17 @@ func (m *Model) syncFlightTracks(s routing.Snapshot, routes []routing.RouteView,
 			}
 		}
 		track.inReplay = replayActive
+		// Record a phase transition on the track itself so the account row
+		// can shake (rthit) or pulse (rtlive) without a second identity map
+		// that a retry to the same provider/model/account would collide in.
+		if phase := currentFlightPhase(*track, now); phase.hasPhase {
+			key := fmt.Sprintf("%d\x00%s\x00%s\x00%s\x00%d", in.id, phase.phase.provider, phase.phase.model, phase.phase.accountID, phase.phase.kind)
+			if track.phaseKey != key {
+				track.phaseKey = key
+				track.phaseKind = phase.phase.kind
+				track.phaseAt = now
+			}
+		}
 		next = append(next, *track)
 	}
 	// A route that has left a live Gateway snapshot gets one return leg. It
@@ -932,6 +1013,7 @@ func (m *Model) drawRoutingStageCanvas(p *ui.Painter, r ui.Rect, s routing.Snaps
 	gatewayURL := m.Settings().GatewayURL
 	litAgents := map[string]bool{}
 	litRows := map[int]bool{}
+	activityNow := map[int]bool{}
 	m.mu.Lock()
 	flights := append([]flightTrack(nil), m.topology.flights...)
 	for _, f := range flights {
@@ -947,6 +1029,12 @@ func (m *Model) drawRoutingStageCanvas(p *ui.Painter, r ui.Rect, s routing.Snaps
 		}
 		if pi := indexProviderNode(rows, targetForPhase(f, phase)); pi >= 0 {
 			litRows[pi] = true
+			if moment := flightMomentAt(f, now); moment.hasPhase {
+				switch moment.phase.kind {
+				case flightOutbound, flightRetryOut, flightHold, flightRetryBack:
+					activityNow[pi] = true
+				}
+			}
 		}
 	}
 	if !activityVisible(flights, now) && hasSel {
@@ -975,7 +1063,7 @@ func (m *Model) drawRoutingStageCanvas(p *ui.Painter, r ui.Rect, s routing.Snaps
 	if redraw {
 		m.topology.stageCanvas.Draw(p, func(cp *ui.Painter) {
 			cp.Transform(ui.Scaling(scale, scale), 0, 0, func() {
-				drawRoutingStatic(cp, ui.Rect{W: r.W, H: r.H}, localStage.agents, localStage.hub, rows, localStage.rows, agents, litAgents, litRows, s, gatewayURL, pal)
+				drawRoutingStatic(cp, ui.Rect{W: r.W, H: r.H}, localStage.agents, localStage.hub, rows, localStage.rows, agents, litAgents, litRows, s, gatewayURL, pal, now, localStage.narrow)
 			})
 		})
 		m.mu.Lock()
@@ -1000,6 +1088,10 @@ func (m *Model) drawRoutingStageCanvas(p *ui.Painter, r ui.Rect, s routing.Snaps
 	// painter transform moves the live layer into place without allocating
 	// offset copies of every node on every animation frame.
 	p.Transform(ui.Translation(r.X, r.Y), 0, 0, func() {
+		// Text, logos and state chips are drawn by the live scene on top
+		// of the cached cards. This keeps the first frame legible and lets
+		// a status change update without rebuilding the whole canvas.
+		drawRoutingStageContent(p, localStage.agents, localStage.hub, rows, localStage.rows, agents, litAgents, litRows, activityNow, s, gatewayURL, pal, now, flights)
 		for _, f := range flights {
 			if !flightAlive(f, now) {
 				continue
@@ -1014,7 +1106,7 @@ func (m *Model) drawRoutingStageCanvas(p *ui.Painter, r ui.Rect, s routing.Snaps
 		if !activeFlight && hasSel {
 			ai := indexAgentNode(agents, sel.Agent)
 			if ai >= 0 {
-				drawStillRoute(p, geometry.agents[ai], geometry.hub, geometry.rows, indexProviderNode(rows, target), agentHue(sel.Agent))
+				drawStillRoute(p, geometry, ai, indexProviderNode(rows, target), agentHue(sel.Agent))
 			}
 		}
 		for _, f := range flights {
@@ -1036,6 +1128,9 @@ func (m *Model) drawRoutingStageCanvas(p *ui.Painter, r ui.Rect, s routing.Snaps
 		// The replay clock itself moves even between flights; draw again so
 		// pause, seek and newly started returns stay in step with it.
 		p.AnimationFrame()
+	}
+	if !m.reduceMotionEnabled() && feedbackVisible(flights, now) && (!replayActive || replayPlaying) {
+		p.After(16 * time.Millisecond)
 	}
 }
 
@@ -1059,85 +1154,103 @@ func stageCanvasKey(agents []agentNode, rows []providerNode, provider string, ha
 	for _, a := range agents {
 		b.WriteString(a.ID)
 		b.WriteByte(0)
-		b.WriteString(a.Model)
+		b.WriteString(a.Icon)
 		b.WriteByte(0)
-		b.WriteString(fmt.Sprintf("%t/%d", a.Active, a.Requests))
-		b.WriteByte(0)
+		b.WriteString(fmt.Sprintf("%t", a.Active))
 	}
 	for _, r := range rows {
 		b.WriteString(r.Provider)
 		b.WriteByte(0)
-		b.WriteString(r.Name)
-		b.WriteByte(0)
-		b.WriteString(r.Model)
-		b.WriteByte(0)
-		b.WriteString(r.AccountID)
-		b.WriteByte(0)
-		b.WriteString(r.Who)
-		b.WriteByte(0)
-		b.WriteString(r.Plan)
-		b.WriteByte(0)
-		b.WriteString(r.Note)
-		b.WriteByte(0)
-		b.WriteString(r.Weight)
-		b.WriteByte(0)
-		b.WriteString(r.Status)
+		b.WriteString(r.Icon)
 		b.WriteByte(0)
 		b.WriteString(fmt.Sprintf("%t/%t/%t/%t/%t/%t", r.Current, r.Failed, r.Rest, r.Fallback, r.Answered, r.WentOn))
 		b.WriteByte(0)
 	}
-	b.WriteString(provider)
+	_ = provider
+	_ = hasSel
+	_ = litAgents
+	_ = litRows
+	b.WriteString(gatewayURL)
 	b.WriteByte(0)
-	if hasSel {
-		b.WriteByte(1)
-	}
-	for _, a := range agents {
-		if litAgents[strings.ToLower(a.ID)] {
-			b.WriteByte('A')
-			b.WriteString(a.ID)
-			b.WriteByte(0)
-		}
-	}
-	for i := range rows {
-		if litRows[i] {
-			b.WriteByte('R')
-			b.WriteString(itoa(i))
-			b.WriteByte(0)
-		}
-	}
-	b.WriteString(fmt.Sprintf("%v|%v|%v|%v|%t|%s", pal.Canvas, pal.Panel, pal.Line, pal.Text, online, gatewayURL))
+	b.WriteString(fmt.Sprintf("%v|%v|%v|%v|%t", pal.Canvas, pal.Panel, pal.Line, pal.Text, online))
 	return b.String()
 }
 
-func drawRoutingStatic(p *ui.Painter, r ui.Rect, agentsBoxes []nodeBox, hub nodeBox, rows []providerNode, rowsBoxes []nodeBox, agents []agentNode, litAgents map[string]bool, litRows map[int]bool, s routing.Snapshot, gatewayURL string, pal palette) {
+func drawRoutingStatic(p *ui.Painter, r ui.Rect, agentsBoxes []nodeBox, hub nodeBox, rows []providerNode, rowsBoxes []nodeBox, agents []agentNode, litAgents map[string]bool, litRows map[int]bool, s routing.Snapshot, gatewayURL string, pal palette, now time.Time, narrow bool) {
 	for _, a := range agentsBoxes {
 		ax, ay := a.rightCenter()
 		hx, hy := hub.leftCenter()
 		drawCubic(p, point(ax, ay), point(hx, hy), pal.RouteIdle, 1.3)
 	}
-	for _, row := range rowsBoxes {
-		hx, hy := hub.rightCenter()
-		rx, ry := row.leftCenter()
-		drawCubic(p, point(hx, hy), point(rx, ry), pal.RouteIdle, 1.3)
+	for i := range rowsBoxes {
+		path := hubToProviderPath(hub, &rowsBoxes[i])
+		if narrow {
+			path = hubToNarrowProviderPath(hub, agentsBoxes, &rowsBoxes[i])
+		}
+		drawFlightPath(p, path, pal.RouteIdle, 1.5)
 	}
 	for i, a := range agents {
-		drawRoutingAgentBox(p, agentsBoxes[i].rect(), a, litAgents[strings.ToLower(a.ID)], pal)
+		drawRoutingAgentBox(p, agentsBoxes[i].rect(), a, litAgents[strings.ToLower(a.ID)], pal, false)
 	}
-	drawRoutingHub(p, hub.rect(), s, gatewayURL, pal)
+	drawRoutingHub(p, hub.rect(), s, gatewayURL, pal, false)
 	for i, row := range rows {
-		drawRoutingAccountRow(p, rowsBoxes[i].rect(), row, litRows[i], pal)
+		drawRoutingAccountRow(p, rowsBoxes[i].rect(), row, litRows[i], false, pal, now, false, topologyFeedback{})
 	}
 	_ = r
 }
 
-func drawStillRoute(p *ui.Painter, agent nodeBox, hub nodeBox, rows []nodeBox, providerIndex int, color ui.Color) {
-	ax, ay := agent.rightCenter()
-	hx, hy := hub.leftCenter()
-	drawCubic(p, point(ax, ay), point(hx, hy), color, 1.8)
-	if providerIndex >= 0 && providerIndex < len(rows) {
-		hx, hy = hub.rightCenter()
-		rx, ry := rows[providerIndex].leftCenter()
-		drawCubic(p, point(hx, hy), point(rx, ry), color, 1.8)
+// drawRoutingStageContent paints the text, provider logos and state chips
+// over the cached card layer. MyGo's canvas is ideal for fills and wires, but
+// its first text rasterization can be sampled a frame early when the canvas
+// itself is painted in that same frame. Keeping glyphs and SVG pictures on
+// the live scene avoids a garbled launch frame and makes state text update
+// without invalidating the static canvas at all.
+func drawRoutingStageContent(p *ui.Painter, agentsBoxes []nodeBox, hub nodeBox, rows []providerNode, rowsBoxes []nodeBox, agents []agentNode, litAgents map[string]bool, litRows, activityNow map[int]bool, s routing.Snapshot, gatewayURL string, pal palette, now time.Time, flights []flightTrack) {
+	for i, a := range agents {
+		drawRoutingAgentBox(p, agentsBoxes[i].rect(), a, litAgents[strings.ToLower(a.ID)], pal, true)
+	}
+	drawRoutingHub(p, hub.rect(), s, gatewayURL, pal, true)
+	for i, row := range rows {
+		drawRoutingAccountRow(p, rowsBoxes[i].rect(), row, litRows[i], activityNow[i], pal, now, true, feedbackForRow(flights, row))
+	}
+}
+
+func feedbackForRow(flights []flightTrack, row providerNode) topologyFeedback {
+	var latest topologyFeedback
+	for _, f := range flights {
+		rowProvider := firstNonEmpty(row.Provider, providerOf(row.Model))
+		if !strings.EqualFold(f.provider, rowProvider) && !strings.EqualFold(providerOf(f.model), rowProvider) {
+			continue
+		}
+		if f.accountID != "" && row.AccountID != "" && !strings.EqualFold(f.accountID, row.AccountID) {
+			continue
+		}
+		if (f.phaseKind == flightHold || f.phaseKind == flightRetryBack) && f.phaseAt.After(latest.at) {
+			latest = topologyFeedback{at: f.phaseAt, kind: f.phaseKind, failed: f.failed}
+		}
+	}
+	return latest
+}
+
+func feedbackVisible(flights []flightTrack, now time.Time) bool {
+	for _, f := range flights {
+		if f.phaseAt.IsZero() || f.phaseKind != flightHold && f.phaseKind != flightRetryBack {
+			continue
+		}
+		if age := now.Sub(f.phaseAt); age >= 0 && age < 450*time.Millisecond {
+			return true
+		}
+	}
+	return false
+}
+
+func drawStillRoute(p *ui.Painter, geometry *flightGeometry, agentIndex, providerIndex int, color ui.Color) {
+	if geometry == nil || agentIndex < 0 || agentIndex >= len(geometry.agentHub) {
+		return
+	}
+	drawFlightPath(p, geometry.agentHub[agentIndex], color, 1.5)
+	if providerIndex >= 0 && providerIndex < len(geometry.hubProvider) {
+		drawFlightPath(p, geometry.hubProvider[providerIndex], color, 1.5)
 	}
 }
 
@@ -1167,7 +1280,8 @@ func (m *Model) stageAgents(s routing.Snapshot, sel routing.RouteView, hasSel bo
 		}
 		seen[key] = true
 		out = append(out, agentNode{
-			ID: id, Name: agentName(id), Model: model, Active: active, Hue: agentHue(id),
+			ID: id, Name: agentName(id), Model: model, Icon: agentIcon(id),
+			Active: active, Hue: agentHue(id),
 		})
 	}
 	if replayActive {
@@ -1194,6 +1308,10 @@ func (m *Model) stageAgents(s routing.Snapshot, sel routing.RouteView, hasSel bo
 func (m *Model) stageAccountRows(sel routing.RouteView, hasSel bool, live []routing.LiveRequest, replay []routing.RouteView, replayActive bool) []providerNode {
 	var rows []providerNode
 	seen := map[string]bool{}
+	// Read the immutable config once for the whole stage. Copying the
+	// snapshot for every replayed route would scale a busy history frame
+	// with the number of routes, not the number of visible rows.
+	cfg := m.snapshot().Config
 	add := func(items []providerNode) {
 		for _, n := range items {
 			key := strings.ToLower(n.Provider + "\x00" + n.Name + "\x00" + n.Model + "\x00" + n.AccountID)
@@ -1205,11 +1323,11 @@ func (m *Model) stageAccountRows(sel routing.RouteView, hasSel bool, live []rout
 		}
 	}
 	if hasSel {
-		add(providerRows(sel, m.accountsMasked()))
+		add(providerRowsWithConfig(sel, m.accountsMasked(), cfg))
 	}
 	if replayActive {
 		for _, rv := range replay {
-			add(providerRows(rv, m.accountsMasked()))
+			add(providerRowsWithConfig(rv, m.accountsMasked(), cfg))
 		}
 	} else {
 		for _, l := range live {
@@ -1225,127 +1343,385 @@ func (m *Model) stageAccountRows(sel routing.RouteView, hasSel bool, live []rout
 	return rows
 }
 
-func drawRoutingAgentBox(p *ui.Painter, r ui.Rect, a agentNode, lit bool, pal palette) {
-	border := pal.Line
-	if lit {
-		border = a.Hue
-	}
-	p.Fill(r, pal.Panel, 10)
-	width := float32(1)
-	if lit {
-		width = 1.6
-	}
-	p.Stroke(r, border, 10, width)
-	cx := r.X + r.W/2
-	compact := r.H < 70
-	if compact {
-		p.Fill(ui.Rect{X: r.X + 9, Y: r.Y + r.H/2 - 11, W: 22, H: 22}, a.Hue.Alpha(0.16), 6)
-		p.Text(r.X+14, r.Y+r.H/2-6, agentInitials(a.ID), 8, a.Hue)
-		p.Text(r.X+39, r.Y+r.H/2-16, truncate(agentName(a.ID), 16), 11, pal.Text)
-		p.Text(r.X+39, r.Y+r.H/2-1, truncate(a.Model, 15), 9, pal.Muted)
-		if lit {
-			p.Fill(ui.Rect{X: r.X + r.W - 9, Y: r.Y + 7, W: 5, H: 5}, a.Hue, 3)
-		}
+func drawRoutingAgentBox(p *ui.Painter, r ui.Rect, a agentNode, lit bool, pal palette, content bool) {
+	// .rt-node: card, 1px line, 12px radius, icon 26px, name 13px/600,
+	// detail 11px muted, everything centered. A live request pulses the
+	// agent's dot, not the card outline.
+	if !content {
+		p.Fill(r, pal.Panel, 12)
+		p.Stroke(r, pal.Line, 12, 1)
 		return
 	}
-	p.Fill(ui.Rect{X: cx - 13, Y: r.Y + 8, W: 26, H: 26}, a.Hue.Alpha(0.16), 7)
-	p.Text(cx-8, r.Y+15, agentInitials(a.ID), 9, a.Hue)
-	drawTextCentered(p, agentName(a.ID), cx, r.Y+43, 12, pal.Text)
-	drawTextCentered(p, truncate(a.Model, 19), cx, r.Y+59, 10, pal.Muted)
+	cx := r.X + r.W/2
+	compact := r.H < 70
+	iconSize := float32(26)
+	if compact {
+		iconSize = 20
+	}
+	iconY := r.Y + 10
+	if compact {
+		iconY = r.Y + 8
+	}
+	iconRect := ui.Rect{X: cx - iconSize/2, Y: iconY, W: iconSize, H: iconSize}
+	if !drawRoutingIcon(p, iconRect, []string{a.Icon, a.ID}, pal.Text) {
+		drawGenericIcon(p, iconRect, pal.Muted)
+	}
+	nameY := iconY + iconSize + 3
+	nameSize := float32(13)
+	if compact {
+		nameSize = 11
+		nameY = iconY + iconSize + 2
+	}
+	name := agentName(a.ID)
+	nameW, _ := p.MeasureText(0, ui.Span{Text: name, Size: nameSize, Weight: 600})
+	dot := float32(7)
+	total := nameW + dot + 6
+	dotX := cx - total/2
+	drawTextAt(p, name, dotX+dot+6, nameY, nameSize, 600, pal.Text, r.W-dot-12)
+	dotRect := ui.Rect{X: dotX, Y: nameY + nameSize*0.48, W: dot, H: dot}
+	p.Fill(dotRect, a.Hue, dot/2)
 	if lit {
-		p.Fill(ui.Rect{X: r.X + r.W - 10, Y: r.Y + 8, W: 5, H: 5}, a.Hue, 3)
+		// .rt-src.tick: the agent's dot pulses once when a request leaves.
+		p.Stroke(ui.Rect{X: dotRect.X - 2, Y: dotRect.Y - 2, W: dot + 4, H: dot + 4}, a.Hue.Alpha(0.3), (dot+4)/2, 1)
+	}
+	model := a.Model
+	if model == "" {
+		model = a.Folder
+	}
+	if model != "" {
+		subY := nameY + nameSize + 3
+		if compact {
+			subY = nameY + nameSize + 1
+		}
+		if subY+10 < r.Y+r.H-3 {
+			drawCenteredClippedText(p, model, cx, subY, 11, pal.Muted, r.W-16)
+		}
 	}
 }
 
 func drawTextCentered(p *ui.Painter, s string, cx, y, size float32, color ui.Color) {
-	width := float32(0)
-	for _, r := range s {
-		if r > 0x2e80 {
-			width += size
-		} else {
-			width += size * 0.56
-		}
-	}
+	width, _ := p.MeasureText(0, ui.Span{Text: s, Size: size})
 	p.Text(cx-width/2, y, s, size, color)
 }
 
-func drawRoutingHub(p *ui.Painter, r ui.Rect, s routing.Snapshot, gatewayURL string, pal palette) {
-	p.Fill(r, pal.Panel, 12)
-	p.Stroke(r, pal.Text, 12, 1.2)
-	cx := r.X + r.W/2
-	drawMagpieMark(p, ui.Rect{X: cx - 13, Y: r.Y + 9, W: 26, H: 26}, pal.Text, pal.Panel)
-	drawTextCentered(p, "magpie", cx, r.Y+45, 12, pal.Text)
-	drawTextCentered(p, gatewayURL, cx, r.Y+61, 10, pal.Muted)
-	chipW := float32(50)
-	status := "online"
-	color := pal.Success
-	if !s.GatewayOnline {
-		status = "offline"
-		color = pal.Danger
+func drawTextAt(p *ui.Painter, s string, x, y, size float32, weight int, color ui.Color, maxWidth float32) {
+	if maxWidth > 0 {
+		s = fitText(p, s, size, weight, maxWidth)
 	}
-	p.Fill(ui.Rect{X: cx - chipW/2, Y: r.Y + 69, W: chipW, H: 20}, pal.Text, 10)
-	drawTextCentered(p, status, cx, r.Y+73, 9, pal.Panel)
-	_ = color
+	if weight != 400 {
+		p.RichText(x, y, max(0, maxWidth), ui.Span{Text: s, Size: size, Weight: weight, Color: color})
+		return
+	}
+	p.Text(x, y, s, size, color)
 }
 
-func drawRoutingAccountRow(p *ui.Painter, r ui.Rect, n providerNode, active bool, pal palette) {
+func drawClippedText(p *ui.Painter, x, y, maxWidth float32, s string, size float32, color ui.Color) {
+	if maxWidth <= 0 || s == "" {
+		return
+	}
+	p.Clip(ui.Rect{X: x, Y: y - 2, W: maxWidth, H: size + 8}, 0, func() {
+		p.Text(x, y, s, size, color)
+	})
+}
+
+func drawGenericIcon(p *ui.Painter, r ui.Rect, color ui.Color) {
+	// app.js's generic icon: a quiet hexagon with its three inner spokes.
+	var path ui.Path
+	cx, cy := r.X+r.W/2, r.Y+r.H/2
+	s := min(r.W, r.H)
+	path.MoveTo(cx, cy-s*0.42)
+	path.LineTo(cx+s*0.36, cy-s*0.21)
+	path.LineTo(cx+s*0.36, cy+s*0.21)
+	path.LineTo(cx, cy+s*0.42)
+	path.LineTo(cx-s*0.36, cy+s*0.21)
+	path.LineTo(cx-s*0.36, cy-s*0.21)
+	path.Close()
+	p.StrokePath(&path, 1.25, color)
+	p.Line(cx, cy, cx, cy+s*0.42, 1.25, color)
+	p.Line(cx-s*0.36, cy-s*0.21, cx, cy-s*0.02, 1.25, color)
+	p.Line(cx+s*0.36, cy-s*0.21, cx, cy-s*0.02, 1.25, color)
+}
+
+func fitText(p *ui.Painter, s string, size float32, weight int, maxWidth float32) string {
+	if maxWidth <= 0 {
+		return s
+	}
+	width, _ := p.MeasureText(0, ui.Span{Text: s, Size: size, Weight: weight})
+	if width <= maxWidth {
+		return s
+	}
+	ellipsisW, _ := p.MeasureText(0, ui.Span{Text: "…", Size: size, Weight: weight})
+	lo, hi := 0, len([]rune(s))
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		candidate := string([]rune(s)[:mid]) + "…"
+		w, _ := p.MeasureText(0, ui.Span{Text: candidate, Size: size, Weight: weight})
+		if w <= maxWidth || mid == 0 {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	if lo <= 0 {
+		return "…"
+	}
+	_ = ellipsisW
+	return string([]rune(s)[:lo]) + "…"
+}
+
+func drawRoutingHub(p *ui.Painter, r ui.Rect, s routing.Snapshot, gatewayURL string, pal palette, content bool) {
+	// .rt-hub: the foreground 1px border plus a 4px ring of --card-2.
+	if !content {
+		p.Fill(ui.Rect{X: r.X - 4, Y: r.Y - 4, W: r.W + 8, H: r.H + 8}, pal.PanelMuted, 16)
+		p.Fill(r, pal.Panel, 12)
+		p.Stroke(r, pal.Text, 12, 1)
+		return
+	}
+	cx := r.X + r.W/2
+	if !drawMagicLogo(p, ui.Rect{X: cx - 13, Y: r.Y + 10, W: 26, H: 26}, pal.Text) {
+		drawMagpieMark(p, ui.Rect{X: cx - 13, Y: r.Y + 10, W: 26, H: 26}, pal.Text, pal.Panel)
+	}
+	drawTextCentered(p, "magpie", cx, r.Y+42, 13, pal.Text)
+	host := strings.TrimPrefix(strings.TrimPrefix(gatewayURL, "http://"), "https://")
+	if host == "" {
+		host = "gateway"
+	}
+	drawCenteredClippedText(p, host, cx, r.Y+60, 11, pal.Muted, r.W-16)
+	status := "online"
+	if !s.GatewayOnline {
+		status = "offline"
+	}
+	chipText := routeModeLabel(s)
+	if chipText == "" {
+		chipText = status
+	}
+	chipW, _ := p.MeasureText(0, ui.Span{Text: chipText, Size: 10.5, Weight: 560})
+	chipW += 16
+	if chipW < 44 {
+		chipW = 44
+	}
+	chip := ui.Rect{X: cx - chipW/2, Y: r.Y + 78, W: chipW, H: 18}
+	p.Fill(chip, pal.Text, 9)
+	drawCenteredClippedText(p, chipText, cx, chip.Y+2, 10.5, pal.Panel, chip.W-8)
+}
+
+func routeModeLabel(s routing.Snapshot) string {
+	// The routing mode belongs to the request's resolved provider/group,
+	// not to the snapshot as a whole. Until the stage carries that exact
+	// decision, the label stays the truthful connection state.
+	if !s.GatewayOnline {
+		return "offline"
+	}
+	return "online"
+}
+
+func drawCenteredClippedText(p *ui.Painter, s string, cx, y, size float32, color ui.Color, maxWidth float32) {
+	s = fitText(p, s, size, 400, maxWidth)
+	width, _ := p.MeasureText(0, ui.Span{Text: s, Size: size})
+	p.Text(cx-width/2, y, s, size, color)
+}
+
+func drawRoutingAccountRow(p *ui.Painter, r ui.Rect, n providerNode, lit, active bool, pal palette, now time.Time, content bool, feedback topologyFeedback) {
+	offsetX := float32(0)
+	if !feedback.at.IsZero() {
+		age := now.Sub(feedback.at)
+		if age >= 0 && age < 450*time.Millisecond {
+			// rthit: 20% -5px, 40% +4px, 60% -2px, 80% +1px.
+			switch {
+			case age < 90*time.Millisecond:
+				offsetX = -5 * (1 - float32(age)/float32(90*time.Millisecond))
+			case age < 180*time.Millisecond:
+				offsetX = 4 * (1 - float32(age-90*time.Millisecond)/float32(90*time.Millisecond))
+			case age < 315*time.Millisecond:
+				offsetX = -2 * (1 - float32(age-180*time.Millisecond)/float32(135*time.Millisecond))
+			default:
+				offsetX = 1 * (1 - float32(age-315*time.Millisecond)/float32(135*time.Millisecond))
+			}
+		}
+	}
+	if offsetX != 0 {
+		p.Transform(ui.Translation(offsetX, 0), 0, 0, func() {
+			drawRoutingAccountRowAt(p, r, n, lit, active, pal, now, content)
+		})
+		return
+	}
+	drawRoutingAccountRowAt(p, r, n, lit, active, pal, now, content)
+}
+
+func drawRoutingAccountRowAt(p *ui.Painter, r ui.Rect, n providerNode, lit, active bool, pal palette, now time.Time, content bool) {
+	failed := n.Failed
+	// .rt-accts li: 10px dot, content, status; 9px 12px padding; 10px
+	// radius. The border changes to --fg when on, dashed when resting,
+	// and red on failure.
 	border := pal.Line
-	if n.Failed {
+	style := ui.BorderSolid
+	if failed {
 		border = pal.Danger.Alpha(0.8)
-	} else if active {
+	} else if lit {
 		border = pal.Text
 	} else if n.Answered {
-		border = pal.Success.Alpha(0.65)
+		border = pal.Text
 	} else if n.Rest {
 		border = pal.LineSoft
+		style = ui.BorderDashed
 	} else if n.Fallback {
 		border = pal.LineSoft
 	}
-	p.Fill(r, pal.Panel, 9)
 	width := float32(1)
-	if active || n.Answered || n.Failed {
-		width = 1.5
+	if lit || n.Answered || n.Failed {
+		width = 1.2
 	}
-	p.Stroke(r, border, 9, width)
-	dotColor := pal.Faint
-	if n.Failed {
-		dotColor = pal.Danger
-	} else if n.Answered {
-		dotColor = pal.Success
-	} else if active || n.Current {
-		dotColor = pal.Text
-	}
-	p.Fill(ui.Rect{X: r.X + 11, Y: r.Y + r.H/2 - 4, W: 8, H: 8}, dotColor, 4)
-	if r.H < 40 {
-		p.Text(r.X+28, r.Y+4, truncate(firstNonEmpty(n.Name, n.Provider), 20), 10.5, pal.Text)
-		model := firstNonEmpty(n.Model, n.Plan)
-		if model != "" {
-			model = " · " + truncate(model, 20)
-		}
-		p.Text(r.X+28, r.Y+17, truncate(firstNonEmpty(n.Who, "—"), 16)+model, 9, pal.Muted)
-		if n.Status != "" {
-			p.Text(r.X+r.W-72, r.Y+8, truncate(n.Status, 16), 9, boolColor(n.Failed, pal.Danger, pal.Muted))
+	if !content {
+		p.Fill(r, pal.Panel, 10)
+		if style == ui.BorderDashed {
+			p.StrokeDashed(r, border, 10, width)
+		} else {
+			p.Stroke(r, border, 10, width)
 		}
 		return
 	}
-	p.Text(r.X+28, r.Y+9, truncate(firstNonEmpty(n.Name, n.Provider), 24), 12, pal.Text)
-	model := firstNonEmpty(n.Model, n.Plan)
+	if style != ui.BorderDashed {
+		p.Stroke(r, border, 10, width)
+	}
+	// Upstream's row is a three-column grid: a dot, a flexible identity
+	// column, and a right-aligned status. The identity column itself keeps
+	// logo + provider + model on the first baseline and the account below.
+	if r.H >= 40 {
+		p.Fill(ui.Rect{X: r.X + 1, Y: r.Y + 1, W: r.W - 2, H: r.H - 2}, pal.Panel, 9)
+	}
+	dotColor := pal.Faint
+	if failed {
+		dotColor = pal.Danger
+	} else if n.Answered {
+		dotColor = pal.Text
+	} else if lit || n.Current {
+		dotColor = pal.Text
+	}
+	dot := ui.Rect{X: r.X + 12, Y: r.Y + r.H/2 - 4, W: 8, H: 8}
+	p.Stroke(dot, dotColor, 4, 1.5)
+	if lit || n.Answered || n.Failed {
+		p.Fill(dot, dotColor, 4)
+	}
+	if active && now.UnixMilli()%1800 < 900 {
+		p.Stroke(ui.Rect{X: dot.X - 3, Y: dot.Y - 3, W: 14, H: 14}, dotColor.Alpha(0.28), 7, 1)
+	}
+
+	status := accountStatusText(n)
+	statusSize := float32(11.5)
+	statusW := float32(0)
+	if status != "" {
+		statusW, _ = p.MeasureText(0, ui.Span{Text: status, Size: statusSize})
+		statusW = min(statusW, (r.W-96)*0.48)
+	}
+	contentX := r.X + 30
+	contentRight := r.X + r.W - 12
+	if status != "" {
+		contentRight -= statusW + 12
+	}
+	iconRect := ui.Rect{X: contentX, Y: r.Y + r.H/2 - 8, W: 16, H: 16}
+	iconKeys := []string{n.Icon, n.Provider}
+	if !drawRoutingIcon(p, iconRect, iconKeys, pal.Muted) {
+		drawGenericIcon(p, iconRect, pal.Faint)
+	}
+	textX := contentX + 24
+	name := firstNonEmpty(n.Name, n.Provider)
+	if n.Name == "" {
+		name = n.Provider
+	}
+	nameSize := float32(13)
+	model := n.Model
+	if model == "" {
+		model = n.Plan
+	}
+	modelW := float32(0)
+	modelGap := float32(0)
 	if model != "" {
-		model = " · " + truncate(model, 28)
+		modelW, _ = p.MeasureText(0, ui.Span{Text: model, Size: 11, Weight: 500})
+		modelW = min(modelW, max((contentRight-textX)*0.55, 0))
+		if modelW > 0 {
+			modelGap = 7
+		}
 	}
-	p.Text(r.X+28, r.Y+25, truncate(firstNonEmpty(n.Who, "—"), 22)+model, 10.5, pal.Muted)
-	if n.Status != "" {
-		p.Text(r.X+r.W-82, r.Y+15, truncate(n.Status, 18), 10.5, boolColor(n.Failed, pal.Danger, pal.Muted))
+	nameMax := max(contentRight-textX-modelW-modelGap, 0)
+	drawTextAt(p, name, textX, r.Y+5, nameSize, 560, pal.Text, nameMax)
+	if model != "" && modelW > 0 {
+		nameActual, _ := p.MeasureText(0, ui.Span{Text: name, Size: nameSize, Weight: 560})
+		modelX := min(textX+min(nameActual, nameMax)+modelGap, contentRight-modelW)
+		p.Fill(ui.Rect{X: modelX - 5, Y: r.Y + 4, W: modelW + 10, H: 17}, pal.PanelMuted, 5)
+		drawClippedText(p, modelX, r.Y+5, modelW, model, 11, pal.Muted)
 	}
-	if n.Fallback || n.Rest || n.WentOn {
+	sub := n.Who
+	if sub == "" {
+		sub = "—"
+	}
+	drawClippedText(p, textX, r.Y+22, contentRight-textX, sub, 11, pal.Muted)
+	if status != "" {
+		statusX := r.X + r.W - 12 - statusW
+		drawClippedText(p, statusX, r.Y+7, statusW+1, status, statusSize, boolColor(failed, pal.Danger, accountStatusColor(n, pal)))
+	}
+	if n.Fallback || n.WentOn {
 		tag := "fallback"
-		if n.Rest {
-			tag = "resting"
-		} else if n.WentOn {
+		if n.WentOn {
 			tag = "re-route"
 		}
-		p.Text(r.X+r.W-68, r.Y+r.H-15, tag, 8.5, pal.Faint)
+		tagW, _ := p.MeasureText(0, ui.Span{Text: tag, Size: 10.5, Weight: 560})
+		tagW += 12
+		tagRect := ui.Rect{X: r.X + r.W - 12 - tagW, Y: r.Y - 8, W: tagW, H: 17}
+		p.Fill(tagRect, pal.Danger, 6)
+		drawTextCentered(p, tag, tagRect.X+tagRect.W/2, tagRect.Y+1, 10.5, ui.Hex("#ffffff"))
 	}
+}
+
+func accountStatusColor(n providerNode, pal palette) ui.Color {
+	switch {
+	case n.Answered:
+		return pal.Text2
+	case n.Current:
+		return pal.Text
+	default:
+		return pal.Muted
+	}
+}
+
+func accountStatusText(n providerNode) string {
+	if n.Rest {
+		return "resting"
+	}
+	if n.Current {
+		return "answering…"
+	}
+	if n.Answered {
+		return "answered this request"
+	}
+	if n.WentOn {
+		if n.Note != "" {
+			return n.Note + " · went on"
+		}
+		return "went on"
+	}
+	if n.Failed {
+		switch {
+		case n.Status != "" && n.Note != "":
+			return n.Status + " · " + n.Note
+		case n.Status != "":
+			return n.Status
+		case n.Note != "":
+			return n.Note
+		}
+	}
+	if n.Known {
+		return trimFixed(n.Used*100, 0) + "% used"
+	}
+	if n.Note != "" {
+		return n.Note
+	}
+	if n.Kind == "key" {
+		return "API key"
+	}
+	if n.Kind == "account" {
+		return "one account"
+	}
+	return ""
 }
 
 // flightPath is a polyline with cumulative arc lengths. Following distance
@@ -1417,7 +1793,11 @@ func (p flightPath) reversed() flightPath {
 
 func cubicFlightPoints(ax, ay, bx, by float32) []flightPoint {
 	const steps = 40
-	dx := max((bx-ax)*0.48, 22)
+	// client.js's layout() uses a midpoint control whose x is exactly
+	// between the two endpoints. Keep dx signed: the previous max(dx, 22)
+	// bent every right-to-left return farther right instead of following
+	// the same wire backwards.
+	dx := (bx - ax) * 0.5
 	out := make([]flightPoint, 0, steps+1)
 	for i := 0; i <= steps; i++ {
 		t := float32(i) / steps
@@ -1429,7 +1809,7 @@ func cubicFlightPoints(ax, ay, bx, by float32) []flightPoint {
 	return out
 }
 
-func stageOutboundPath(agent, hub nodeBox, provider *nodeBox) flightPath {
+func stageOutboundPath(agent, hub nodeBox, provider *nodeBox, narrow bool) flightPath {
 	ax, ay := agent.rightCenter()
 	hlx, hly := hub.leftCenter()
 	hcx, hcy := hub.x+hub.w/2, hub.y+hub.h/2
@@ -1438,6 +1818,10 @@ func stageOutboundPath(agent, hub nodeBox, provider *nodeBox) flightPath {
 	// continuous arc through it instead of jumping between two paths.
 	raw = append(raw[1:], cubicFlightPoints(hlx, hly, hcx, hcy)...)
 	if provider == nil {
+		return newFlightPath(raw)
+	}
+	if narrow {
+		raw = append(raw[1:], hubToNarrowProviderPath(hub, []nodeBox{agent}, provider).pts...)
 		return newFlightPath(raw)
 	}
 	hrx, hry := hub.rightCenter()
@@ -1469,6 +1853,47 @@ func hubToProviderPath(hub nodeBox, provider *nodeBox) flightPath {
 	hrx, hry := hub.rightCenter()
 	px, py := provider.leftCenter()
 	return newFlightPath(cubicFlightPoints(hrx, hry, px, py))
+}
+
+// hubToNarrowProviderPath is client.js's fromHub() lane in the max560
+// layout: down from the hub's bottom, round into a lane 12px left of the
+// account, then to the account's left edge.
+func hubToNarrowProviderPath(hub nodeBox, agents []nodeBox, provider *nodeBox) flightPath {
+	if provider == nil {
+		return flightPath{}
+	}
+	hcx, hcxBottom := hub.x+hub.w/2, hub.y+hub.h
+	agentBottom := hub.y + hub.h
+	for _, a := range agents {
+		agentBottom = max(agentBottom, a.y+a.h)
+	}
+	laneX := provider.x - 12
+	laneTop := max(hcxBottom, agentBottom-8)
+	px, py := provider.leftCenter()
+
+	var raw []flightPoint
+	raw = append(raw, flightPoint{x: hcx, y: hcxBottom})
+	raw = append(raw, flightPoint{x: hcx, y: laneTop})
+	raw = append(raw[1:], cubicFlightPoints(hcx, laneTop, laneX, laneTop+24)...)
+	raw = append(raw[1:], flightPoint{x: laneX, y: py - 10})
+	raw = append(raw[1:], quadraticFlightPoints(laneX, py-10, laneX, py, px, py, 8)...)
+	return newFlightPath(raw)
+}
+
+func quadraticFlightPoints(ax, ay, cx, cy, bx, by float32, steps int) []flightPoint {
+	if steps < 1 {
+		return nil
+	}
+	out := make([]flightPoint, 0, steps+1)
+	for i := 0; i <= steps; i++ {
+		t := float32(i) / float32(steps)
+		u := 1 - t
+		out = append(out, flightPoint{
+			x: u*u*ax + 2*u*t*cx + t*t*bx,
+			y: u*u*ay + 2*u*t*cy + t*t*by,
+		})
+	}
+	return out
 }
 
 type flightMoment struct {
@@ -1536,6 +1961,10 @@ func flightMomentAt(f flightTrack, now time.Time) flightMoment {
 		return flightMoment{phase: ph, elapsed: elapsed, progress: 1, hasPhase: true}
 	}
 	return flightMoment{}
+}
+
+func currentFlightPhase(f flightTrack, now time.Time) flightMoment {
+	return flightMomentAt(f, now)
 }
 
 // drawFlightWire paints the real route above the static node layer so the
@@ -1655,12 +2084,16 @@ func drawFlightActor(p *ui.Painter, geometry *flightGeometry, agentIndex int, f 
 		drawHeldPacket(p, x, y, agentColor, outcome, now)
 		// The carrier leaves as soon as it lets go of the request. Its
 		// 450ms exit mirrors .rt-flier.away.
-		if moment.local < 450*time.Millisecond {
+		// On arriving at an account the bird lets go of the dot and flies
+		// up and away. moment.local is the time since that arrival, so a
+		// long provider answer leaves only the waiting dot behind.
+		release := moment.local
+		if release < 450*time.Millisecond {
 			pose := magpiePose{
 				x: x, y: y, scale: 0.72, aim: 0, flapAt: now,
 				body: pal.BirdBody, belly: pal.BirdBelly, far: pal.BirdWing,
 				appear:    1,
-				away:      float32(moment.local) / float32(450*time.Millisecond),
+				away:      float32(release) / float32(450*time.Millisecond),
 				flapPhase: float32(moment.local%420) / 420,
 			}
 			drawMagpie(p, pose, agentColor, magpieCarryNone, outcome, reduceMotion)
@@ -1803,8 +2236,11 @@ const (
 // magpiePose is the complete per-frame pose of the native FLIER. Keeping it
 // independent of route state makes the drawing deterministic and testable.
 type magpiePose struct {
-	x, y   float32
-	scale  float32
+	x, y  float32
+	scale float32
+	// scale scales the FLIER's local 44-unit artwork. drawMagpie applies
+	// the SVG's own 1.2 transform after it, so the path point stays the
+	// packet position at every stage size and DPI.
 	aim    float32
 	flip   float32
 	flapAt time.Time
@@ -2353,7 +2789,7 @@ func drawCubic(p *ui.Painter, a, b [2]float32, color ui.Color, width float32) {
 	if a[0] == b[0] && a[1] == b[1] {
 		return
 	}
-	dx := max((b[0]-a[0])*0.48, 22)
+	dx := (b[0] - a[0]) * 0.5
 	var path ui.Path
 	path.MoveTo(a[0], a[1])
 	path.CubeTo(a[0]+dx, a[1], b[0]-dx, b[1], b[0], b[1])
@@ -2408,7 +2844,7 @@ func drawBirdAt(p *ui.Painter, x, y, size float32, color ui.Color, now time.Time
 }
 
 func cubicPoint(a, b [2]float32, t float32) (float32, float32) {
-	dx := max((b[0]-a[0])*0.48, 22)
+	dx := (b[0] - a[0]) * 0.5
 	c1x, c1y := a[0]+dx, a[1]
 	c2x, c2y := b[0]-dx, b[1]
 	u := 1 - t

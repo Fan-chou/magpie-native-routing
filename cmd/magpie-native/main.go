@@ -27,7 +27,7 @@ const (
 	appTitle        = "Magpie Native Routing"
 	defaultWindowW  = 1240
 	defaultWindowH  = 820
-	minimumWindowW  = 880
+	minimumWindowW  = 560
 	minimumWindowH  = 620
 	diagnosticLimit = 500
 )

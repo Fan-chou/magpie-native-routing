@@ -239,8 +239,8 @@ func TestStageCanvasResizesWithWindowAndDPI(t *testing.T) {
 	before := model.topology.stageCanvas
 	beforeW, beforeH := model.topology.stageCanvasW, model.topology.stageCanvasH
 	model.mu.RUnlock()
-	if before == nil || beforeW <= 0 || beforeH != 258 {
-		t.Fatalf("initial canvas = %v (%dx%d), want the stage card raster", before != nil, beforeW, beforeH)
+	if before == nil || beforeW <= 0 || beforeH < int(routingStageMinHeight) {
+		t.Fatalf("initial canvas = %v (%dx%d), want at least the stage minimum %v", before != nil, beforeW, beforeH, routingStageMinHeight)
 	}
 
 	tester.SetSize(1240, 900)
@@ -252,8 +252,8 @@ func TestStageCanvasResizesWithWindowAndDPI(t *testing.T) {
 	if afterResize == before {
 		t.Fatal("window resize reused a canvas with the old raster size")
 	}
-	if resizedW <= beforeW || resizedH != beforeH {
-		t.Fatalf("resized canvas = %dx%d, want wider than %dx%d", resizedW, resizedH, beforeW, beforeH)
+	if resizedW <= beforeW || resizedH < beforeH {
+		t.Fatalf("resized canvas = %dx%d, want wider than %dx%d and not shorter", resizedW, resizedH, beforeW, beforeH)
 	}
 	if gotW, gotH := afterResize.Size(); gotW != resizedW || gotH != resizedH {
 		t.Fatalf("actual canvas bitmap = %dx%d, tracked %dx%d", gotW, gotH, resizedW, resizedH)
@@ -576,6 +576,35 @@ func TestReplayFlightPausesWithReplayClock(t *testing.T) {
 	tester.Frame()
 	if tester.FramePending() {
 		t.Fatal("a paused history replay requested animation frames")
+	}
+}
+
+func TestReplayPauseStopsFramesWithLivePhaseFeedback(t *testing.T) {
+	start := time.Now().Add(-time.Minute)
+	store := routing.NewStore()
+	store.ReplaceHistory([]routing.Route{{
+		ID: 78, Time: start, Agent: "codex", Model: "qoder/model",
+		Provider: "qoder", Done: true, Status: 200, Millis: 2000,
+		Tries: []routing.Try{{
+			ID: "qoder", Model: "qoder/model", Start: start,
+			Millis: 2000, Status: 200, Done: true,
+		}},
+	}})
+	model, _ := testModel(t, store.Snapshot(), Actions{})
+	model.setTab(tabHistory)
+	model.SetHistoryDay(start.Format("2006-01-02"))
+	tester := render(t, model, 1240, 900)
+	model.mu.Lock()
+	model.replay.position = 500 * time.Millisecond
+	model.replay.playing = false
+	for i := range model.topology.flights {
+		model.topology.flights[i].phaseAt = time.Now()
+		model.topology.flights[i].phaseKind = flightHold
+	}
+	model.mu.Unlock()
+	tester.Frame()
+	if tester.FramePending() {
+		t.Fatal("paused replay kept scheduling a feedback repaint")
 	}
 }
 
@@ -920,6 +949,163 @@ func TestReplayCacheKeyIncludesTryDetails(t *testing.T) {
 	fourthKey, _ := replaySource(after, "2026-10-19", routing.RouteFilter{})
 	if thirdKey == fourthKey {
 		t.Fatal("replay cache key ignored a Try completion update")
+	}
+}
+
+func TestFinalRouteFailureIgnoresRecoveredAttempt(t *testing.T) {
+	start := time.Date(2026, 10, 19, 5, 30, 0, 0, time.UTC)
+	recovered := routing.RouteView{Route: routing.Route{
+		ID: 910, Time: start, Agent: "codex", Done: true, Status: 200, Millis: 1200,
+		Tries: []routing.Try{
+			{ID: "a", Model: "vendor/a", Start: start, Millis: 400, Status: 429, Fail: "rate"},
+			{ID: "b", Model: "vendor/b", Start: start.Add(500 * time.Millisecond), Millis: 700, Status: 200, Done: true},
+		},
+	}}
+	if got := finalRouteFailure(recovered); got != "" {
+		t.Fatalf("recovered route reported final failure %q", got)
+	}
+	failed := recovered
+	failed.Tries = append([]routing.Try(nil), recovered.Tries...)
+	failed.Tries[len(failed.Tries)-1].Status = 500
+	failed.Tries[len(failed.Tries)-1].Fail = "upstream"
+	if got := finalRouteFailure(failed); got != "upstream" {
+		t.Fatalf("final failure = %q, want upstream", got)
+	}
+}
+
+func TestRoutingStatsCountRequestsNotTries(t *testing.T) {
+	start := time.Date(2026, 10, 19, 5, 40, 0, 0, time.UTC)
+	routes := []routing.RouteView{
+		{Route: routing.Route{ID: 1, Time: start, Done: true, Status: 200, Tries: []routing.Try{
+			{ID: "a", Start: start, Millis: 100, Status: 429, Fail: "rate", Rest: &routing.Rest{Why: "rate"}},
+			{ID: "b", Start: start.Add(200 * time.Millisecond), Millis: 300, Status: 200, Done: true},
+		}}},
+		{Route: routing.Route{ID: 2, Time: start.Add(time.Second), Done: true, Status: 500, Tries: []routing.Try{
+			{ID: "a", Start: start.Add(time.Second), Millis: 100, Status: 500, Fail: "upstream", Done: true},
+		}}},
+	}
+	requests, rerouted, failed := routingStats(routes)
+	if requests != 2 || rerouted != 1 || failed != 1 {
+		t.Fatalf("routingStats = (%d,%d,%d), want (2,1,1)", requests, rerouted, failed)
+	}
+}
+
+func TestProviderRowsUseReadOnlyConfigIdentity(t *testing.T) {
+	rv := routing.RouteView{Route: routing.Route{
+		ID: 920, Time: time.Now(), Agent: "codex", Model: "deepseek/deepseek-flash",
+		Done: true, Status: 200,
+		Order: []routing.Weighed{{
+			ID: "key-a", Provider: "deepseek", Model: "deepseek-flash",
+		}},
+		Tries: []routing.Try{{
+			ID: "key-a", Model: "deepseek/deepseek-flash", Status: 200, Done: true,
+		}},
+	}}
+	cfg := routing.ConfigSnapshot{Providers: []routing.ProviderInfo{{
+		ID: "deepseek", Name: "DeepSeek", Icon: "deepseek-color", Preset: "deepseek",
+	}}}
+	rows := providerRowsWithConfig(rv, false, cfg)
+	if len(rows) != 1 {
+		t.Fatalf("rows = %+v, want one", rows)
+	}
+	if rows[0].Name != "DeepSeek" || rows[0].Icon != "deepseek-color" {
+		t.Fatalf("config identity = name %q icon %q", rows[0].Name, rows[0].Icon)
+	}
+}
+
+func TestStageCanvasKeyChangesWithBrandIdentityAndGateway(t *testing.T) {
+	pal := colors(nil, config.ThemeLight)
+	agents := []agentNode{{ID: "codex", Icon: "codex-color"}}
+	rows := []providerNode{{Provider: "openai", Icon: "openai", Model: "gpt-6"}}
+	a := stageCanvasKey(agents, rows, "", false, pal, true, "127.0.0.1:3425", nil, nil)
+	b := stageCanvasKey(agents, rows, "", false, pal, true, "127.0.0.1:3425", nil, nil)
+	if a != b {
+		t.Fatal("stable stage key changed between identical frames")
+	}
+	rows[0].Icon = "anthropic"
+	if c := stageCanvasKey(agents, rows, "", false, pal, true, "127.0.0.1:3425", nil, nil); c == a {
+		t.Fatal("provider logo change did not invalidate the static canvas")
+	}
+	rows[0].Icon = "openai"
+	if d := stageCanvasKey(agents, rows, "", false, pal, true, "127.0.0.1:4000", nil, nil); d == a {
+		t.Fatal("gateway address change did not invalidate the hub text canvas")
+	}
+}
+
+func TestRoutingIconCacheIncludesSVGAndPNG(t *testing.T) {
+	loadRoutingIcons()
+	for _, key := range []string{"codex-color", "openai", "magpie", "crush"} {
+		icon, ok := routingIconFor(key)
+		if !ok {
+			t.Fatalf("embedded icon %q was not parsed", key)
+		}
+		if icon.svg == nil && icon.bitmap == nil {
+			t.Fatalf("icon %q has neither SVG nor bitmap", key)
+		}
+	}
+	crush, ok := routingIconFor("crush")
+	if !ok || crush.bitmap == nil {
+		t.Fatal("upstream PNG icon Crush was not decoded")
+	}
+}
+
+func TestAgentIconKeysUseRealUpstreamAssets(t *testing.T) {
+	cases := map[string]string{
+		"codex":    "codex-color",
+		"claude":   "claudecode-color",
+		"opencode": "opencode",
+		"cursor":   "cursor",
+	}
+	for id, want := range cases {
+		got := agentIcon(id)
+		if got != want {
+			t.Errorf("agentIcon(%q) = %q, want %q", id, got, want)
+		}
+		if _, ok := routingIconFor(got); !ok {
+			t.Errorf("agent icon asset %q is missing", got)
+		}
+	}
+}
+
+func TestNarrowLayoutAndRequestSectionDoNotClip(t *testing.T) {
+	model, _ := testModel(t, completedSyntheticSnapshot(t), Actions{})
+	tester := render(t, model, 600, 900)
+	tester.Frame()
+	if !tester.HasText("Recent requests") {
+		t.Fatalf("narrow request section disappeared: %v", tester.Texts())
+	}
+	if r, ok := tester.Find("Recent requests"); !ok || r.X < 0 || r.X+r.W > 600 {
+		t.Fatalf("request heading outside narrow window: %+v present=%v", r, ok)
+	}
+	for _, label := range []string{"Live", "Today", "All", "Active", "Completed", "Failed"} {
+		if r, ok := tester.Find(label); ok && (r.X < 0 || r.X+r.W > 600) {
+			t.Fatalf("%s control clipped by narrow window: %+v", label, r)
+		}
+	}
+}
+
+func TestStageGeometryUsesUpstreamColumnsAndNarrowLane(t *testing.T) {
+	agents := []agentNode{{ID: "codex"}, {ID: "claude"}}
+	rows := []providerNode{{Provider: "one", Model: "m"}, {Provider: "two", Model: "m"}}
+	stage := layoutRoutingStage(ui.Rect{W: 900, H: 180}, agents, rows)
+	if stage.narrow {
+		t.Fatal("900px stage chose the narrow layout")
+	}
+	if stage.agents[0].w != routingStageAgentWidth || stage.hub.w != routingStageHubWidth {
+		t.Fatalf("wide columns = %.0f / %.0f, want %.0f / %.0f", stage.agents[0].w, stage.hub.w, routingStageAgentWidth, routingStageHubWidth)
+	}
+	if stage.rows[0].x-stage.hub.x-stage.hub.w != routingStageColumnGap {
+		t.Fatalf("hub/provider gap = %.0f, want %.0f", stage.rows[0].x-stage.hub.x-stage.hub.w, routingStageColumnGap)
+	}
+	narrow := layoutRoutingStage(ui.Rect{W: 540, H: 260}, agents, rows)
+	if !narrow.narrow {
+		t.Fatal("540px stage did not choose the narrow layout")
+	}
+	if narrow.rows[0].y <= narrow.hub.y+narrow.hub.h {
+		t.Fatal("narrow providers did not move below the top row")
+	}
+	if narrow.rows[0].x-narrow.agents[0].x < 12 {
+		t.Fatal("narrow provider lane lost its left inset")
 	}
 }
 

@@ -16,6 +16,7 @@ type palette struct {
 	Line        ui.Color
 	LineSoft    ui.Color
 	Text        ui.Color
+	Text2       ui.Color
 	Muted       ui.Color
 	Faint       ui.Color
 	Accent      ui.Color
@@ -63,6 +64,7 @@ func colors(c *ui.Context, mode config.ThemeMode) palette {
 			Line:        ui.Hex("#333339"),
 			LineSoft:    ui.Hex("#2c2c32"),
 			Text:        ui.Hex("#ededf1"),
+			Text2:       ui.Hex("#b9b9c1"),
 			Muted:       ui.Hex("#8b8b94"),
 			Faint:       ui.Hex("#56565f"),
 			Accent:      ui.Hex("#a5b4fc"),
@@ -95,6 +97,7 @@ func colors(c *ui.Context, mode config.ThemeMode) palette {
 		Line:        ui.Hex("#e3e3e8"),
 		LineSoft:    ui.Hex("#ececf0"),
 		Text:        ui.Hex("#1c1c21"),
+		Text2:       ui.Hex("#4b4b53"),
 		Muted:       ui.Hex("#85858d"),
 		Faint:       ui.Hex("#b9b9c2"),
 		Accent:      ui.Hex("#4f46e5"),

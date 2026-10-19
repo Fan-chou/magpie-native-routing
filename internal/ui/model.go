@@ -118,6 +118,12 @@ type topologyState struct {
 	layout           topologyFrameLayout
 }
 
+type topologyFeedback struct {
+	at     time.Time
+	kind   flightPhaseKind
+	failed bool
+}
+
 // flightTrack is deliberately UI-only animation state. Its route id is the
 // exact Magpie Route ID and every timing input comes from the observed route.
 // It never creates a request that is absent from the snapshot.
@@ -140,6 +146,9 @@ type flightTrack struct {
 	inReplay  bool
 	failed    bool
 	done      bool
+	phaseKey  string
+	phaseKind flightPhaseKind
+	phaseAt   time.Time
 }
 
 // flightAttempt is the geometry-independent part of one recorded attempt.
@@ -561,7 +570,7 @@ func (m *Model) visibleAgents(routes []routing.RouteView, live []routing.LiveReq
 			return
 		}
 		out = append(out, agentNode{
-			ID: id, Name: agentName(id), Model: model, Folder: folder,
+			ID: id, Name: agentName(id), Model: model, Folder: folder, Icon: agentIcon(id),
 			Active: active, Requests: requests, Sessions: sessions, Hue: agentHue(id),
 		})
 	}
@@ -601,6 +610,7 @@ type agentNode struct {
 	Name     string
 	Model    string
 	Folder   string
+	Icon     string
 	Active   bool
 	Requests int
 	Sessions int
@@ -611,15 +621,55 @@ func agentName(id string) string {
 	switch strings.ToLower(id) {
 	case "codex":
 		return "Codex"
-	case "claude":
+	case "claude", "claude-code":
 		return "Claude Code"
 	case "opencode":
 		return "OpenCode"
+	case "cursor":
+		return "Cursor"
+	case "gemini":
+		return "Gemini"
+	case "copilot":
+		return "Copilot"
+	case "crush":
+		return "Crush"
+	case "goose":
+		return "Goose"
+	case "pi":
+		return "Pi"
+	case "qoder":
+		return "Qoder"
 	case "other", "":
 		return "Agent"
 	default:
 		return id
 	}
+}
+
+func agentIcon(id string) string {
+	switch strings.ToLower(id) {
+	case "codex":
+		return "codex-color"
+	case "claude", "claude-code":
+		return "claudecode-color"
+	case "opencode":
+		return "opencode"
+	case "cursor":
+		return "cursor"
+	case "gemini":
+		return "gemini-color"
+	case "copilot":
+		return "copilot-color"
+	case "crush":
+		return "crush"
+	case "goose":
+		return "goose"
+	case "pi":
+		return "pi"
+	case "qoder":
+		return "qoder"
+	}
+	return ""
 }
 
 func agentHue(id string) ui.Color {
@@ -662,7 +712,7 @@ func agentHue(id string) ui.Color {
 func providerRows(r routing.RouteView, hidden bool) []providerNode {
 	var out []providerNode
 	seen := map[string]int{}
-	add := func(provider, name, who, model, accountID, plan, status, note string, weight string, current, failed bool) {
+	add := func(provider, name, who, model, accountID, plan, icon, status, note, weight, kind, routingMode string, current, failed bool) {
 		// Fold rows for the same provider and model (the gateway may expose
 		// the candidate order and a try separately). Accounts of the same
 		// provider serving different models stay separate.
@@ -680,13 +730,22 @@ func providerRows(r routing.RouteView, hidden bool) []providerNode {
 			if note != "" {
 				out[i].Note = note
 			}
+			if icon != "" {
+				out[i].Icon = icon
+			}
+			if kind != "" {
+				out[i].Kind = kind
+			}
+			if routingMode != "" {
+				out[i].Routing = routingMode
+			}
 			return
 		}
 		seen[key] = len(out)
 		out = append(out, providerNode{
 			Provider: provider, Name: name, Who: who, Model: model, Plan: plan,
-			AccountID: accountID, Status: status, Note: note, Weight: weight,
-			Current: current, Failed: failed,
+			AccountID: accountID, Icon: icon, Status: status, Note: note, Weight: weight,
+			Kind: kind, Routing: routingMode, Current: current, Failed: failed,
 		})
 	}
 	for i, w := range r.Order {
@@ -712,12 +771,14 @@ func providerRows(r routing.RouteView, hidden bool) []providerNode {
 		if w.Barred {
 			note = "barred"
 		}
-		add(provider, name, w.Who, w.Model, w.ID, w.Plan, status, note, w.Fixed, current, failed)
+		add(provider, name, w.Who, w.Model, w.ID, w.Plan, firstNonEmpty(w.Icon, w.Preset), status, note, w.Fixed, w.Kind, w.Routing, current, failed)
 		if len(out) > i {
 			out[i].Fallback = w.Fallback
 			out[i].Rest = w.Rest != nil
 			out[i].Answered = i < len(r.Tries) && r.Tries[i].Done && !tryFailed(r.Tries[i])
 			out[i].WentOn = i < len(r.Tries) && r.Tries[i].Done && tryFailed(r.Tries[i]) && i+1 < len(r.Tries)
+			out[i].Known = w.Known
+			out[i].Used = w.Used
 		}
 	}
 	for _, tr := range r.Tries {
@@ -729,7 +790,7 @@ func providerRows(r routing.RouteView, hidden bool) []providerNode {
 			continue
 		}
 		status := tryStatus(tr)
-		add(provider, provider, tr.Served, tr.Model, tr.ID, "", status, routing.TryFailure(tr), "",
+		add(provider, provider, tr.Served, tr.Model, tr.ID, "", providerIconKey(r, provider, tr), status, routing.TryFailure(tr), "", "", "",
 			r.Active && !tr.Done && !tryFailed(tr), tryFailed(tr))
 	}
 	if len(out) == 0 {
@@ -741,14 +802,14 @@ func providerRows(r routing.RouteView, hidden bool) []providerNode {
 			} else if r.Done {
 				status = "done"
 			}
-			add(provider, provider, "", r.Model, "", "", status, "", "",
+			add(provider, provider, "", r.Model, "", "", "", status, "", "", "", "",
 				r.Active, r.Status >= 400 || r.Error != "")
 		}
 	}
 	if len(r.Live) > 0 && len(out) == 0 {
 		for _, l := range r.Live {
 			// Concurrency exposes a session, not the provider account id.
-			add(l.Provider, l.Provider, "", l.Model, "", "", string(l.Phase), "", "",
+			add(l.Provider, l.Provider, "", l.Model, "", "", "", string(l.Phase), "", "", "", "",
 				true, false)
 		}
 	}
@@ -762,13 +823,62 @@ func providerRows(r routing.RouteView, hidden bool) []providerNode {
 	return out
 }
 
+// providerRowsWithConfig fills the fields that completed traces often omit:
+// providers.json is Magpie's own read-only source for a provider's logo and
+// display name. A trace value remains authoritative whenever it is present.
+func providerRowsWithConfig(r routing.RouteView, hidden bool, cfg routing.ConfigSnapshot) []providerNode {
+	rows := providerRows(r, hidden)
+	for i := range rows {
+		info, ok := providerInfoByID(cfg, rows[i].Provider)
+		if !ok {
+			continue
+		}
+		if rows[i].Name == "" || strings.EqualFold(rows[i].Name, rows[i].Provider) {
+			if info.Name != "" {
+				rows[i].Name = info.Name
+			}
+		}
+		if rows[i].Icon == "" {
+			rows[i].Icon = firstNonEmpty(info.Icon, info.Preset)
+		}
+	}
+	return rows
+}
+
+func providerInfoByID(cfg routing.ConfigSnapshot, id string) (routing.ProviderInfo, bool) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return routing.ProviderInfo{}, false
+	}
+	for _, p := range cfg.Providers {
+		if strings.EqualFold(p.ID, id) {
+			return p, true
+		}
+	}
+	return routing.ProviderInfo{}, false
+}
+
+func providerIconKey(r routing.RouteView, provider string, tr routing.Try) string {
+	for _, w := range r.Order {
+		rowProvider := firstNonEmpty(w.Provider, providerOf(w.Model))
+		if !strings.EqualFold(rowProvider, provider) && !strings.EqualFold(w.ID, tr.ID) {
+			continue
+		}
+		if icon := firstNonEmpty(w.Icon, w.Preset); icon != "" {
+			return icon
+		}
+	}
+	return ""
+}
+
 func providerMatchesOrder(order []routing.Weighed, provider, model string) bool {
 	for _, w := range order {
 		p := w.Provider
 		if p == "" {
 			p = providerOf(w.Model)
 		}
-		if p != "" && strings.EqualFold(p, provider) && (model == "" || w.Model == "" || strings.EqualFold(w.Model, model)) {
+		if p != "" && strings.EqualFold(p, provider) &&
+			(model == "" || w.Model == "" || modelMatches(w.Model, model, provider)) {
 			return true
 		}
 	}
@@ -782,9 +892,14 @@ type providerNode struct {
 	Model     string
 	AccountID string
 	Plan      string
+	Icon      string
 	Status    string
 	Note      string
 	Weight    string
+	Kind      string
+	Routing   string
+	Known     bool
+	Used      float64
 	Current   bool
 	Failed    bool
 	// Fallback and Rest are actual fields of Magpie's Weighed/Try trace;
