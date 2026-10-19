@@ -659,7 +659,7 @@ func traceAttemptTarget(rv routing.RouteView, tr routing.Try) providerTarget {
 				accountRow = &row
 			}
 			// Model is only a tie-breaker within the one account Try named.
-			if tr.Model != "" && modelMatches(w.Model, tr.Model) {
+			if tr.Model != "" && modelMatches(w.Model, tr.Model, firstNonEmpty(w.Provider, rv.Provider)) {
 				return traceTargetFromOrder(w, tr)
 			}
 		}
@@ -679,7 +679,7 @@ func traceAttemptTarget(rv routing.RouteView, tr routing.Try) providerTarget {
 	if provider == "" && tr.Model != "" {
 		providers := map[string]bool{}
 		for _, w := range rv.Order {
-			if !modelMatches(w.Model, tr.Model) {
+			if !modelMatches(w.Model, tr.Model, firstNonEmpty(w.Provider, rv.Provider)) {
 				continue
 			}
 			if p := firstNonEmpty(w.Provider, providerOf(w.Model)); p != "" {
@@ -707,24 +707,33 @@ func traceTargetFromOrder(w routing.Weighed, tr routing.Try) providerTarget {
 	}
 }
 
-// modelMatches compares a model id while accepting one side's provider
-// prefix. It never treats two different bare names as aliases.
-func modelMatches(a, b string) bool {
-	a, b = strings.TrimSpace(a), strings.TrimSpace(b)
+// modelMatches compares a model id. When both sides carry provider
+// prefixes, those providers must agree; the prefixed and bare forms are
+// compatible only when the known provider context agrees as well.
+func modelMatches(a, b, provider string) bool {
+	aProvider, aModel := splitModel(a)
+	bProvider, bModel := splitModel(b)
+	a, b = strings.TrimSpace(aModel), strings.TrimSpace(bModel)
 	if a == "" || b == "" {
 		return false
 	}
 	if strings.EqualFold(a, b) {
-		return true
+		if aProvider != "" && bProvider != "" {
+			return strings.EqualFold(aProvider, bProvider)
+		}
+		known := firstNonEmpty(aProvider, bProvider)
+		context := firstNonEmpty(strings.TrimSpace(provider), known)
+		return known == "" || context == "" || strings.EqualFold(known, context)
 	}
-	return strings.EqualFold(bareModel(a), bareModel(b))
+	return false
 }
 
-func bareModel(model string) string {
+func splitModel(model string) (provider, name string) {
+	model = strings.TrimSpace(model)
 	if i := strings.IndexByte(model, '/'); i >= 0 && i+1 < len(model) {
-		return model[i+1:]
+		return strings.TrimSpace(model[:i]), model[i+1:]
 	}
-	return model
+	return "", model
 }
 
 func clampDuration(v, lo, hi time.Duration) time.Duration {
@@ -2177,7 +2186,7 @@ func providerMatchScore(row providerNode, target providerTarget) int {
 	if accountMatch {
 		score += 100
 	}
-	if model != "" && row.Model != "" && strings.EqualFold(row.Model, model) {
+	if model != "" && row.Model != "" && modelMatches(row.Model, model, firstNonEmpty(rowProvider, provider)) {
 		score += 30
 	} else if model != "" && row.Model != "" && !accountMatch {
 		// A recorded account id is stronger evidence than a display model

@@ -677,6 +677,62 @@ func TestProviderNodeRejectsKnownAccountMismatch(t *testing.T) {
 	}
 }
 
+func TestProviderNodeMatchesPrefixedAndShortModelWithSameProvider(t *testing.T) {
+	rows := []providerNode{
+		{Provider: "openai", Model: "gpt-6", AccountID: "key-a"},
+	}
+	cases := []providerTarget{
+		{provider: "openai", model: "openai/gpt-6"},
+		{provider: "openai", model: "gpt-6"},
+	}
+	for _, target := range cases {
+		if got := indexProviderNode(rows, target); got != 0 {
+			t.Errorf("indexProviderNode(%+v) = %d, want row 0", target, got)
+		}
+	}
+	prefixedRow := []providerNode{
+		{Provider: "openai", Model: "openai/gpt-6", AccountID: "key-a"},
+	}
+	if got := indexProviderNode(prefixedRow, providerTarget{provider: "openai", model: "gpt-6"}); got != 0 {
+		t.Fatalf("short model did not match prefixed row: %d", got)
+	}
+}
+
+func TestModelMatchesRejectsDifferentProviderPrefixes(t *testing.T) {
+	if modelMatches("openai/gpt-6", "other/gpt-6", "") {
+		t.Fatal("modelMatches accepted different explicit provider prefixes")
+	}
+	if !modelMatches("openai/gpt-6", "gpt-6", "openai") {
+		t.Fatal("modelMatches rejected a short name with the matching provider")
+	}
+	if modelMatches("openai/gpt-6", "gpt-6", "other") {
+		t.Fatal("modelMatches accepted a short name with a conflicting provider")
+	}
+}
+
+func TestTraceAttemptWithoutAccountMatchesShortModelByName(t *testing.T) {
+	start := time.Date(2026, 10, 19, 4, 30, 0, 0, time.UTC)
+	rv := routing.RouteView{Route: routing.Route{
+		Time: start, Millis: 900,
+		Tries: []routing.Try{{
+			Model: "openai/gpt-6", Start: start,
+			Millis: 900, Status: 200, Done: true,
+		}},
+	}}
+	attempts, _ := traceFlightAttempts(rv)
+	if len(attempts) != 1 {
+		t.Fatalf("attempts = %d, want 1", len(attempts))
+	}
+	rows := []providerNode{
+		{Provider: "openai", Model: "gpt-6"},
+	}
+	if got := indexProviderNode(rows, targetForPhase(flightTrack{}, flightPhase{
+		provider: attempts[0].provider, model: attempts[0].model,
+	})); got != 0 {
+		t.Fatalf("short-name row resolved to %d, want row 0", got)
+	}
+}
+
 func TestTraceAttemptTargetKeepsProviderModelAndAccount(t *testing.T) {
 	start := time.Date(2026, 10, 19, 3, 30, 0, 0, time.UTC)
 	rv := routing.RouteView{Route: routing.Route{
