@@ -2,6 +2,7 @@ package routing
 
 import (
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -274,3 +275,63 @@ func TestErrTextNoSecrets(t *testing.T) {
 type APIErrorText struct{ Text string }
 
 func (e *APIErrorText) Error() string { return e.Text }
+
+func TestStoreVersionConcurrentWriters(t *testing.T) {
+	s := NewStore()
+	const n = 200
+	var notified int64
+	var nmu sync.Mutex
+	s.OnChange(func() {
+		nmu.Lock()
+		notified++
+		nmu.Unlock()
+	})
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = s.Snapshot().Version
+				_ = s.Version()
+			}
+		}
+	}()
+	alt := func(i int) string {
+		if i%2 == 0 {
+			return "a"
+		}
+		return "b"
+	}
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < n; i++ {
+			s.SetGatewayWarning(alt(i))
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < n; i++ {
+			s.SetHistoryError(alt(i))
+		}
+	}()
+	wg.Wait()
+	close(stop)
+	<-readerDone
+	// Every call flips its field, so each one is a committed change and no
+	// increment may be lost to a concurrent writer.
+	if got := s.Version(); got != 2*n {
+		t.Fatalf("version = %d, want %d", got, 2*n)
+	}
+	if got := s.Snapshot().Version; got != 2*n {
+		t.Fatalf("snapshot version = %d, want %d", got, 2*n)
+	}
+	if notified != 2*n {
+		t.Fatalf("notifications = %d, want %d", notified, 2*n)
+	}
+}

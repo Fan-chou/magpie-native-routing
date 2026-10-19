@@ -40,7 +40,8 @@ type HistoryDay struct {
 }
 
 // Store merges Gateway observations and completed history by stable Route ID.
-// It is safe for one writer goroutine and many UI readers. Route values in
+// It is safe for multiple writer goroutines (the Supervisor and the
+// HistoryWatcher) and many UI readers. Route values in
 // the map are immutable once visible to Snapshot: updates clone the one route
 // they change (copy-on-write), so snapshots need not deep-copy the whole
 // multi-thousand-route history on every poll.
@@ -89,8 +90,10 @@ func (s *Store) Version() uint64 {
 	return s.version
 }
 
+// changed dispatches OnChange callbacks. The version bump itself happens in
+// each mutator's critical section so concurrent writers never lose an
+// increment; call changed only after s.mu is released.
 func (s *Store) changed() {
-	s.version++
 	s.notifyMu.Lock()
 	callbacks := append([]func(){}, s.notify...)
 	s.notifyMu.Unlock()
@@ -176,6 +179,9 @@ func (s *Store) ApplyConcurrency(c ConcurrencyLike) {
 	// each row. Keep those volatile values in the store for the next snapshot,
 	// while notifying only when the live plane actually changed.
 	changed := !wasOnline || oldError != "" || oldLiveKey != livePlaneKey(s.live)
+	if changed {
+		s.version++
+	}
 	s.mu.Unlock()
 	if changed {
 		s.changed()
@@ -236,6 +242,7 @@ func (s *Store) SetConnectionError(msg string) {
 	s.live = map[int64]LiveRequest{}
 	s.byRoute = map[int64]map[int64]LiveRequest{}
 	s.orphans = map[int64]LiveRequest{}
+	s.version++
 	s.mu.Unlock()
 	s.changed()
 }
@@ -303,6 +310,9 @@ func (s *Store) ApplySessionRoute(sr SessionRouteLike) {
 	}
 	r.AddSource(SourceSessionRoute)
 	changed := !existed || before != sessionRouteUIKey(*r)
+	if changed {
+		s.version++
+	}
 	s.mu.Unlock()
 	if changed {
 		s.changed()
@@ -391,6 +401,7 @@ func (s *Store) MergeHistory(rs []Route) {
 	}
 	if changed {
 		s.snap.LastHistoryRead = time.Now()
+		s.version++
 	}
 	s.mu.Unlock()
 	if changed {
@@ -456,6 +467,7 @@ func (s *Store) ReplaceHistory(rs []Route) {
 	if changed {
 		s.snap.LoadedHistoryDays = loadedDays
 		s.snap.LastHistoryRead = time.Now()
+		s.version++
 	}
 	s.mu.Unlock()
 	if changed {
@@ -477,6 +489,7 @@ func (s *Store) SetConfig(c ConfigSnapshot) {
 		if s.snap.ConfigError != "" {
 			s.snap.ConfigError = ""
 			s.snap.LastConfigRead = c.ReadAt
+			s.version++
 			s.mu.Unlock()
 			s.changed()
 			return
@@ -490,6 +503,7 @@ func (s *Store) SetConfig(c ConfigSnapshot) {
 	s.config = c
 	s.snap.ConfigError = ""
 	s.snap.LastConfigRead = c.ReadAt
+	s.version++
 	s.mu.Unlock()
 	s.changed()
 }
@@ -499,6 +513,7 @@ func (s *Store) SetConfigError(msg string) {
 	s.mu.Lock()
 	s.snap.ConfigError = msg
 	s.snap.LastConfigRead = time.Now()
+	s.version++
 	s.mu.Unlock()
 	s.changed()
 }
@@ -512,6 +527,7 @@ func (s *Store) SetDays(days []HistoryDay) {
 	}
 	s.snap.Days = append([]HistoryDay(nil), days...)
 	s.snap.LastHistoryRead = time.Now()
+	s.version++
 	s.mu.Unlock()
 	s.changed()
 }
@@ -540,6 +556,7 @@ func (s *Store) SetHistoryError(msg string) {
 	}
 	s.historyErr = msg
 	s.snap.HistoryError = msg
+	s.version++
 	s.mu.Unlock()
 	s.changed()
 }
@@ -553,6 +570,7 @@ func (s *Store) SetGatewayWarning(msg string) {
 		return
 	}
 	s.snap.GatewayWarning = msg
+	s.version++
 	s.mu.Unlock()
 	s.changed()
 }
@@ -561,6 +579,7 @@ func (s *Store) SetGatewayWarning(msg string) {
 func (s *Store) SetReplay(r ReplayState) {
 	s.mu.Lock()
 	s.snap.Replay = r
+	s.version++
 	s.mu.Unlock()
 	s.changed()
 }
@@ -623,6 +642,7 @@ func (s *Store) ResetLive() {
 	s.byRoute = map[int64]map[int64]LiveRequest{}
 	s.orphans = map[int64]LiveRequest{}
 	s.snap.GatewayWarning = ""
+	s.version++
 	s.mu.Unlock()
 	s.changed()
 }
