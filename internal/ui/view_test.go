@@ -2483,3 +2483,61 @@ func TestNamedAndPrintfLocalizationPlaceholders(t *testing.T) {
 		t.Fatalf("printf placeholder = %q", got)
 	}
 }
+
+func TestPlayRouteSeeksWithinAlreadyShownDay(t *testing.T) {
+	day := "2026-10-18"
+	base := time.Date(2026, 10, 18, 10, 0, 0, 0, time.Local)
+	store := routing.NewStore()
+	store.ReplaceHistory([]routing.Route{
+		{ID: 1, Time: base, Agent: "codex", Model: "m", Done: true, Millis: 1000, HistoryDay: day,
+			Tries: []routing.Try{{Model: "p/m", Done: true, Millis: 1000, Start: base}}},
+		{ID: 2, Time: base.Add(30 * time.Second), Agent: "codex", Model: "m", Done: true, Millis: 1000, HistoryDay: day,
+			Tries: []routing.Try{{Model: "p/m", Done: true, Millis: 1000, Start: base.Add(30 * time.Second)}}},
+	})
+	snap := store.Snapshot()
+	model, _ := testModel(t, snap, Actions{})
+	model.setTab(tabHistory)
+	model.SetHistoryDay(day)
+	now := time.Now()
+	model.syncReplay(snap, now)
+	model.PlayRoute(day, 2)
+	model.syncReplay(snap, now)
+	if got := model.replay.position; got != 30*time.Second {
+		t.Fatalf("position = %v, want 30s", got)
+	}
+	if model.replay.pendingID != 0 || model.replay.playing {
+		t.Fatalf("pendingID = %d playing = %t, want consumed and paused", model.replay.pendingID, model.replay.playing)
+	}
+}
+
+func TestStaticStageBitmapKeyCoversDrawnInputs(t *testing.T) {
+	stage := &routingStagePresentation{stageIdentity: "id"}
+	rows := []providerNode{{Provider: "p"}, {Provider: "q"}}
+	now := time.Now()
+	key := func(loc Localization, online bool, url, mode string, lit map[int]bool) string {
+		return staticStageBitmapKey(stage, flightStage{}, palette{}, rows, now, 0, 1, loc, online, url, mode, lit, 900, 400)
+	}
+	en, zh := NewLocalization("en"), NewLocalization("zh")
+	base := key(en, true, "http://a", "smart", map[int]bool{0: true})
+	if base != key(en, true, "http://a", "smart", map[int]bool{0: true}) {
+		t.Fatal("key changed with identical inputs")
+	}
+	for name, other := range map[string]string{
+		"language": key(zh, true, "http://a", "smart", map[int]bool{0: true}),
+		"online":   key(en, false, "http://a", "smart", map[int]bool{0: true}),
+		"url":      key(en, true, "http://b", "smart", map[int]bool{0: true}),
+		"mode":     key(en, true, "http://a", "order", map[int]bool{0: true}),
+		"litRows":  key(en, true, "http://a", "smart", map[int]bool{1: true}),
+	} {
+		if other == base {
+			t.Errorf("key ignores %s", name)
+		}
+	}
+	// A resize must rebuild the bitmap even when the hub keeps its size.
+	wide := staticStageBitmapKey(stage, flightStage{}, palette{}, rows, now, 0, 1, en, true, "http://a", "smart", nil, 1000, 400)
+	narrower := staticStageBitmapKey(stage, flightStage{}, palette{}, rows, now, 0, 1, en, true, "http://a", "smart", nil, 800, 400)
+	taller := staticStageBitmapKey(stage, flightStage{}, palette{}, rows, now, 0, 1, en, true, "http://a", "smart", nil, 1000, 500)
+	if wide == narrower || wide == taller {
+		t.Error("key ignores stage size")
+	}
+}

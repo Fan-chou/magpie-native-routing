@@ -1232,7 +1232,9 @@ func (m *Model) drawRoutingStageStatic(p *ui.Painter, r ui.Rect, stage *routingS
 	maskBlur, maskOpacity := m.accountMaskStyle(now)
 	gatewayURL := m.Settings().GatewayURL
 	mode := stageRoutingMode(stage.selection, stage.hasSelection, s.Config)
-	key := staticStageBitmapKey(stage, localStage, pal, rows, now, maskBlur, maskOpacity)
+	key := staticStageBitmapKey(stage, localStage, pal, rows, now, maskBlur, maskOpacity,
+		loc, s.GatewayOnline, gatewayURL, mode, litRows,
+		max(1, int(math.Ceil(float64(r.W)))), max(1, int(math.Ceil(float64(r.H)))))
 	scale := p.Scale()
 	m.mu.Lock()
 	cached, cachedKey, cachedScale := m.topology.staticStage, m.topology.staticStageKey, m.topology.staticStageScale
@@ -1272,13 +1274,25 @@ func (m *Model) drawRoutingStageStatic(p *ui.Painter, r ui.Rect, stage *routingS
 // bitmap. Only a resting account's countdown is time-driven in the static
 // layer; selection and activity rings live on the dynamic layer. The
 // countdown advances at second granularity, so ordinary frame time does not
-// invalidate the bitmap.
-func staticStageBitmapKey(stage *routingStagePresentation, local flightStage, pal palette, rows []providerNode, now time.Time, maskBlur, maskOpacity float32) string {
+// invalidate the bitmap. The language, gateway state and URL, routing mode
+// and lit rows are drawn into the bitmap too (hub chip and host, card text).
+// The device-pixel size is part of the key: the hub is a fixed size in the
+// wide layout, so without it a resize would stretch the stale bitmap.
+func staticStageBitmapKey(stage *routingStagePresentation, local flightStage, pal palette, rows []providerNode, now time.Time, maskBlur, maskOpacity float32, loc Localization, online bool, gatewayURL, mode string, litRows map[int]bool, pxW, pxH int) string {
 	var b strings.Builder
 	b.WriteString(stage.stageIdentity)
 	b.WriteByte(0)
 	b.WriteString(pal.stageKey())
 	fmt.Fprintf(&b, "|%.1fx%.1f|%t|%.3f/%.3f|", local.hub.w, local.hub.h, local.narrow, maskBlur, maskOpacity)
+	fmt.Fprintf(&b, "%dx%d|%v|%t|%s|%s|", pxW, pxH, loc.Lang, online, gatewayURL, mode)
+	for i := range rows {
+		if litRows[i] {
+			b.WriteByte('1')
+		} else {
+			b.WriteByte('0')
+		}
+	}
+	b.WriteByte('|')
 	countdown := false
 	for i := range rows {
 		if i < len(local.rows) && rows[i].Rest && !rows[i].RestUntil.IsZero() && rows[i].RestUntil.After(now) {

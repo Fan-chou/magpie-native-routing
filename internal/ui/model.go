@@ -325,6 +325,9 @@ func (m *Model) PlayRoute(day string, id int64) {
 	}
 	m.replay.pendingID = id
 	m.replay.loaded = false
+	// syncReplay only consumes pendingID when it rebuilds. Without this, a
+	// route of the already-shown day leaves the key unchanged and never seeks.
+	m.replay.builtKey = ""
 	m.mu.Unlock()
 }
 
