@@ -645,40 +645,86 @@ func traceFlightAttempts(rv routing.RouteView) ([]flightAttempt, time.Duration) 
 // Try.ID identifies the account; Model identifies the model when the same
 // account can serve several. The recorded candidate order is authoritative.
 func traceAttemptTarget(rv routing.RouteView, tr routing.Try) providerTarget {
-	for _, w := range rv.Order {
-		if tr.ID != "" && !strings.EqualFold(w.ID, tr.ID) {
-			continue
-		}
-		if tr.Model != "" && w.Model != "" && !strings.EqualFold(w.Model, tr.Model) {
-			continue
-		}
-		if provider := firstNonEmpty(w.Provider, providerOf(w.Model), w.ID); provider != "" {
-			return providerTarget{
-				provider:  provider,
-				model:     firstNonEmpty(w.Model, tr.Model),
-				accountID: firstNonEmpty(w.ID, tr.ID),
-				who:       w.Who,
+	// Try.ID is the account identity. When it is present, only an order row
+	// with that exact id may identify the endpoint; a model alias must never
+	// redirect the attempt to another account after an id mismatch.
+	if tr.ID != "" {
+		var accountRow *routing.Weighed
+		for _, w := range rv.Order {
+			if !strings.EqualFold(w.ID, tr.ID) {
+				continue
+			}
+			row := w
+			if accountRow == nil {
+				accountRow = &row
+			}
+			// Model is only a tie-breaker within the one account Try named.
+			if tr.Model != "" && modelMatches(w.Model, tr.Model) {
+				return traceTargetFromOrder(w, tr)
 			}
 		}
-	}
-	for _, w := range rv.Order {
-		if tr.Model == "" || w.Model == "" || !strings.EqualFold(w.Model, tr.Model) {
-			continue
+		if accountRow != nil {
+			return traceTargetFromOrder(*accountRow, tr)
 		}
-		if provider := firstNonEmpty(w.Provider, providerOf(w.Model), w.ID); provider != "" {
-			return providerTarget{
-				provider:  provider,
-				model:     w.Model,
-				accountID: firstNonEmpty(w.ID, tr.ID),
-				who:       w.Who,
+		return providerTarget{
+			provider:  firstNonEmpty(providerOf(tr.Model), rv.Provider),
+			model:     tr.Model,
+			accountID: tr.ID,
+		}
+	}
+	// Without an account id, Model may identify a provider but must not be
+	// promoted into the account id of whichever Order row happens to be
+	// first. Leaving the account empty makes duplicate model rows ambiguous.
+	provider := firstNonEmpty(providerOf(tr.Model), rv.Provider)
+	if provider == "" && tr.Model != "" {
+		providers := map[string]bool{}
+		for _, w := range rv.Order {
+			if !modelMatches(w.Model, tr.Model) {
+				continue
+			}
+			if p := firstNonEmpty(w.Provider, providerOf(w.Model)); p != "" {
+				providers[strings.ToLower(p)] = true
+			}
+		}
+		if len(providers) == 1 {
+			for p := range providers {
+				provider = p
 			}
 		}
 	}
 	return providerTarget{
-		provider:  firstNonEmpty(providerOf(tr.Model), rv.Provider),
-		model:     firstNonEmpty(tr.Model, rv.Model),
-		accountID: firstNonEmpty(tr.ID, tr.Served),
+		provider: provider,
+		model:    firstNonEmpty(tr.Model, rv.Model),
 	}
+}
+
+func traceTargetFromOrder(w routing.Weighed, tr routing.Try) providerTarget {
+	return providerTarget{
+		provider:  firstNonEmpty(w.Provider, providerOf(w.Model), w.ID),
+		model:     firstNonEmpty(tr.Model, w.Model),
+		accountID: w.ID,
+		who:       w.Who,
+	}
+}
+
+// modelMatches compares a model id while accepting one side's provider
+// prefix. It never treats two different bare names as aliases.
+func modelMatches(a, b string) bool {
+	a, b = strings.TrimSpace(a), strings.TrimSpace(b)
+	if a == "" || b == "" {
+		return false
+	}
+	if strings.EqualFold(a, b) {
+		return true
+	}
+	return strings.EqualFold(bareModel(a), bareModel(b))
+}
+
+func bareModel(model string) string {
+	if i := strings.IndexByte(model, '/'); i >= 0 && i+1 < len(model) {
+		return model[i+1:]
+	}
+	return model
 }
 
 func clampDuration(v, lo, hi time.Duration) time.Duration {
@@ -2122,6 +2168,11 @@ func providerMatchScore(row providerNode, target providerTarget) int {
 		return 0
 	}
 	score := 0
+	if account != "" && row.AccountID != "" && !strings.EqualFold(row.AccountID, account) {
+		// A known account id is authoritative. Matching provider and model
+		// must never redirect a flight to a different account.
+		return 0
+	}
 	accountMatch := account != "" && row.AccountID != "" && strings.EqualFold(row.AccountID, account)
 	if accountMatch {
 		score += 100

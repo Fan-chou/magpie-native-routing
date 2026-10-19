@@ -665,6 +665,18 @@ func TestProviderNodeRejectsAmbiguousSameProviderModel(t *testing.T) {
 	}
 }
 
+func TestProviderNodeRejectsKnownAccountMismatch(t *testing.T) {
+	rows := []providerNode{
+		{Provider: "openai", Model: "gpt-6", AccountID: "key-a"},
+		{Provider: "openai", Model: "gpt-5.6", AccountID: "key-c"},
+	}
+	if got := indexProviderNode(rows, providerTarget{
+		provider: "openai", model: "gpt-6", accountID: "key-b",
+	}); got != -1 {
+		t.Fatalf("known account mismatch resolved to row %d; want no endpoint", got)
+	}
+}
+
 func TestTraceAttemptTargetKeepsProviderModelAndAccount(t *testing.T) {
 	start := time.Date(2026, 10, 19, 3, 30, 0, 0, time.UTC)
 	rv := routing.RouteView{Route: routing.Route{
@@ -711,6 +723,109 @@ func TestTraceAttemptTargetKeepsProviderModelAndAccount(t *testing.T) {
 	}
 	if retryOut != 1 || inbound != 1 {
 		t.Fatalf("retry landed on row %d and return on row %d, want both row 1", retryOut, inbound)
+	}
+}
+
+func TestTraceAttemptTargetPrefersAccountIDOverModelConflict(t *testing.T) {
+	start := time.Date(2026, 10, 19, 3, 40, 0, 0, time.UTC)
+	rv := routing.RouteView{Route: routing.Route{
+		Time: start, Millis: 900,
+		Order: []routing.Weighed{
+			{ID: "key-a", Provider: "openai", Who: "alice@example", Model: "gpt-6"},
+			{ID: "key-b", Provider: "openai", Who: "bob@example", Model: "gpt-5.6"},
+		},
+		Tries: []routing.Try{{
+			ID: "key-a", Model: "gpt-5.6", Start: start,
+			Millis: 900, Status: 200, Done: true,
+		}},
+	}}
+	got := traceAttemptTarget(rv, rv.Tries[0])
+	want := providerTarget{
+		provider: "openai", model: "gpt-5.6",
+		accountID: "key-a", who: "alice@example",
+	}
+	if got != want {
+		t.Fatalf("conflicting try target = %+v, want account-first %+v", got, want)
+	}
+	rows := []providerNode{
+		{Provider: "openai", Model: "gpt-6", AccountID: "key-a", Who: "alice@example"},
+		{Provider: "openai", Model: "gpt-5.6", AccountID: "key-b", Who: "bob@example"},
+	}
+	if row := indexProviderNode(rows, got); row != 0 {
+		t.Fatalf("account-first target resolved to row %d, want row 0", row)
+	}
+}
+
+func TestTraceAttemptUnknownAccountDoesNotFallBackByModel(t *testing.T) {
+	start := time.Date(2026, 10, 19, 3, 50, 0, 0, time.UTC)
+	rv := routing.RouteView{Route: routing.Route{
+		Time: start, Millis: 900,
+		Order: []routing.Weighed{
+			{ID: "key-a", Provider: "openai", Model: "gpt-6"},
+			{ID: "key-b", Provider: "openai", Model: "gpt-6"},
+		},
+		Tries: []routing.Try{{
+			ID: "key-c", Model: "gpt-6", Start: start,
+			Millis: 900, Status: 200, Done: true,
+		}},
+	}}
+	got := traceAttemptTarget(rv, rv.Tries[0])
+	if got.accountID != "key-c" {
+		t.Fatalf("unknown try account = %q, want key-c", got.accountID)
+	}
+	rows := []providerNode{
+		{Provider: "openai", Model: "gpt-6", AccountID: "key-a"},
+		{Provider: "openai", Model: "gpt-6", AccountID: "key-b"},
+	}
+	if row := indexProviderNode(rows, got); row != -1 {
+		t.Fatalf("unknown try account fell back to model row %d", row)
+	}
+}
+
+func TestTraceAttemptWithoutIDDoesNotBorrowOrderAccount(t *testing.T) {
+	start := time.Date(2026, 10, 19, 4, 10, 0, 0, time.UTC)
+	rv := routing.RouteView{Route: routing.Route{
+		Time: start, Millis: 900,
+		Order: []routing.Weighed{
+			{ID: "key-a", Provider: "openai", Model: "gpt-6"},
+		},
+		Tries: []routing.Try{{
+			Model: "openai/gpt-6", Start: start,
+			Millis: 900, Status: 200, Done: true,
+		}},
+	}}
+	got := traceAttemptTarget(rv, rv.Tries[0])
+	if got.accountID != "" {
+		t.Fatalf("try without an id inherited account %q", got.accountID)
+	}
+	if got.provider != "openai" || got.model != "openai/gpt-6" {
+		t.Fatalf("try without id lost provider/model: %+v", got)
+	}
+	rows := []providerNode{
+		{Provider: "openai", Model: "gpt-6", AccountID: "key-a"},
+		{Provider: "openai", Model: "gpt-6", AccountID: "key-b"},
+	}
+	if row := indexProviderNode(rows, got); row != -1 {
+		t.Fatalf("account-less try chose one of two accounts: row %d", row)
+	}
+}
+
+func TestTraceAttemptUsesModelWithinExactAccountOnly(t *testing.T) {
+	start := time.Date(2026, 10, 19, 4, 20, 0, 0, time.UTC)
+	rv := routing.RouteView{Route: routing.Route{
+		Time: start, Millis: 900,
+		Order: []routing.Weighed{
+			{ID: "key-a", Provider: "openai", Model: "gpt-6"},
+			{ID: "key-a", Provider: "openai", Model: "gpt-5.6"},
+		},
+		Tries: []routing.Try{{
+			ID: "key-a", Model: "gpt-5.6", Start: start,
+			Millis: 900, Status: 200, Done: true,
+		}},
+	}}
+	got := traceAttemptTarget(rv, rv.Tries[0])
+	if got.accountID != "key-a" || got.model != "gpt-5.6" {
+		t.Fatalf("model did not disambiguate within exact account: %+v", got)
 	}
 }
 

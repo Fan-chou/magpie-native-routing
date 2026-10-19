@@ -192,9 +192,9 @@ func replaySource(s routing.Snapshot, day string, f routing.RouteFilter) (string
 // append can fill in an existing try's start, target, duration or failure
 // while the route's count and status stay unchanged.
 func appendReplayTraceKey(b *strings.Builder, r routing.RouteView) {
-	fmt.Fprintf(b, "route:%d/%t/%t/%d/%d/%s/%d/%s/%s/%s;",
+	fmt.Fprintf(b, "route:%d/%t/%t/%d/%d/%s/%d/%s/%s/%s/%s/%s;",
 		r.ID, r.Done, r.Active, r.Status, len(r.Order), r.Time.UTC().Format(time.RFC3339Nano),
-		r.Millis, r.HistoryDay, r.Provider, r.Error)
+		r.Millis, r.HistoryDay, r.Agent, r.Model, r.Provider, r.Error)
 	for i, w := range r.Order {
 		fmt.Fprintf(b, "o%d:%s/%s/%s/%s/%s;",
 			i, w.ID, w.Provider, w.Name, w.Who, w.Model)
