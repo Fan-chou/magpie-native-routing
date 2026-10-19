@@ -1,91 +1,186 @@
 # Magpie Native Routing
 
-> **状态：架构与可行性研究完成；客户端尚未实现。**
+> **状态：可运行的独立原生客户端（阶段 2–4 的主要纵向切片已实现）。**
 >
-> 使用 **MyGo Native UI（纯 Go GPU 绘制，不使用 WebView）**，复刻 [Magpie](https://github.com/yetone/magpie) 的 Routing 界面，并作为**独立桌面应用**连接用户已经运行的 Magpie Desktop。此仓库当前保存经过源码核查的最终结论与实施方案，**不包含可运行的客户端**。
+> 使用 **Go + MyGo Native UI**（GPU 原生绘制，无 WebView、HTML/CSS/JavaScript 界面）读取正在运行的 Magpie Desktop Gateway 和只读历史文件。
 
-## 目标
+## 这是什么
 
-- 独立安装、启动、退出；不嵌入或替代 Magpie，不启动第二个 Gateway。
-- 现有 Magpie Desktop 继续接收 Codex、Claude Code、OpenCode 等 Agent 的请求；本客户端不转发模型流量。
-- 使用 Magpie **已有的 Gateway HTTP API** 和 **本地已落盘的数据文件（只读）**。
-- 完整重做 Routing 页面的布局、节点、曲线路径、动画、请求列表、详情、历史回放和路由组视图。
-- 不使用 Wails/WebView/HTML/CSS/JavaScript 渲染 UI；Go 后端和 MyGo Native UI 分层。
-- 不修改现有 Magpie 程序，也不直接写其配置/数据库。
+Magpie Native Routing 是一个独立桌面应用，用于观察 Magpie 的真实路由行为：
 
-## 核心结论
+- 左侧 Agent → 中间 Magpie Gateway → 右侧 Provider / Account / Model 拓扑。
+- 当前 Gateway 快照中真实在途的请求及其阶段。
+- Magpie 已完成历史的请求列表、候选顺序、每次尝试、失败原因、TTFT 和 Token。
+- 按日期查看历史并回放真实 Trace。
+- 只读展示 `providers.json` 中的路由组、成员顺序和策略。
 
-**独立客户端可行；但不修改 Magpie 时，无法与其原版 Routing 页面做到 100% 实时功能对等。**
+它**不是** Magpie 的替代品，也不会：
 
-Magpie 公开 Gateway HTTP API 可读取全局活动请求、按 Session 获取实时路由、用量和配额；完整路由 Trace 在**每次请求结束后**保存于本地 `routing/*.jsonl` / `*.jsonl.gz`，因此能够还原已完成请求的真实候选顺序、每次尝试和故障转移，并回放历史。
+- 启动第二个 Magpie Gateway；
+- 代理、转发或修改 Agent 的模型请求；
+- 修改 Codex、Claude Code、OpenCode 等配置；
+- 写入、覆盖或删除 Magpie 的 `providers.json`、账号、密钥或历史文件；
+- 调用 Magpie 的私有 GUI API。
 
-但是 Magpie 原版 Routing 页面使用的 **全局内存 Trace** (`/api/gateway/trace`) 与 **路由组管理** (`/api/groups`) 是桌面 GUI 内部 API，**并不是现有 Gateway 的对外 API**。Desktop 将 GUI 资源放在 Wails Asset Handler 中，不能假设 `127.0.0.1:3425/api/...` 可访问。另启 `magpie web` 且由原桌面进程承载 Gateway 时，Web 实例的 `mine` 为 false，不能取到原进程的实时 Trace。
+## 数据来源与真实性
 
-因此本项目严格区分：
+界面只展示实际观测到的数据：
 
-- **真实实时**：`GET /v1/magpie/concurrency` 中当前在途的 Agent、模型、阶段；对于已知 Session 使用 `GET /v1/magpie/route` 获取尝试详情。
-- **完成后完整回放**：通过 Magpie 本地 Routing 历史数据获得全量已记录的最终 Trace。
-- **无法无侵入实现的部分**：所有 Session 的全局逐步 Trace、对所有请求实时显示候选账号的每次重试；完整动态路由组管理写入；仅存在于进程内存中的状态。
+| 界面事实 | 来源 |
+| --- | --- |
+| 当前活动请求、阶段、并发 | `GET /v1/magpie/concurrency` |
+| 已知 Session 的最新路由和尝试 | `GET /v1/magpie/route?session=...` |
+| 完整候选顺序、尝试链、失败原因 | `routing/YYYY-MM-DD.jsonl[.gz]` 完成后历史 |
+| 路由组、成员、策略 | `<magpie-dir>/providers.json` 只读快照 |
+| Token / 用量 | 历史 `usage` 字段；Gateway usage API 已封装供后续页面使用 |
 
-详细依据见 [最终结论](docs/FINAL_CONCLUSION.md) 和 [功能兼容矩阵](docs/COMPATIBILITY.md)。
+两种来源只按真实的 **Route ID** 合并。不会根据模型、Session 或时间猜测同一请求。
 
-## 架构概览
+需要明确区分：
 
-```text
-                        Magpie Desktop（原进程，不修改）
-                           │                    │
-          现有 Gateway HTTP API                  本地数据（只读）
-          /v1/magpie/concurrency                 providers.json
-          /v1/magpie/route                       routing/*.jsonl[.gz]
-          /v1/magpie/usage*                      settings.json（可选）
-          /v1/magpie/quotas*                      │
-          /v1/models                            │
-                      │                         │
-                      └──────────┬──────────────┘
-                             Go adapters
-                                 │
-                     Route Store / Event Journal
-                                 │
-                      MyGo Native GPU UI
-             Topology · Animation · Detail · Replay · Groups
+- **实时观测**：只在当前 Gateway 快照中确实在途时显示为活动；Gateway 断开后旧实时行会清除。
+- **完成历史**：来自 Magpie 异步落盘的 JSONL/GZIP；界面标注为“完成后历史”。
+- **回放**：回放时钟由 `Route.Time`、`Try.Start` 和记录耗时推导，并明确标注，不伪装成当时的流式采集。
+
+公开 Gateway API 不提供原版 GUI 的全局逐步 Trace 流，因此实时阶段只展示 API 实际返回的部分；完整尝试链在请求完成并落盘后补齐。
+
+## 构建与运行
+
+要求：Go 1.27+、macOS / Linux 原生图形环境（当前开发验证为 macOS arm64）。
+
+```sh
+go test ./...
+go vet ./...
+go build -o bin/magpie-native ./cmd/magpie-native
+./bin/magpie-native
 ```
 
-**重要**：图中的 “Event Journal” 是客户端对外部观测数据进行的归一化处理，**不是重建 Magpie 路由算法**，也不代表任何时间点的数据都能由 Gateway 完整观测。
+启动前请先运行 Magpie Desktop。默认 Gateway 为 `http://127.0.0.1:3425`，默认数据目录自动探测：
 
-## 建议的实施优先级
+- `$XDG_CONFIG_HOME/magpie`
+- `~/.config/magpie`
+- Magpie.app / 可执行文件旁的 `data`
 
-1. **协议与数据真实接入**：Gateway 连通、权限错误处理、历史文件发现、尾随与解压、Route ID 合并、断线重连。
-2. **MyGo 原生可视化**：Agent → Gateway → Provider/Account/Model 节点与曲线路径，支持并发动画和真实请求详情。
-3. **历史回放**：按天、筛选、速度控制、失败重试、请求时间线。
-4. **配置视图与兼容性**：路由组只读展示、自动组与手动组差异、版本探测、状态明确标注。
-5. **能力扩展（可选）**：只有 Magpie 官方日后开放全局 Trace 与管理 API，或用户允许修改 Magpie，才补上无损实时回放与组管理。
+可在应用内“连接与数据”中修改 Gateway 地址、API Key 和 Magpie 数据目录。设置只写入本应用自己的目录：
 
-## 仓库文档
+- macOS: `~/Library/Application Support/magpie-native-routing/`
+- Linux: `$XDG_CONFIG_HOME/magpie-native-routing/`
 
-| 文件 | 内容 |
-| --- | --- |
-| [docs/FINAL_CONCLUSION.md](docs/FINAL_CONCLUSION.md) | 核心结论、不可跨越的边界与决策 |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 技术架构、数据模型、同步与回放策略 |
-| [docs/INTEGRATION.md](docs/INTEGRATION.md) | 已有 API、默认目录、诊断与安全约束 |
-| [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) | 原版 Routing 功能逐项兼容性 |
-| [docs/ROADMAP.md](docs/ROADMAP.md) | 开发计划、测试矩阵与验收条件 |
-| [docs/SOURCES.md](docs/SOURCES.md) | 源码证据（固定到审核过的 commit） |
-| [PUBLISH.md](PUBLISH.md) | 如何把本地仓库发布到 GitHub |
+API Key 不会写入日志。也可通过环境变量临时注入：
 
-## 技术选型
+```sh
+MAGPIE_API_KEY='...' ./bin/magpie-native
+```
 
-- Go 1.27+（按当前 MyGo README 的 Native 模板要求；实际开发时应重新核对）。
-- [egoist/mygo](https://github.com/egoist/mygo) Native `ui`，使用 Go GPU 绘制；无 WebView。
-- `net/http` 用于 Gateway 只读 API；Go 标准库 `encoding/json`、`compress/gzip` 用于历史文件。
-- 文件变化监听可以采用平台 watcher 加定时兜底，**不能仅依靠一次 `fsnotify` 事件判断完整 JSONL 行已写入**。
+命令行选项：
 
-## 当前工程状态
+```text
+-gateway URL       覆盖 Gateway
+-data-dir PATH     覆盖 Magpie 数据目录
+-api-key KEY       本次运行使用 API Key（不建议放在 shell 历史中）
+-theme MODE        system | light | dark
+-lang LANG         zh | en
+-diagnose          只读连接/历史诊断后退出
+-json              配合 -diagnose 输出 JSON
+```
 
-本仓库目前为**决策/设计文档仓库**，不含 `go.mod`、可编译二进制、真实运行截图或已实现的 API Client。任何示意图、功能矩阵都应视为目标与源码推导的可行性，而非完成情况。
+### 只读诊断
+
+```sh
+./bin/magpie-native -diagnose
+./bin/magpie-native -diagnose -json
+```
+
+诊断只读取 Gateway 和本地历史，不会修改 Magpie。
+
+## 使用
+
+1. 启动 Magpie Desktop，并保持 Gateway 开启。
+2. 启动本应用；窗口顶部显示 Gateway 在线状态。
+3. “实时”页查看真实在途拓扑和最新请求。
+4. “历史”页选择日期，查看完成请求的完整候选顺序和尝试链。
+5. 在历史页使用播放、暂停、重播、拖动时间轴和倍速控制回放真实 Trace。
+6. “路由组”页只读查看手动组、自动生成组、成员顺序、规则与策略信息。
+
+## 已验证
+
+```sh
+go test ./...
+go test -race ./...
+go vet ./...
+go build -o bin/magpie-native ./cmd/magpie-native
+./bin/magpie-native -diagnose
+```
+
+本地验证结果（2026-10-19）：
+
+- Go `1.27.2 darwin/arm64`，CGO 可用。
+- 单元测试、`go vet`、Race Detector 全部通过。
+- 真实 Gateway `http://127.0.0.1:3425` 连接成功。
+- 读取到真实 `~/.config/magpie/routing` 的 14 天历史，最新一天有真实记录。
+- `providers.json` 可读，路由组和自动组可展示。
+- 已实际启动原生窗口并确认拓扑、历史和详情界面渲染。
+
+## 已实现
+
+- 只读 Gateway HTTP Client：并发、Session Route、usage、quotas、models。
+- 可配置 Base URL、API Key、超时、取消、状态码解析与有界重连。
+- JSONL / GZIP 历史读取；兼容追加、部分行、截断、替换、轮转和拼接 gzip。
+- Route ID 去重；API 与历史统一 Store；UI 只读不可变快照。
+- 按天历史、持续增量读取、真实时间线回放。
+- 原生拓扑、分段贝塞尔连线、按弧长采样的喜鹊飞行动画、并发请求路径。
+- 喜鹊由 MyGo `Path`/`Painter`/`Transform` 原生绘制：远翅、尾羽、身体、腹部、头、喙、近翅分层，约 420ms 扇翅周期、飞行切线朝向、平滑转向、出现/离场缩放与透明度。
+- 实际业务阶段驱动：Agent → Gateway → Provider 去程，Provider 等待，失败经 Gateway 转到下一 Provider，成功后返回 Agent；不在画布上生成未经观测的请求。
+- 历史回放的飞行仍由回放时钟驱动；播放、暂停、重播、倍速与时间轴共用同一真实 Try 时间线。
+- 静态节点和连线缓存到 MyGo `Canvas`（按窗口尺寸、DPI 和真实亮灯状态重建），飞鸟、请求圆点和流动虚线只在动态 Painter 层；空闲或暂停时停止动画帧。
+- 请求列表、详情、候选顺序、尝试链、Token、TTFT、固定查看。
+- 手动/自动组只读视图，包括成员、匹配规则、pick、停用成员、Fast 和等级。
+- 中英文界面、浅色/深色/跟随系统、响应式布局、设置弹窗和原生目录选择。
+
+## 已知限制
+
+- 公开 Gateway API 没有原版 GUI 的 `/api/gateway/trace` 全局逐步 Trace；实时候选顺序只能在完成后从历史补齐。
+- 原版 GUI 的组管理写接口是私有的；本应用只读展示，编辑/删除按钮明确禁用。
+- 历史保留由 Magpie 的约 30 天 / 200 MiB 策略决定；应用不假设历史永久存在。
+- 实时已完成行的历史落盘存在异步延迟；在落盘前会保持“实时观测”来源，不会伪造完整 Trace。
+- 回放时间精度受 Magpie 记录的毫秒字段和落盘时间限制。
+- 当前实际启动验证在 macOS arm64 上完成；其他平台需自行执行构建与启动测试。
+- 喜鹊是原生矢量移植，几何形状、图层顺序和 420ms 扇翅关键帧来自上游 `FLIER`/`rtflap`，但不是浏览器 SVG/CSS 的逐像素渲染；字体、系统抗锯齿与亚像素布局会有差异。
+- 实时 API 只给出当前 provider 和采样时刻的 `ms`；若完整 Try 链尚未落盘，应用只显示实际观测到的等待/在途状态，不补造候选顺序或重试。
+- 实时请求完成到历史落盘之间，返回鸟根据当前快照的在线观测和保持时间播放；不会把历史回放伪装成实时观测。
+
+## 动画架构与性能
+
+静态层与动态层分离：
+
+- `ui.Canvas` 缓存 Agent、Gateway、Provider 卡片、静态曲线和文字，避免每帧重排/重绘拓扑。
+- 动态层只绘制飞鸟、请求圆点、流动虚线与选中路径高亮。
+- 位置按路径累计弧长采样，而不是按贝塞尔 `t` 采样，避免转弯处速度突跳。
+- 每只鸟、每个飞行段独立使用阶段时钟；支持多请求并发和回放暂停。
+- 飞行曲线按“布局 + Agent/Provider 身份”缓存弧长表，飞鸟和动态连线共享同一组路径，不在每帧重复采样贝塞尔曲线。
+- 节点列表不再截断到 4 个 Agent / 5 个 Provider；并发升高时压缩节点高度并增高舞台，所有活动飞行都有可见端点。
+- 历史回放的飞行窗口直接由真实 Trace 阶段构建；暂停、重播或直接 Seek 到返回段都从时间轴重建，不依赖之前是否播放过。
+- `Painter.AnimationFrame()` 只在有真实在途请求，或历史回放确实处于播放状态时调用；暂停回放、空闲和窗口隐藏时不再请求帧。
+- 渲染使用当前帧 `Painter.Now()`，不按固定帧计数推进动画。
+
+2026-10-19 在真实 Gateway（`127.0.0.1:3425`）和真实并发请求上的短时 `MYGO_FRAME_STATS=1` 观测：飞行动画帧通常 `build 0.0`、`layout 0.0`，`paint` 约 0.2–1.0 ms、`present` 约 0.3–1.8 ms（本机 GPU）；空闲时不再请求动画帧。该数字是单次本机采样，不是跨平台保证。
+
+## 工程结构
+
+```text
+cmd/magpie-native/   启动、窗口、worker 生命周期
+internal/config/     应用配置与 Magpie 路径探测
+internal/magpie/     只读 Gateway HTTP Client
+internal/routing/    Route 模型、历史、Store、监听、回放、组视图
+internal/ui/         MyGo Native UI、拓扑、动画、主题、本地化
+internal/testutil/   仅用于测试的明确合成样本
+```
+
+历史文件和 `providers.json` 始终只读。真实历史不会提交到仓库；`.gitignore` 已排除 JSONL/GZIP、构建产物和本地运行数据。
 
 ## 上游
 
 - Magpie: https://github.com/yetone/magpie
 - MyGo: https://github.com/egoist/mygo
 
-这是一项独立集成项目，与上述上游无官方关联。后续如复用上游代码或素材，应分别遵守其许可。
+独立集成项目，与上游无官方关联。未直接复制上游界面资源或专有源码。

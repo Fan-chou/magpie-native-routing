@@ -28,4 +28,4 @@ cd magpie-native-routing
 
 若 GitHub App 不能写仓库，请在 GitHub Settings → Applications → Installed GitHub Apps 中找到连接的 ChatGPT GitHub 应用，确认其仓库访问范围包含新仓库，并在 ChatGPT 的 GitHub 连接中完成必要授权。更改权限后再次尝试推送。
 
-此包当前是文档项目，没有已编译/可运行客户端。上传前建议查看所有文件，尤其核对 Gateway 实际 URL 与本地 Magpie 数据路径。
+此包包含可编译、可运行的 Go + MyGo Native UI 客户端。上传前建议查看所有文件，尤其核对 Gateway 实际 URL 与本地 Magpie 数据路径，并确认没有把真实历史文件或 API Key 加入提交。

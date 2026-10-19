@@ -1,0 +1,18 @@
+.codex/
+
+# Build products
+/bin/
+/dist/
+*.app/
+
+# Local runtime state and Magpie data must never be committed.
+/data/
+/routing/
+*.jsonl
+*.jsonl.gz
+.DS_Store
+
+# Test and coverage output
+*.test
+coverage.out
+coverage.html
