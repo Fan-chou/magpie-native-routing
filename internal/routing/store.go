@@ -1,6 +1,8 @@
 package routing
 
 import (
+	"fmt"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -8,8 +10,9 @@ import (
 	"time"
 )
 
-// Observer is a UI-safe snapshot. All slices are copies and can be read
-// without holding the store lock.
+// Snapshot is a UI-safe observation. The store publishes immutable Route
+// values: a snapshot may share Route slices, but no later store update
+// mutates them in place. Consumers must treat it as read-only.
 type Snapshot struct {
 	Version           uint64
 	Routes            []RouteView
@@ -37,7 +40,11 @@ type HistoryDay struct {
 }
 
 // Store merges Gateway observations and completed history by stable Route ID.
-// It is safe for one writer goroutine and many UI readers.
+// It is safe for multiple writer goroutines (the Supervisor and the
+// HistoryWatcher) and many UI readers. Route values in
+// the map are immutable once visible to Snapshot: updates clone the one route
+// they change (copy-on-write), so snapshots need not deep-copy the whole
+// multi-thousand-route history on every poll.
 type Store struct {
 	mu      sync.RWMutex
 	routes  map[int64]*Route
@@ -83,8 +90,10 @@ func (s *Store) Version() uint64 {
 	return s.version
 }
 
+// changed dispatches OnChange callbacks. The version bump itself happens in
+// each mutator's critical section so concurrent writers never lose an
+// increment; call changed only after s.mu is released.
 func (s *Store) changed() {
-	s.version++
 	s.notifyMu.Lock()
 	callbacks := append([]func(){}, s.notify...)
 	s.notifyMu.Unlock()
@@ -99,6 +108,17 @@ func (s *Store) changed() {
 func (s *Store) ApplyConcurrency(c ConcurrencyLike) {
 	s.mu.Lock()
 	now := time.Now()
+	oldLiveKey := livePlaneKey(s.live)
+	wasOnline := s.snap.GatewayOnline
+	oldError := s.snap.GatewayError
+	// Older routes live for the gateway's private trace window. Keep every
+	// route that any source observed; replacing the whole map here dropped
+	// completed history whenever a concurrency poll arrived. Only a route
+	// that a live counter actually changes is copied before the update.
+	nextRoutes := make(map[int64]*Route, len(s.routes)+len(c.Active))
+	for id, r := range s.routes {
+		nextRoutes[id] = r
+	}
 	s.live = map[int64]LiveRequest{}
 	s.byRoute = map[int64]map[int64]LiveRequest{}
 	s.orphans = map[int64]LiveRequest{}
@@ -116,11 +136,18 @@ func (s *Store) ApplyConcurrency(c ConcurrencyLike) {
 				s.byRoute[a.RouteID] = m
 			}
 			m[a.ID] = lr
-			r := s.routes[a.RouteID]
+			r := nextRoutes[a.RouteID]
 			if r == nil {
 				r = &Route{ID: a.RouteID, Agent: a.Agent, Session: a.Session, Model: a.Model,
 					Provider: a.Provider, Time: a.Started}
-				s.routes[a.RouteID] = r
+				nextRoutes[a.RouteID] = r
+			} else if r == s.routes[a.RouteID] {
+				// Copy once for this poll. Several active counters may point
+				// at one route, and a published snapshot must never observe
+				// these writes.
+				mutable := cloneRoute(*r)
+				r = &mutable
+				nextRoutes[a.RouteID] = r
 			}
 			r.AddSource(SourceLiveAPI)
 			if r.Agent == "" {
@@ -142,11 +169,46 @@ func (s *Store) ApplyConcurrency(c ConcurrencyLike) {
 			s.orphans[a.ID] = lr
 		}
 	}
+	s.routes = nextRoutes
 	s.snap.GatewayOnline = true
 	s.snap.GatewayError = ""
 	s.snap.LastPoll = now
+	// A poll that observes the same active routes must not rebuild the whole
+	// native view. Millis and ObservedAt advance every second, but animation
+	// and live status are driven by the UI clock and the stable identity of
+	// each row. Keep those volatile values in the store for the next snapshot,
+	// while notifying only when the live plane actually changed.
+	changed := !wasOnline || oldError != "" || oldLiveKey != livePlaneKey(s.live)
+	if changed {
+		s.version++
+	}
 	s.mu.Unlock()
-	s.changed()
+	if changed {
+		s.changed()
+	}
+}
+
+func livePlaneKey(live map[int64]LiveRequest) string {
+	if len(live) == 0 {
+		return ""
+	}
+	ids := make([]int64, 0, len(live))
+	for id := range live {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	var b strings.Builder
+	for _, id := range ids {
+		l := live[id]
+		// Millis is intentionally not in the key: the UI clock advances the
+		// bird from Started, and the gateway's sampled ms must not rebuild
+		// the whole page every second. Phase, route identity, and provider
+		// remain exact observations.
+		fmt.Fprintf(&b, "%d\x00%d\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00",
+			l.ID, l.RouteID, l.Agent, l.Model, l.Provider, l.Session,
+			l.Started.UTC().Format(time.RFC3339Nano), l.Phase)
+	}
+	return b.String()
 }
 
 // ApplyActive is ApplyConcurrency for a transport-neutral active list.
@@ -180,6 +242,7 @@ func (s *Store) SetConnectionError(msg string) {
 	s.live = map[int64]LiveRequest{}
 	s.byRoute = map[int64]map[int64]LiveRequest{}
 	s.orphans = map[int64]LiveRequest{}
+	s.version++
 	s.mu.Unlock()
 	s.changed()
 }
@@ -189,9 +252,20 @@ func (s *Store) SetConnectionError(msg string) {
 // gateway's full candidate list.
 func (s *Store) ApplySessionRoute(sr SessionRouteLike) {
 	s.mu.Lock()
+	_, existed := s.routes[sr.ID]
+	before := ""
+	if existed {
+		before = sessionRouteUIKey(*s.routes[sr.ID])
+	}
 	r := s.routes[sr.ID]
 	if r == nil {
 		r = &Route{ID: sr.ID}
+		s.routes[sr.ID] = r
+	} else {
+		// A previous Snapshot may still point at r. Merge happens rarely
+		// compared with polls, so clone this one route before changing it.
+		mutable := cloneRoute(*r)
+		r = &mutable
 		s.routes[sr.ID] = r
 	}
 	// Completed history is authoritative for completion, attempts and
@@ -235,8 +309,65 @@ func (s *Store) ApplySessionRoute(sr SessionRouteLike) {
 		}
 	}
 	r.AddSource(SourceSessionRoute)
+	changed := !existed || before != sessionRouteUIKey(*r)
+	if changed {
+		s.version++
+	}
 	s.mu.Unlock()
-	s.changed()
+	if changed {
+		s.changed()
+	}
+}
+
+// sessionRouteUIKey fingerprints the live trace fields that change what the
+// native UI shows. The gateway may refresh ms/ttft every poll; those values
+// are retained in Route but do not force a page rebuild while the request's
+// identity, phase, and completion state stay the same.
+func sessionRouteUIKey(r Route) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%t\x00%d\x00%s\x00%t\x00",
+		r.ID, r.Time.UTC().Format(time.RFC3339Nano), r.Model, r.Provider,
+		r.Effort, routeGroupID(r.Group), r.Served, r.Done, r.Status, r.Error,
+		r.HasSource(SourceHistory))
+	for _, src := range r.Sources {
+		b.WriteString(string(src))
+		b.WriteByte(0)
+	}
+	for _, tr := range r.Tries {
+		fmt.Fprintf(&b, "%s\x00%s\x00%s\x00%s\x00%t\x00%d\x00%s\x00%s\x00%t\x00%t\x00",
+			tr.Model, tr.Effort, tr.Tier, tr.TierServed, tr.Done, tr.Status,
+			tr.Fail, tr.Start.UTC().Format(time.RFC3339Nano), tr.Gone, tr.Earlier)
+	}
+	return b.String()
+}
+
+func routeGroupID(g *GroupRef) string {
+	if g == nil {
+		return ""
+	}
+	return g.ID
+}
+
+// routeUIEqual compares trace fields rendered by the native UI. Local
+// metadata such as ReadAt does not change a row, so an incremental history
+// read that saw the same records must not force a full-window rebuild. The
+// source set does change the provenance label and completeness summary and
+// therefore remains part of the comparison.
+func routeUIEqual(a, b Route) bool {
+	// Keep local metadata out of the comparison without mutating caller data.
+	// Route contains slices and maps, so it is not comparable with ==.
+	extraA, extraB := a.Extra, b.Extra
+	readA, readB := a.ReadAt, b.ReadAt
+	a.Extra, b.Extra = nil, nil
+	a.ReadAt, b.ReadAt = time.Time{}, time.Time{}
+	// The watcher stamps every warm tail poll with a fresh ReadAt even when
+	// the JSONL line is unchanged. That local read timestamp is not part of
+	// the UI snapshot and must not turn a quiet poll into a full-page rebuild.
+	// Sources, trace fields and all parsed values remain compared.
+	equal := reflect.DeepEqual(a, b)
+	a.Extra, b.Extra = extraA, extraB
+	a.ReadAt, b.ReadAt = readA, readB
+	return equal
 }
 
 // MergeSession merges a public SessionRoute-shaped observation.
@@ -246,23 +377,36 @@ func (s *Store) MergeSession(sr SessionRouteLike) { s.ApplySessionRoute(sr) }
 // the fuller history version while preserving all source labels.
 func (s *Store) MergeHistory(rs []Route) {
 	s.mu.Lock()
+	changed := false
 	for _, in := range rs {
 		if in.ID == 0 {
 			continue
 		}
-		c := in
+		c := cloneRoute(in)
 		c.AddSource(SourceHistory)
 		if old := s.routes[in.ID]; old != nil {
 			for _, src := range old.Sources {
 				c.AddSource(src)
 			}
+			// Compare only after unioning provenance. A live+history route
+			// read again from the same history line must not look changed
+			// merely because this input starts with only the history label.
+			if routeUIEqual(*old, c) {
+				continue
+			}
 		}
 		s.routes[in.ID] = &c
 		s.history[in.ID] = time.Now()
+		changed = true
 	}
-	s.snap.LastHistoryRead = time.Now()
+	if changed {
+		s.snap.LastHistoryRead = time.Now()
+		s.version++
+	}
 	s.mu.Unlock()
-	s.changed()
+	if changed {
+		s.changed()
+	}
 }
 
 // ReplaceHistory rebuilds the completed-history layer. Routes that vanished
@@ -278,7 +422,7 @@ func (s *Store) ReplaceHistory(rs []Route) {
 		if in.ID == 0 {
 			continue
 		}
-		c := in
+		c := cloneRoute(in)
 		c.AddSource(SourceHistory)
 		if old := s.routes[in.ID]; old != nil {
 			for _, src := range old.Sources {
@@ -308,20 +452,58 @@ func (s *Store) ReplaceHistory(rs []Route) {
 		c.HistoryDay = ""
 		next[id] = &c
 	}
+	changed := !slices.Equal(s.snap.LoadedHistoryDays, loadedDays) || len(next) != len(s.routes)
+	if !changed {
+		for id, r := range next {
+			old := s.routes[id]
+			if old == nil || !routeUIEqual(*old, *r) {
+				changed = true
+				break
+			}
+		}
+	}
 	s.routes = next
 	sort.Strings(loadedDays)
-	s.snap.LoadedHistoryDays = loadedDays
-	s.snap.LastHistoryRead = time.Now()
+	if changed {
+		s.snap.LoadedHistoryDays = loadedDays
+		s.snap.LastHistoryRead = time.Now()
+		s.version++
+	}
 	s.mu.Unlock()
-	s.changed()
+	if changed {
+		s.changed()
+	}
 }
 
 // SetConfig replaces the static snapshot.
 func (s *Store) SetConfig(c ConfigSnapshot) {
 	s.mu.Lock()
+	old := s.config
+	changed := !configUIEqual(old, c)
+	if !changed {
+		// The supervisor re-reads providers.json every few seconds. The
+		// read timestamp changes even when the parsed configuration does
+		// not, and notifying here rebuilt the complete native view for no
+		// visible change. A recovered read must still clear a previous
+		// error banner once.
+		if s.snap.ConfigError != "" {
+			s.snap.ConfigError = ""
+			s.snap.LastConfigRead = c.ReadAt
+			s.version++
+			s.mu.Unlock()
+			s.changed()
+			return
+		}
+		if s.snap.LastConfigRead != c.ReadAt {
+			s.snap.LastConfigRead = c.ReadAt
+		}
+		s.mu.Unlock()
+		return
+	}
 	s.config = c
 	s.snap.ConfigError = ""
 	s.snap.LastConfigRead = c.ReadAt
+	s.version++
 	s.mu.Unlock()
 	s.changed()
 }
@@ -331,6 +513,7 @@ func (s *Store) SetConfigError(msg string) {
 	s.mu.Lock()
 	s.snap.ConfigError = msg
 	s.snap.LastConfigRead = time.Now()
+	s.version++
 	s.mu.Unlock()
 	s.changed()
 }
@@ -338,14 +521,30 @@ func (s *Store) SetConfigError(msg string) {
 // SetDays updates the history day list.
 func (s *Store) SetDays(days []HistoryDay) {
 	s.mu.Lock()
-	if slices.Equal(s.snap.Days, days) {
+	if historyDaysEqual(s.snap.Days, days) {
 		s.mu.Unlock()
 		return
 	}
 	s.snap.Days = append([]HistoryDay(nil), days...)
 	s.snap.LastHistoryRead = time.Now()
+	s.version++
 	s.mu.Unlock()
 	s.changed()
+}
+
+// historyDaysEqual compares what the day chips render. File size and mtime
+// update on every append but do not change a chip's label, while the request
+// count does.
+func historyDaysEqual(a, b []HistoryDay) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Day != b[i].Day || a[i].Requests != b[i].Requests {
+			return false
+		}
+	}
+	return true
 }
 
 // SetHistoryError records a safe reader error while retaining last-good data.
@@ -357,6 +556,7 @@ func (s *Store) SetHistoryError(msg string) {
 	}
 	s.historyErr = msg
 	s.snap.HistoryError = msg
+	s.version++
 	s.mu.Unlock()
 	s.changed()
 }
@@ -370,6 +570,7 @@ func (s *Store) SetGatewayWarning(msg string) {
 		return
 	}
 	s.snap.GatewayWarning = msg
+	s.version++
 	s.mu.Unlock()
 	s.changed()
 }
@@ -378,12 +579,14 @@ func (s *Store) SetGatewayWarning(msg string) {
 func (s *Store) SetReplay(r ReplayState) {
 	s.mu.Lock()
 	s.snap.Replay = r
+	s.version++
 	s.mu.Unlock()
 	s.changed()
 }
 
-// Snapshot returns a deep-enough copy for the UI. Route slices are copied so
-// future merges cannot race with a frame being built.
+// Snapshot returns an immutable view for the UI. Route records are
+// copy-on-write, so existing snapshots never observe a later update, while a
+// new snapshot avoids cloning thousands of unchanged history records.
 func (s *Store) Snapshot() Snapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -398,10 +601,7 @@ func (s *Store) Snapshot() Snapshot {
 	sort.Slice(out.Live, func(i, j int) bool { return out.Live[i].ID < out.Live[j].ID })
 	out.Routes = make([]RouteView, 0, len(s.routes))
 	for _, r := range s.routes {
-		if r.HistoryDay != "" {
-			// loaded days are already recorded separately
-		}
-		rv := RouteView{Route: cloneRoute(*r)}
+		rv := RouteView{Route: *r}
 		if live := s.byRoute[r.ID]; len(live) > 0 {
 			for _, l := range live {
 				rv.Live = append(rv.Live, l)
@@ -442,6 +642,7 @@ func (s *Store) ResetLive() {
 	s.byRoute = map[int64]map[int64]LiveRequest{}
 	s.orphans = map[int64]LiveRequest{}
 	s.snap.GatewayWarning = ""
+	s.version++
 	s.mu.Unlock()
 	s.changed()
 }
@@ -572,6 +773,17 @@ func cloneConfig(c ConfigSnapshot) ConfigSnapshot {
 	out.ProviderOrder = append([]string(nil), c.ProviderOrder...)
 	out.GroupOrder = append([]string(nil), c.GroupOrder...)
 	return out
+}
+
+func configUIEqual(a, b ConfigSnapshot) bool {
+	readA, readB := a.ReadAt, b.ReadAt
+	modA, modB := a.ModifiedAt, b.ModifiedAt
+	a.ReadAt, b.ReadAt = time.Time{}, time.Time{}
+	a.ModifiedAt, b.ModifiedAt = time.Time{}, time.Time{}
+	equal := reflect.DeepEqual(a, b)
+	a.ReadAt, b.ReadAt = readA, readB
+	a.ModifiedAt, b.ModifiedAt = modA, modB
+	return equal
 }
 
 func providerOfModel(model string) string {

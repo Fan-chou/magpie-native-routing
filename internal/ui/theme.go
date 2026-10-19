@@ -1,7 +1,8 @@
 package ui
 
 import (
-	"time"
+	"fmt"
+	"strings"
 
 	"github.com/egoist/mygo/ui"
 
@@ -16,6 +17,7 @@ type palette struct {
 	Line        ui.Color
 	LineSoft    ui.Color
 	Text        ui.Color
+	Text2       ui.Color
 	Muted       ui.Color
 	Faint       ui.Color
 	Accent      ui.Color
@@ -28,6 +30,12 @@ type palette struct {
 	DangerSoft  ui.Color
 	Violet      ui.Color
 	Cyan        ui.Color
+	C1          ui.Color
+	C2          ui.Color
+	C3          ui.Color
+	C4          ui.Color
+	C5          ui.Color
+	C6          ui.Color
 	Shadow      ui.Color
 	RouteIdle   ui.Color
 	RouteLit    ui.Color
@@ -37,6 +45,23 @@ type palette struct {
 	BirdWing    ui.Color
 	BirdBelly   ui.Color
 	Grid        ui.Color
+}
+
+// stageKey fingerprints the colors that a cached stage bitmap bakes in.
+// Geometry, text and data have their own key parts in topology.go.
+func (p palette) stageKey() string {
+	var b strings.Builder
+	for _, c := range []ui.Color{
+		p.Canvas, p.Panel, p.PanelRaised, p.PanelMuted, p.Line, p.LineSoft,
+		p.Text, p.Text2, p.Muted, p.Faint, p.Accent, p.AccentSoft,
+		p.Success, p.SuccessSoft, p.Warning, p.WarningSoft, p.Danger,
+		p.DangerSoft, p.Violet, p.Cyan, p.C1, p.C2, p.C3, p.C4, p.C5, p.C6,
+		p.Shadow, p.RouteIdle, p.RouteLit, p.RouteDanger, p.RouteWarm,
+		p.BirdBody, p.BirdWing, p.BirdBelly, p.Grid,
+	} {
+		fmt.Fprintf(&b, "%08x", c)
+	}
+	return b.String()
 }
 
 func colors(c *ui.Context, mode config.ThemeMode) palette {
@@ -63,6 +88,7 @@ func colors(c *ui.Context, mode config.ThemeMode) palette {
 			Line:        ui.Hex("#333339"),
 			LineSoft:    ui.Hex("#2c2c32"),
 			Text:        ui.Hex("#ededf1"),
+			Text2:       ui.Hex("#b9b9c1"),
 			Muted:       ui.Hex("#8b8b94"),
 			Faint:       ui.Hex("#56565f"),
 			Accent:      ui.Hex("#a5b4fc"),
@@ -75,6 +101,12 @@ func colors(c *ui.Context, mode config.ThemeMode) palette {
 			DangerSoft:  ui.Hex("#45272a"),
 			Violet:      ui.Hex("#c4b5fd"),
 			Cyan:        ui.Hex("#7dd3fc"),
+			C1:          ui.Hex("#a5b4fc"),
+			C2:          ui.Hex("#7dd3fc"),
+			C3:          ui.Hex("#6ee7b7"),
+			C4:          ui.Hex("#fcd34d"),
+			C5:          ui.Hex("#f9a8d4"),
+			C6:          ui.Hex("#c4b5fd"),
 			Shadow:      ui.RGBA(0, 0, 0, 0.32),
 			RouteIdle:   ui.Hex("#333339"),
 			RouteLit:    ui.Hex("#a5b4fc"),
@@ -95,6 +127,7 @@ func colors(c *ui.Context, mode config.ThemeMode) palette {
 		Line:        ui.Hex("#e3e3e8"),
 		LineSoft:    ui.Hex("#ececf0"),
 		Text:        ui.Hex("#1c1c21"),
+		Text2:       ui.Hex("#4b4b53"),
 		Muted:       ui.Hex("#85858d"),
 		Faint:       ui.Hex("#b9b9c2"),
 		Accent:      ui.Hex("#4f46e5"),
@@ -107,6 +140,12 @@ func colors(c *ui.Context, mode config.ThemeMode) palette {
 		DangerSoft:  ui.Hex("#fbe9e9"),
 		Violet:      ui.Hex("#8b5cf6"),
 		Cyan:        ui.Hex("#0ea5e9"),
+		C1:          ui.Hex("#4f46e5"),
+		C2:          ui.Hex("#0ea5e9"),
+		C3:          ui.Hex("#10b981"),
+		C4:          ui.Hex("#f59e0b"),
+		C5:          ui.Hex("#ec4899"),
+		C6:          ui.Hex("#8b5cf6"),
 		Shadow:      ui.RGBA(20, 22, 30, 0.10),
 		RouteIdle:   ui.Hex("#e3e3e8"),
 		RouteLit:    ui.Hex("#4f46e5"),
@@ -145,45 +184,4 @@ func themeFor(c *ui.Context, p palette) *ui.Theme {
 	t.Spacing = 4
 	t.FontSize = 13
 	return t
-}
-
-type springValue struct {
-	from  float32
-	to    float32
-	start time.Time
-	dur   time.Duration
-	valid bool
-}
-
-func (s *springValue) value(now time.Time) float32 {
-	if !s.valid {
-		return s.to
-	}
-	if s.dur <= 0 {
-		return s.to
-	}
-	t := float32(now.Sub(s.start)) / float32(s.dur)
-	if t < 0 {
-		return s.from
-	}
-	if t >= 1 {
-		return s.to
-	}
-	// Ease-out cubic, close to Magpie's transform transitions.
-	u := 1 - t
-	return s.from + (s.to-s.from)*(1-u*u*u)
-}
-
-func (s *springValue) set(to float32, now time.Time, dur time.Duration) {
-	if !s.valid || s.to != to {
-		s.from = s.value(now)
-		s.to = to
-		s.start = now
-		s.dur = dur
-		s.valid = true
-	}
-}
-
-func (s *springValue) moving(now time.Time) bool {
-	return s.valid && s.dur > 0 && now.Sub(s.start) < s.dur && s.from != s.to
 }

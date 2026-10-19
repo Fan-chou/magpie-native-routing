@@ -300,7 +300,8 @@ type NestedRule struct {
 }
 
 // Weighed is an account or key in the actual candidate order recorded by
-// Magpie. Used is a share from 0 to 1; unavailable fields are zero values.
+// Magpie. Used is the vendor's percentage from 0 to 100, as the routing
+// history records it; unavailable fields are zero values.
 type Weighed struct {
 	ID         string      `json:"id"`
 	Provider   string      `json:"provider,omitempty"`

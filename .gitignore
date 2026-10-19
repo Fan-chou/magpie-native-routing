@@ -16,3 +16,6 @@
 *.test
 coverage.out
 coverage.html
+
+# mygo build output
+/build/

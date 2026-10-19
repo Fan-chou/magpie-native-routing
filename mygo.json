@@ -1,0 +1,8 @@
+{
+  "name": "Magpie Native Routing",
+  "identifier": "io.github.fanchou.magpienativerouting",
+  "version": "0.1.0",
+  "copyright": "Copyright © 2026 Fan-chou",
+  "main": "./cmd/magpie-native",
+  "out": "build"
+}

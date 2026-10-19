@@ -25,7 +25,9 @@ type Supervisor struct {
 	cancel  context.CancelFunc
 	done    chan struct{}
 	notify  chan struct{}
-	lastSeq int64
+	// lastSeq is the newest route seq seen per session. The endpoint reports
+	// the seq of that session's own latest route, not a global counter.
+	lastSeq map[string]int64
 	// lastConfig is the last successfully parsed providers.json.
 	lastConfig ConfigSnapshot
 	haveConfig bool
@@ -40,7 +42,7 @@ func NewSupervisor(client *magpie.Client, store *Store, pollEvery time.Duration,
 	}
 	return &Supervisor{
 		client: client, store: store, pollEvery: pollEvery, day: day,
-		maxDays: maxDays, done: make(chan struct{}), notify: make(chan struct{}, 1),
+		maxDays: maxDays, lastSeq: map[string]int64{}, done: make(chan struct{}), notify: make(chan struct{}, 1),
 	}
 }
 
@@ -163,23 +165,20 @@ func (s *Supervisor) pollOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	// The trace's seq is per Gateway process. A rollback means Magpie
-	// restarted; stale live rows and seq state must not survive it.
-	if s.lastSeq > 0 && c.Waiting >= 0 {
-		// concurrency itself carries no seq; this check is completed below
-		// from session-route responses.
-	}
 	s.store.ApplyActive(FromGatewayConcurrency(c))
 
 	// Poll known sessions at most once per cycle. The endpoint's long
 	// polling is intentionally not used here: the supervisor must cancel
 	// promptly on quit and not hold a worker for a minute.
 	var warning string
+	active := map[string]struct{}{}
 	for _, a := range c.Active {
 		if a.Session == "" {
 			continue
 		}
-		resp, err := s.client.SessionRoute(cctx, a.Session, s.lastSeq, 0)
+		active[a.Session] = struct{}{}
+		last := s.lastSeq[a.Session]
+		resp, err := s.client.SessionRoute(cctx, a.Session, last, 0)
 		if err != nil {
 			if magpie.IsAuthError(err) || magpie.IsNotFound(err) {
 				if warning == "" {
@@ -195,17 +194,21 @@ func (s *Supervisor) pollOnce(ctx context.Context) error {
 			}
 			continue
 		}
-		if s.lastSeq > 0 && resp.Seq < s.lastSeq {
-			// Trace sequence went backwards: the Gateway restarted.
-			s.store.ResetLive()
-			s.store.ApplyActive(FromGatewayConcurrency(c))
-			s.lastSeq = 0
-		}
-		if resp.Seq > s.lastSeq {
-			s.lastSeq = resp.Seq
+		if last > 0 && resp.Seq < last {
+			// This session's trace sequence went backwards: the Gateway
+			// restarted. ApplyActive above already replaced the live plane
+			// wholesale, so only the seq state needs resetting.
+			s.lastSeq[a.Session] = 0
+		} else if resp.Seq > last {
+			s.lastSeq[a.Session] = resp.Seq
 		}
 		if sr, ok := FromGatewaySession(resp); ok {
 			s.store.MergeSession(sr)
+		}
+	}
+	for id := range s.lastSeq {
+		if _, ok := active[id]; !ok {
+			delete(s.lastSeq, id)
 		}
 	}
 	s.store.SetGatewayWarning(warning)

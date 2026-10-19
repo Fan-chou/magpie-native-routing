@@ -63,7 +63,7 @@
 | 路由关联 | 活动 ID 与 Route ID 区分、重启后 ID 分配、无 Session、重复 Session |
 | 历史 | 增量写入半行、跨日、gzip、截断/文件轮转、权限不足 |
 | Native 绘制 | 高 DPI、不同窗口大小、系统缩放、动画中多 Route 更新 |
-| 动画回归 | Canvas 尺寸/DPI 失效、暂停回放停止帧请求、直接 Seek 返回段、超过 4 Agent / 5 Provider 的并发端点 |
+| 动画回归 | 窗口缩放/DPI 后几何一致、暂停回放停止帧请求、直接 Seek 返回段、超过 4 Agent / 5 Provider 的并发端点 |
 | 性能 | 多请求并发、密集 Trace 更新、长历史、不在 UI 主线程解压 |
 | 安全 | Key 不落日志、请求文本脱敏、数据目录只读、只连接配置过的目标 |
 | 可用性 | Magpie 未运行、重启、不同版本、portable 模式 |

@@ -93,6 +93,28 @@ MAGPIE_API_KEY='...' ./bin/magpie-native
 
 诊断只读取 Gateway 和本地历史，不会修改 Magpie。
 
+### 打包与发布
+
+`bin/magpie-native` 是命令行可执行文件，在 Finder 中双击会先打开“终端”。应用包由 MyGo CLI（在 `go.mod` 中作为 tool 固定版本）按 `mygo.json` 生成：
+
+```sh
+go tool mygo build                                  # 本机平台
+go tool mygo build -platform darwin/arm64,windows/amd64
+```
+
+输出在 `build/<os>-<arch>/`：macOS 为 `Magpie Native Routing.app` 与 `.dmg`，Windows 为 GUI 子系统的 `.exe`，安装了 NSIS 时另有 `… Setup … .exe` 安装包。图标为 `resources/icon.png`（由上游 `magpie.svg` 渲染）。
+
+发布由 `.github/workflows/release.yml` 完成：把 `mygo.json` 的 `version` 改为新版本并提交，再推送同名标签：
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+工作流先校验标签与 `mygo.json` 版本一致并创建草稿 Release，运行 `go vet`/`go test`，然后并行打包 macOS（arm64、amd64 的 `.dmg`，macOS runner）与 Windows（amd64、arm64 的安装包，Ubuntu runner + NSIS），全部上传成功后发布 Release。
+
+当前构建未使用开发者证书：macOS 应用为 ad hoc 签名，首次打开需在 Finder 中右键“打开”（或执行 `xattr -dr com.apple.quarantine "/Applications/Magpie Native Routing.app"`）；Windows 安装包未签名，SmartScreen 会提示“仍要运行”。
+
 ## 使用
 
 1. 启动 Magpie Desktop，并保持 Gateway 开启。
@@ -101,6 +123,14 @@ MAGPIE_API_KEY='...' ./bin/magpie-native
 4. “历史”页选择日期，查看完成请求的完整候选顺序和尝试链。
 5. 在历史页使用播放、暂停、重播、拖动时间轴和倍速控制回放真实 Trace。
 6. “路由组”页只读查看手动组、自动生成组、成员顺序、规则与策略信息。
+
+界面结构按原版 Routing 页对齐：顶部是同款 Magpie 工具栏与
+`实时 / 历史 / 路由组` 页签；实时区依次展示 Agent → Gateway →
+Provider 舞台、路由故事、上下文窗口、按日期分组的请求列表和账号列。
+窗口变窄时，舞台切换为上下布局，请求指标移到第二行。
+
+“实时”列表与原版一样取自 Gateway 保留的最近 60 个请求；切换日期后
+显示该日完整历史，统计数字也随当前列表范围变化。
 
 ## 已验证
 
@@ -120,6 +150,7 @@ go build -o bin/magpie-native ./cmd/magpie-native
 - 读取到真实 `~/.config/magpie/routing` 的 14 天历史，最新一天有真实记录。
 - `providers.json` 可读，路由组和自动组可展示。
 - 已实际启动原生窗口并确认拓扑、历史和详情界面渲染。
+- Agent、Provider 与 Gateway 图标复用上游 Magpie MIT 授权的真实 SVG/PNG 资产，来源与许可证记录在 `internal/ui/assets/icons/NOTICE.md`。
 
 ## 已实现
 
@@ -130,10 +161,18 @@ go build -o bin/magpie-native ./cmd/magpie-native
 - 按天历史、持续增量读取、真实时间线回放。
 - 原生拓扑、分段贝塞尔连线、按弧长采样的喜鹊飞行动画、并发请求路径。
 - 喜鹊由 MyGo `Path`/`Painter`/`Transform` 原生绘制：远翅、尾羽、身体、腹部、头、喙、近翅分层，约 420ms 扇翅周期、飞行切线朝向、平滑转向、出现/离场缩放与透明度。
-- 实际业务阶段驱动：Agent → Gateway → Provider 去程，Provider 等待，失败经 Gateway 转到下一 Provider，成功后返回 Agent；不在画布上生成未经观测的请求。
-- 历史回放的飞行仍由回放时钟驱动；播放、暂停、重播、倍速与时间轴共用同一真实 Try 时间线。
-- 静态节点和连线缓存到 MyGo `Canvas`（按窗口尺寸、DPI 和真实亮灯状态重建），飞鸟、请求圆点和流动虚线只在动态 Painter 层；空闲或暂停时停止动画帧。
-- 请求列表、详情、候选顺序、尝试链、Token、TTFT、固定查看。
+- 实际业务阶段驱动，与原版 `play()` 相同：发现请求时喜鹊从 Agent 起飞；路由未选定时先飞到 magpie 等待，选定后经 hub 弧线飞向账号；失败经 magpie 转到下一账号，成功或最终失败后返回 Agent。每段飞行时长固定（1400/900/620/1350 ms），只由 Trace 事件推进，已排定的航段不改写，喜鹊总是从一端飞到另一端；不在画布上生成未经观测的请求。
+- 实时舞台与原版一致：未固定时始终讲述正在进行的最新请求（无在途请求时为最新请求）；在列表点选某个请求即固定到它，固定期间新请求不起飞，“回到实时”或该请求离开列表后恢复跟随。其他在途请求按自身 Try 在舞台上有对应账号行，喜鹊总能飞到实际处理它的账号。公开 API 不提供在途请求的候选顺序，飞行期间舞台用 `providers.json` 中该组的启用成员作为账号行，并补齐组名、成员与路由模式（只填空缺，不覆盖 Trace）；完成后由历史中的真实候选顺序替换，舞台行数和标题不随飞行开始、结束而变化。对路由组请求，并发接口的 `provider` 不是正在尝试的账号（实测 translate 请求全程报 `opencode-go`，实际尝试为 `codex`），因此不用它定位；没有 Session 的请求飞到 magpie 等待，请求结束后最多再等 5 秒历史落盘，拿到真实 Try 后飞往实际账号再返回，超时才从 magpie 直接返回。
+- 连接线按原版 `lightRow`/`busy` 状态绘制：Agent 有请求在途时其连线流动；请求在某账号（飞往、等待、返回）时该账号连线流动，当前请求由其应答时实线高亮；休息中或已不在组内的账号连线为淡色虚线。
+- 历史回放的飞行仍由回放时钟驱动；播放、暂停、重播、倍速与时间轴共用同一真实 Try 时间线。与原版相同，倍速只缩短等待，每段飞行仍按真实时长播放。
+- 静态节点与连线由 MyGo `Painter` 离屏渲染并缓存为位图，飞鸟、请求圆点和流动虚线在动态层；空闲或暂停时停止动画帧。
+- 请求列表对齐原版 `renderHist`：模型、目的地、尝试次数，以及耗时、
+  首 Token、Token、缓存和输出速度指标；双栏宽度的列表按原版
+  `metaFit` 将这些指标放到第二行。
+- 账号列对齐 `renderActs`：以账号/密钥为主标题，显示 plan、模型、
+  `used` 百分比（0–100，与 Magpie 历史字段一致）、尝试/回答次数和
+  最近回答时间；Provider 作为分组标题。
+- 请求详情、完整候选顺序、尝试链、固定查看。
 - 手动/自动组只读视图，包括成员、匹配规则、pick、停用成员、Fast 和等级。
 - 中英文界面、浅色/深色/跟随系统、响应式布局、设置弹窗和原生目录选择。
 
@@ -153,17 +192,41 @@ go build -o bin/magpie-native ./cmd/magpie-native
 
 静态层与动态层分离：
 
-- `ui.Canvas` 缓存 Agent、Gateway、Provider 卡片、静态曲线和文字，避免每帧重排/重绘拓扑。
+- Agent、Gateway、Provider 卡片、静态曲线和卡片底由第一条绘制路径完成，文字、真实品牌图标和状态胶囊随后绘制。
 - 动态层只绘制飞鸟、请求圆点、流动虚线与选中路径高亮。
 - 位置按路径累计弧长采样，而不是按贝塞尔 `t` 采样，避免转弯处速度突跳。
 - 每只鸟、每个飞行段独立使用阶段时钟；支持多请求并发和回放暂停。
 - 飞行曲线按“布局 + Agent/Provider 身份”缓存弧长表，飞鸟和动态连线共享同一组路径，不在每帧重复采样贝塞尔曲线。
 - 节点列表不再截断到 4 个 Agent / 5 个 Provider；并发升高时压缩节点高度并增高舞台，所有活动飞行都有可见端点。
-- 历史回放的飞行窗口直接由真实 Trace 阶段构建；暂停、重播或直接 Seek 到返回段都从时间轴重建，不依赖之前是否播放过。
-- `Painter.AnimationFrame()` 只在有真实在途请求，或历史回放确实处于播放状态时调用；暂停回放、空闲和窗口隐藏时不再请求帧。
+- 历史回放的飞行窗口直接由真实 Trace 阶段构建；回放在下一个请求开始时重建视图，新喜鹊总是从 Agent 起飞。拖动时间轴与原版 `seek()` 相同：此刻仍在进行的请求从 Agent 重新起飞并按剩余记录飞完，已结束的请求不再飞行。
+- 飞行动画与静态舞台位于同一原生窗口；动态层只重绘飞鸟、请求圆点和局部反馈，不创建透明子窗口。
+- 飞行与短暂的状态反馈使用 `Painter.AnimationFrame`，跟随显示器刷新出帧，与原版的 `requestAnimationFrame` 一致；请求在途（包括在账号等待）时连线持续流动、等待圆点持续脉动，与原版 CSS 动画一致；没有在途请求时不请求帧；Rest 倒计时每秒一帧；暂停回放、空闲、最小化和窗口隐藏时停止请求帧。
+  - 早期版本用 `Painter.After(1/60s)` 定时请求帧。定时器总在刷新稍后到期、再等下一次刷新，2026-10-19 在 60 Hz 内屏上实测只有约 30 fps（帧间隔中位数 33.3 ms）；同一 MyGo 版本下 `AnimationFrame` 实测约 59.5 fps（16.7 ms）。
 - 渲染使用当前帧 `Painter.Now()`，不按固定帧计数推进动画。
+- 静态舞台通过 MyGo 公共 `ui.Render` 按设备像素离屏渲染，再缓存为 `ui.Bitmap`；仅在布局、主题、DPI、静态语义、隐藏账号过渡或 Rest 倒计时整秒变化时重绘。动画帧只采样位图并绘制飞鸟、流动线和局部状态。
+- 静态层与动态层共享一次 Agent / Account / Replay / flight / geometry 解析，不再在每个 retained paint 回调中重复计算同一舞台输入。
+- 隐藏账号的稳定态使用 Painter 内的小型归一化高斯采样，不再为每行文本创建 `Element.Blur()` 离屏层；350ms 的 `rtpii` 过渡期间会按需重建静态位图，进入稳定态后停止。
+- Store 对快照采用 copy-on-write：一次轮询只复制实际变化的 Route，不再为数千条历史记录逐帧深拷贝。
+- 相同的并发快照、`providers.json` 内容和历史记录不会触发整页重建；回放源缓存直接以 `Snapshot.Version` 失效。
 
-2026-10-19 在真实 Gateway（`127.0.0.1:3425`）和真实并发请求上的短时 `MYGO_FRAME_STATS=1` 观测：飞行动画帧通常 `build 0.0`、`layout 0.0`，`paint` 约 0.2–1.0 ms、`present` 约 0.3–1.8 ms（本机 GPU）；空闲时不再请求动画帧。该数字是单次本机采样，不是跨平台保证。
+> 项目固定使用 MyGo `v0.5.6-0.20261019035537-3d5c0df8105d`。该版本的 `ui.Canvas` 在滚动祖先 Clip 中嵌套文字/图像时会采样错位，因此本项目不使用 Canvas 作为舞台缓存，而采用 `ui.Render` + `ui.Bitmap`。MyGo 的 `Element.Blur()` 在每次 retained-tree paint 时都会重建离屏图层，因此隐藏账号文本改用 Painter 内的高斯近似。
+
+2026-10-19 在真实 Gateway（`127.0.0.1:3425`）、真实请求数据和
+macOS arm64 上的观测：
+
+- 空闲窗口进程约 `0.1–0.3% CPU`。
+- 有真实活动请求时，飞行重绘帧日志为 `build 0.0 (painted again)`、
+  `layout 0.0`、`0 text layouts`；静态舞台文字不再每帧重新排版。
+- 本次收尾未取得可靠的“持续历史回放飞行”同条件前后 CPU 百分比，因此不声称具体降幅。台架依据是：飞行帧只采样静态位图，绘制实例约 2280 个，且不再执行静态舞台的 200+ 次文字布局。
+- 历史连续回放的另一热点是每帧扫描并序列化整日数千条 Trace；回放源缓存以 `Snapshot.Version` 失效后已避免该路径。
+
+`top` 的 `POWER` 是进程能耗近似值，不是 GPU 或整机功耗 API。以上数字是
+单次本机采样，不是跨平台保证。可用以下命令复测：
+
+```sh
+MYGO_FRAME_STATS=1 ./bin/magpie-native
+top -l 20 -s 1 -pid "$(pgrep -n magpie-native)" -stats pid,cpu,mem,power,command
+```
 
 ## 工程结构
 
@@ -183,4 +246,4 @@ internal/testutil/   仅用于测试的明确合成样本
 - Magpie: https://github.com/yetone/magpie
 - MyGo: https://github.com/egoist/mygo
 
-独立集成项目，与上游无官方关联。未直接复制上游界面资源或专有源码。
+独立集成项目，与上游无官方关联。`internal/ui/assets/icons/` 中使用上游 MIT 授权的品牌图标，归属和许可证见该目录的 `NOTICE.md`；未复制上游其他专有源码。

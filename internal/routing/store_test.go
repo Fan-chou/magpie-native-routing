@@ -2,6 +2,7 @@ package routing
 
 import (
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -79,14 +80,28 @@ func TestStoreHistoryOverridesFullerTrace(t *testing.T) {
 	}
 }
 
-func TestStoreSnapshotCopiesSlices(t *testing.T) {
+func TestStoreSnapshotSharesImmutableRoutes(t *testing.T) {
 	s := NewStore()
-	s.MergeHistory([]Route{{ID: 1, Time: time.Now(), Order: []Weighed{{ID: "a"}}}})
+	s.MergeHistory([]Route{{
+		ID: 1, Time: time.Now(), Order: []Weighed{{ID: "a"}}, Tries: []Try{{ID: "a"}},
+		Group: &GroupRef{ID: "g", Members: []string{"member-a"}},
+	}})
 	a := s.Snapshot()
-	a.Routes[0].Order[0].ID = "mutated"
+	oldOrder := a.Routes[0].Order
+	// A later update clones only the changed route. The earlier snapshot
+	// remains stable, and updating a caller-owned input does not mutate the
+	// route that was already stored.
+	input := Route{ID: 1, Time: time.Now(), Order: []Weighed{{ID: "b"}}, Tries: []Try{{ID: "b"}}}
+	s.MergeHistory([]Route{input})
 	b := s.Snapshot()
-	if b.Routes[0].Order[0].ID != "a" {
-		t.Fatal("snapshot shares mutable route slices")
+	if a.Routes[0].Order[0].ID != oldOrder[0].ID || b.Routes[0].Order[0].ID != "b" {
+		t.Fatalf("copy-on-write route snapshot changed: old=%+v new=%+v", a.Routes[0].Order, b.Routes[0].Order)
+	}
+	input.Order[0].ID = "caller-mutated"
+	input.Tries[0].ID = "caller-mutated"
+	c := s.Snapshot()
+	if c.Routes[0].Order[0].ID != "b" || c.Routes[0].Tries[0].ID != "b" {
+		t.Fatalf("stored route shares caller-owned slices: %+v", c.Routes[0])
 	}
 }
 
@@ -108,6 +123,148 @@ func TestStoreConcurrencySnapshotReplacesLive(t *testing.T) {
 	}
 }
 
+func TestStoreSkipsNotificationsForVolatileOnlyPolls(t *testing.T) {
+	s := NewStore()
+	started := time.Now()
+	notifications := 0
+	s.OnChange(func() { notifications++ })
+	s.ApplyActive([]LiveRequest{{
+		ID: 1, RouteID: 10, Agent: "codex", Provider: "p",
+		Started: started, Millis: 100, Phase: PhaseUpstream,
+	}})
+	if notifications != 1 {
+		t.Fatalf("initial poll notifications = %d, want 1", notifications)
+	}
+	s.ApplyActive([]LiveRequest{{
+		ID: 1, RouteID: 10, Agent: "codex", Provider: "p",
+		Started: started, Millis: 1100, Phase: PhaseUpstream,
+	}})
+	if notifications != 1 {
+		t.Fatalf("volatile ms poll rebuilt the view: %d notifications", notifications)
+	}
+	s.ApplyActive([]LiveRequest{{
+		ID: 1, RouteID: 10, Agent: "codex", Provider: "p",
+		Started: started, Millis: 1100, Phase: PhaseRPM,
+	}})
+	if notifications != 2 {
+		t.Fatalf("phase change notifications = %d, want 2", notifications)
+	}
+	if got := s.Snapshot().Live[0].Millis; got != 1100 {
+		t.Fatalf("latest observed ms = %d, want 1100", got)
+	}
+}
+
+func TestStoreSkipsUnchangedHistoryAndConfigRevisions(t *testing.T) {
+	s := NewStore()
+	notifications := 0
+	s.OnChange(func() { notifications++ })
+	route := Route{
+		ID: 17, Time: time.Date(2026, 10, 19, 2, 0, 0, 0, time.UTC),
+		Agent: "codex", Model: "openai/gpt-6", Done: true, Status: 200,
+	}
+	s.MergeHistory([]Route{route})
+	if notifications != 1 {
+		t.Fatalf("first history merge notifications = %d, want 1", notifications)
+	}
+	// A tail scan and a full-day read can both return the same record. The
+	// ReadAt and accumulated source metadata change, but no rendered field
+	// does.
+	repeated := cloneRoute(route)
+	repeated.ReadAt = time.Now().Add(time.Minute)
+	repeated.AddSource(SourceHistory)
+	s.MergeHistory([]Route{repeated})
+	if notifications != 1 {
+		t.Fatalf("identical history append rebuilt the view: %d notifications", notifications)
+	}
+	s.ReplaceHistory([]Route{route})
+	if notifications != 1 {
+		t.Fatalf("identical history replacement rebuilt the view: %d notifications", notifications)
+	}
+
+	cfg := ConfigSnapshot{
+		Providers: []ProviderInfo{{ID: "openai", Name: "OpenAI"}},
+		Groups:    []GroupInfo{{ID: "g", Name: "Group", Members: []string{"openai/gpt-6"}}},
+	}
+	s.SetConfig(cfg)
+	if notifications != 2 {
+		t.Fatalf("first config read notifications = %d, want 2", notifications)
+	}
+	same := cloneConfig(cfg)
+	same.ReadAt = time.Now().Add(time.Second)
+	same.ModifiedAt = time.Now().Add(time.Second)
+	s.SetConfig(same)
+	if notifications != 2 {
+		t.Fatalf("identical providers.json refresh rebuilt the view: %d notifications", notifications)
+	}
+	s.SetConfigError("temporary config read error")
+	if notifications != 3 {
+		t.Fatalf("config error notifications = %d, want 3", notifications)
+	}
+	s.SetConfig(same)
+	if notifications != 4 {
+		t.Fatalf("recovered identical config did not clear the stale error: %d notifications", notifications)
+	}
+	if got := s.Snapshot().ConfigError; got != "" {
+		t.Fatalf("config error remained after recovery: %q", got)
+	}
+	changed := cloneConfig(cfg)
+	changed.Groups[0].Members = append(changed.Groups[0].Members, "backup/gpt-6")
+	s.SetConfig(changed)
+	if notifications != 5 {
+		t.Fatalf("changed config notifications = %d, want 5", notifications)
+	}
+}
+
+func TestStoreRepeatedHistoryMergePreservesLiveSourcesWithoutRebuild(t *testing.T) {
+	s := NewStore()
+	notifications := 0
+	s.OnChange(func() { notifications++ })
+
+	started := time.Date(2026, 10, 19, 2, 0, 0, 0, time.UTC)
+	s.ApplyActive([]LiveRequest{{
+		ID: 1, RouteID: 17, Agent: "codex", Model: "openai/gpt-6",
+		Started: started, Phase: PhaseUpstream,
+	}})
+	history := Route{
+		ID: 17, Time: started, Agent: "codex", Model: "openai/gpt-6",
+		Done: true, Status: 200,
+	}
+	s.MergeHistory([]Route{history})
+	if notifications != 2 {
+		t.Fatalf("initial live+history notifications = %d, want 2", notifications)
+	}
+
+	// The history watcher re-reads the same completed record while the live
+	// concurrency poll still owns the same route. The incoming history copy
+	// only carries its own source label; the store must union old provenance
+	// before deciding whether anything visible changed.
+	for range 3 {
+		repeated := cloneRoute(history)
+		repeated.ReadAt = time.Now()
+		s.MergeHistory([]Route{repeated})
+	}
+	if notifications != 2 {
+		t.Fatalf("repeated live+history merge rebuilt the view: %d notifications", notifications)
+	}
+	got := s.Snapshot().Routes[0]
+	if !got.HasSource(SourceLiveAPI) || !got.HasSource(SourceHistory) {
+		t.Fatalf("merged sources = %v", got.Sources)
+	}
+}
+
+func TestStoreConcurrencyKeepsCompletedHistory(t *testing.T) {
+	s := NewStore()
+	s.MergeHistory([]Route{{
+		ID: 7, Time: time.Now().Add(-time.Minute), Agent: "codex",
+		Model: "p/m", Done: true, Status: 200,
+	}})
+	s.ApplyActive([]LiveRequest{{ID: 2, RouteID: 20, Model: "p/m", Started: time.Now()}})
+	snap := s.Snapshot()
+	if len(snap.Routes) != 2 {
+		t.Fatalf("routes after poll = %d, want history plus live", len(snap.Routes))
+	}
+}
+
 func TestErrTextNoSecrets(t *testing.T) {
 	e := &APIErrorText{Text: "gateway is unreachable"}
 	if strings.Contains(SafeErrorText(e), "secret") {
@@ -118,3 +275,63 @@ func TestErrTextNoSecrets(t *testing.T) {
 type APIErrorText struct{ Text string }
 
 func (e *APIErrorText) Error() string { return e.Text }
+
+func TestStoreVersionConcurrentWriters(t *testing.T) {
+	s := NewStore()
+	const n = 200
+	var notified int64
+	var nmu sync.Mutex
+	s.OnChange(func() {
+		nmu.Lock()
+		notified++
+		nmu.Unlock()
+	})
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = s.Snapshot().Version
+				_ = s.Version()
+			}
+		}
+	}()
+	alt := func(i int) string {
+		if i%2 == 0 {
+			return "a"
+		}
+		return "b"
+	}
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < n; i++ {
+			s.SetGatewayWarning(alt(i))
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < n; i++ {
+			s.SetHistoryError(alt(i))
+		}
+	}()
+	wg.Wait()
+	close(stop)
+	<-readerDone
+	// Every call flips its field, so each one is a committed change and no
+	// increment may be lost to a concurrent writer.
+	if got := s.Version(); got != 2*n {
+		t.Fatalf("version = %d, want %d", got, 2*n)
+	}
+	if got := s.Snapshot().Version; got != 2*n {
+		t.Fatalf("snapshot version = %d, want %d", got, 2*n)
+	}
+	if notified != 2*n {
+		t.Fatalf("notifications = %d, want %d", notified, 2*n)
+	}
+}

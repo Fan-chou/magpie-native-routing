@@ -27,7 +27,7 @@ const (
 	appTitle        = "Magpie Native Routing"
 	defaultWindowW  = 1240
 	defaultWindowH  = 820
-	minimumWindowW  = 880
+	minimumWindowW  = 560
 	minimumWindowH  = 620
 	diagnosticLimit = 500
 )
@@ -44,8 +44,13 @@ type options struct {
 
 type application struct {
 	settings config.AppSettings
-	paths    config.Paths
-	loc      ui.Localization
+	// persisted is the settings file as loaded (then as last saved), and
+	// launch the effective settings after env/CLI overrides. Saves write
+	// config.PersistedSettings so overrides stay process-local.
+	persisted config.AppSettings
+	launch    config.AppSettings
+	paths     config.Paths
+	loc       ui.Localization
 
 	store      *routing.Store
 	client     *magpie.Client
@@ -61,11 +66,15 @@ type application struct {
 
 	historyReader *routing.HistoryReader
 	configReader  routing.ConfigReader
+
+	publishMu      sync.Mutex
+	publishPending bool
+	publishTimer   *time.Timer
 }
 
 func main() {
 	opts := parseFlags()
-	cfg, paths, err := loadConfiguration(opts)
+	cfg, persisted, paths, err := loadConfiguration(opts)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, sanitize(err.Error()))
 		os.Exit(1)
@@ -73,7 +82,7 @@ func main() {
 	if opts.diagnose {
 		os.Exit(runDiagnostics(cfg, paths, opts))
 	}
-	if err := runGUI(cfg, paths, opts); err != nil {
+	if err := runGUI(cfg, persisted, paths, opts); err != nil {
 		fmt.Fprintln(os.Stderr, sanitize(err.Error()))
 		os.Exit(1)
 	}
@@ -92,22 +101,27 @@ func parseFlags() options {
 	return o
 }
 
-func loadConfiguration(opts options) (config.AppSettings, config.Paths, error) {
+// loadConfiguration returns the effective settings (disk plus env/CLI
+// overrides), the settings exactly as stored on disk, and the paths.
+func loadConfiguration(opts options) (config.AppSettings, config.AppSettings, config.Paths, error) {
 	// Locate the app's own settings directory before reading Magpie's data.
 	// Discover returns the app paths even when Magpie has not created its
 	// folder yet; loading settings can then override the auto-detected one.
 	base, err := config.Discover("")
 	if err != nil {
-		return config.AppSettings{}, config.Paths{}, err
+		return config.AppSettings{}, config.AppSettings{}, config.Paths{}, err
 	}
 	if err := config.EnsureAppDirs(base); err != nil {
-		return config.AppSettings{}, config.Paths{}, err
+		return config.AppSettings{}, config.AppSettings{}, config.Paths{}, err
 	}
 	settingsStore := config.NewSettingsStore(base.AppConfig)
 	cfg, err := settingsStore.Load()
 	if err != nil {
-		return config.AppSettings{}, config.Paths{}, err
+		return config.AppSettings{}, config.AppSettings{}, config.Paths{}, err
 	}
+	// Overrides below apply to this process only; keep the stored settings so
+	// saves do not write them back.
+	persisted := cfg
 	if v := strings.TrimSpace(opts.gateway); v != "" {
 		cfg.GatewayURL = v
 	}
@@ -127,24 +141,16 @@ func loadConfiguration(opts options) (config.AppSettings, config.Paths, error) {
 		cfg.Language = strings.ToLower(v)
 	}
 	if err := cfg.Validate(); err != nil {
-		return cfg, base, err
-	}
-	if strings.TrimSpace(os.Getenv("MAGPIE_API_KEY")) != "" {
-		// An environment-injected key is applied for this process only. Do
-		// not persist it just because the user launched the app.
-		cfg.APIKey = strings.TrimSpace(os.Getenv("MAGPIE_API_KEY"))
-	}
-	if strings.TrimSpace(opts.apiKey) != "" {
-		cfg.APIKey = strings.TrimSpace(opts.apiKey)
+		return cfg, persisted, base, err
 	}
 	paths, err := config.Discover(cfg.MagpieDir)
 	if err != nil {
-		return cfg, base, err
+		return cfg, persisted, base, err
 	}
-	return cfg, paths, nil
+	return cfg, persisted, paths, nil
 }
 
-func runGUI(cfg config.AppSettings, paths config.Paths, opts options) error {
+func runGUI(cfg, persisted config.AppSettings, paths config.Paths, opts options) error {
 	client, err := magpie.NewClient(magpie.Options{
 		BaseURL: cfg.GatewayURL,
 		APIKey:  cfg.APIKey,
@@ -154,12 +160,13 @@ func runGUI(cfg config.AppSettings, paths config.Paths, opts options) error {
 		return err
 	}
 	app := &application{
-		settings: cfg, paths: paths, loc: ui.NewLocalization(cfg.Language),
+		settings: cfg, persisted: persisted, launch: cfg, paths: paths, loc: ui.NewLocalization(cfg.Language),
 		store:         routing.NewStore(),
 		client:        client,
 		historyReader: routing.NewHistoryReader(paths.RoutingDir),
 		configReader:  routing.NewConfigReader(paths.Providers),
 	}
+	app.loc = ui.NewLocalization(cfg.Language)
 	app.model = ui.NewModel(app.store, cfg, paths, paths.MagpieDir, ui.Actions{
 		Refresh:        app.refresh,
 		OpenDay:        app.openDay,
@@ -289,15 +296,58 @@ func (a *application) openDay(day string) {
 	}
 }
 
-// publishSnapshot copies the store on the worker's goroutine and delivers the
-// immutable copy to the UI thread. It intentionally does not read the store
-// from a draw callback, and it coalesces naturally because every callback
-// posts one Update.
+const snapshotPublishDelay = 120 * time.Millisecond
+
+// publishSnapshot copies the store off the UI thread and coalesces bursts of
+// worker updates into one UI rebuild. A live poll, a history append and a
+// config refresh often arrive together; publishing each separately rebuilt
+// the whole retained tree several times for one visible change. The newest
+// snapshot always wins, and shutdown flushes synchronously so no final state
+// is lost.
 func (a *application) publishSnapshot() {
+	a.mu.Lock()
+	if a.stopped {
+		a.mu.Unlock()
+		return
+	}
+	a.mu.Unlock()
+	a.publishMu.Lock()
+	if a.publishPending {
+		a.publishMu.Unlock()
+		return
+	}
+	a.publishPending = true
+	a.publishMu.Unlock()
+	a.schedulePublish(snapshotPublishDelay)
+}
+
+func (a *application) schedulePublish(delay time.Duration) {
+	a.publishMu.Lock()
+	if a.publishTimer != nil {
+		a.publishTimer.Stop()
+	}
+	a.publishTimer = time.AfterFunc(delay, a.flushSnapshot)
+	a.publishMu.Unlock()
+}
+
+func (a *application) flushSnapshot() {
+	a.publishMu.Lock()
+	a.publishTimer = nil
+	if !a.publishPending {
+		a.publishMu.Unlock()
+		return
+	}
+	a.publishPending = false
+	a.publishMu.Unlock()
+
 	snapshot := a.store.Snapshot()
 	a.mu.Lock()
 	win := a.win
+	stopped := a.stopped
 	a.mu.Unlock()
+	if stopped {
+		return
+	}
 	if win == nil {
 		a.model.SetSnapshot(snapshot)
 		return
@@ -308,6 +358,16 @@ func (a *application) publishSnapshot() {
 	win.Update(func() {
 		a.model.SetSnapshot(snapshot)
 	})
+}
+
+func (a *application) publishSnapshotNow() {
+	a.publishMu.Lock()
+	if a.publishTimer != nil {
+		a.publishTimer.Stop()
+		a.publishTimer = nil
+	}
+	a.publishMu.Unlock()
+	a.flushSnapshot()
 }
 
 func (a *application) chooseDataDir() {
@@ -330,6 +390,7 @@ func (a *application) saveSettings(cfg config.AppSettings) error {
 	a.mu.Lock()
 	old := a.settings
 	oldPaths := a.paths
+	persisted, launch := a.persisted, a.launch
 	a.mu.Unlock()
 	var newPaths config.Paths
 	if cfg.MagpieDir != old.MagpieDir {
@@ -339,10 +400,13 @@ func (a *application) saveSettings(cfg config.AppSettings) error {
 		}
 		newPaths = paths
 	}
-	if err := config.NewSettingsStore(oldPaths.AppConfig).Save(cfg); err != nil {
+	// Env/CLI overrides the user did not edit stay out of settings.json.
+	toSave := config.PersistedSettings(cfg, persisted, launch)
+	if err := config.NewSettingsStore(oldPaths.AppConfig).Save(toSave); err != nil {
 		return err
 	}
 	a.mu.Lock()
+	a.persisted = toSave
 	a.settings = cfg
 	a.loc = ui.NewLocalization(cfg.Language)
 	a.mu.Unlock()
@@ -410,6 +474,7 @@ func (a *application) shutdown() {
 	if supervisor != nil {
 		supervisor.Stop()
 	}
+	a.publishSnapshotNow()
 }
 
 func runDiagnostics(cfg config.AppSettings, paths config.Paths, opts options) int {
