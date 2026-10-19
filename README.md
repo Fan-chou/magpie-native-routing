@@ -141,7 +141,7 @@ go build -o bin/magpie-native ./cmd/magpie-native
 - 喜鹊由 MyGo `Path`/`Painter`/`Transform` 原生绘制：远翅、尾羽、身体、腹部、头、喙、近翅分层，约 420ms 扇翅周期、飞行切线朝向、平滑转向、出现/离场缩放与透明度。
 - 实际业务阶段驱动：Agent → Gateway → Provider 去程，Provider 等待，失败经 Gateway 转到下一 Provider，成功后返回 Agent；不在画布上生成未经观测的请求。
 - 历史回放的飞行仍由回放时钟驱动；播放、暂停、重播、倍速与时间轴共用同一真实 Try 时间线。
-- 静态节点与连线直接由 MyGo `Painter` 绘制，飞鸟、请求圆点和流动虚线在动态层；空闲或暂停时停止动画帧。
+- 静态节点与连线由 MyGo `Painter` 离屏渲染并缓存为位图，飞鸟、请求圆点和流动虚线在动态层；空闲或暂停时停止动画帧。
 - 请求列表对齐原版 `renderHist`：模型、目的地、尝试次数，以及耗时、
   首 Token、Token、缓存和输出速度指标；双栏宽度的列表按原版
   `metaFit` 将这些指标放到第二行。
@@ -175,22 +175,33 @@ go build -o bin/magpie-native ./cmd/magpie-native
 - 飞行曲线按“布局 + Agent/Provider 身份”缓存弧长表，飞鸟和动态连线共享同一组路径，不在每帧重复采样贝塞尔曲线。
 - 节点列表不再截断到 4 个 Agent / 5 个 Provider；并发升高时压缩节点高度并增高舞台，所有活动飞行都有可见端点。
 - 历史回放的飞行窗口直接由真实 Trace 阶段构建；暂停、重播或直接 Seek 到返回段都从时间轴重建，不依赖之前是否播放过。
-- `Painter.AnimationFrame()` 只在有真实在途请求，或历史回放确实处于播放状态时调用；暂停回放、空闲和窗口隐藏时不再请求帧。
+- 飞行动画与静态舞台位于同一原生窗口；动态层只重绘飞鸟、请求圆点和局部反馈，不创建透明子窗口。
+- 动画使用 `Painter.After`：飞行为 60 Hz；等待中的请求圆点与状态只绘制一次，不使用持续帧；暂停回放、空闲、最小化和窗口隐藏时停止请求帧。
 - 渲染使用当前帧 `Painter.Now()`，不按固定帧计数推进动画。
+- 静态舞台通过 MyGo 公共 `ui.Render` 按设备像素离屏渲染，再缓存为 `ui.Bitmap`；仅在布局、主题、DPI、静态语义、隐藏账号过渡或 Rest 倒计时整秒变化时重绘。动画帧只采样位图并绘制飞鸟、流动线和局部状态。
+- 静态层与动态层共享一次 Agent / Account / Replay / flight / geometry 解析，不再在每个 retained paint 回调中重复计算同一舞台输入。
+- 隐藏账号的稳定态使用 Painter 内的小型归一化高斯采样，不再为每行文本创建 `Element.Blur()` 离屏层；350ms 的 `rtpii` 过渡期间会按需重建静态位图，进入稳定态后停止。
+- Store 对快照采用 copy-on-write：一次轮询只复制实际变化的 Route，不再为数千条历史记录逐帧深拷贝。
+- 相同的并发快照、`providers.json` 内容和历史记录不会触发整页重建；回放源缓存直接以 `Snapshot.Version` 失效。
 
-> MyGo `v0.5.6-0.20261018121843-4dc371f94507` 在页面 `Clip` 内合成 `ui.Canvas` 时会以错误源原点采样，造成附近卡片文字在舞台上出现浅色重影。本项目因此不使用整页 `Canvas` 合成；已解析的 SVG 图标、文字布局和按布局缓存的飞行弧长表仍然复用。这是对上游渲染缺陷的隔离，不改变业务数据。
+> 项目固定使用 MyGo `v0.5.6-0.20261019035537-3d5c0df8105d`。该版本的 `ui.Canvas` 在滚动祖先 Clip 中嵌套文字/图像时会采样错位，因此本项目不使用 Canvas 作为舞台缓存，而采用 `ui.Render` + `ui.Bitmap`。MyGo 的 `Element.Blur()` 在每次 retained-tree paint 时都会重建离屏图层，因此隐藏账号文本改用 Painter 内的高斯近似。
 
-2026-10-19 在真实 Gateway（`127.0.0.1:3425`）和真实并发请求上的
-`MYGO_FRAME_STATS=1` 观测：
+2026-10-19 在真实 Gateway（`127.0.0.1:3425`）、真实请求数据和
+macOS arm64 上的观测：
 
-- 飞行重绘帧：`build 0.0`、`layout 0.0`、`paint` 约 0.2–1.4 ms；
-  `present` 通常 0.3–0.7 ms，偶发 GPU 调度达到 9–14 ms。
-- 约 1 秒一次的 Gateway 轮询会重建视图：`build` 约 6–17 ms，
-  这是当前主要 CPU 成本，而不是喜鹊绘制。
-- 空闲且无动画时不再请求帧；顶部实时圆点也改为静态，避免空闲页
-  每秒重建 30 次整棵 Native 视图。
+- 空闲窗口进程约 `0.1–0.3% CPU`。
+- 有真实活动请求时，飞行重绘帧日志为 `build 0.0 (painted again)`、
+  `layout 0.0`、`0 text layouts`；静态舞台文字不再每帧重新排版。
+- 本次收尾未取得可靠的“持续历史回放飞行”同条件前后 CPU 百分比，因此不声称具体降幅。台架依据是：飞行帧只采样静态位图，绘制实例约 2280 个，且不再执行静态舞台的 200+ 次文字布局。
+- 历史连续回放的另一热点是每帧扫描并序列化整日数千条 Trace；回放源缓存以 `Snapshot.Version` 失效后已避免该路径。
 
-该数字是单次本机采样，不是跨平台保证。
+`top` 的 `POWER` 是进程能耗近似值，不是 GPU 或整机功耗 API。以上数字是
+单次本机采样，不是跨平台保证。可用以下命令复测：
+
+```sh
+MYGO_FRAME_STATS=1 ./bin/magpie-native
+top -l 20 -s 1 -pid "$(pgrep -n magpie-native)" -stats pid,cpu,mem,power,command
+```
 
 ## 工程结构
 

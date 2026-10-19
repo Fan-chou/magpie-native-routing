@@ -32,6 +32,7 @@ type AppSettings struct {
 	PollIntervalMS  int       `json:"pollIntervalMS"`
 	HistoryTailMS   int       `json:"historyTailMS"`
 	ShowHistory     bool      `json:"showHistory"`
+	HideAccounts    bool      `json:"hideAccounts,omitempty"`
 	HistoryDayLimit int       `json:"historyDayLimit"`
 	OnboardingDone  bool      `json:"onboardingDone,omitempty"`
 }

@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/egoist/mygo/ui"
@@ -44,6 +46,23 @@ type palette struct {
 	BirdWing    ui.Color
 	BirdBelly   ui.Color
 	Grid        ui.Color
+}
+
+// stageKey fingerprints the colors that a cached stage bitmap bakes in.
+// Geometry, text and data have their own key parts in topology.go.
+func (p palette) stageKey() string {
+	var b strings.Builder
+	for _, c := range []ui.Color{
+		p.Canvas, p.Panel, p.PanelRaised, p.PanelMuted, p.Line, p.LineSoft,
+		p.Text, p.Text2, p.Muted, p.Faint, p.Accent, p.AccentSoft,
+		p.Success, p.SuccessSoft, p.Warning, p.WarningSoft, p.Danger,
+		p.DangerSoft, p.Violet, p.Cyan, p.C1, p.C2, p.C3, p.C4, p.C5, p.C6,
+		p.Shadow, p.RouteIdle, p.RouteLit, p.RouteDanger, p.RouteWarm,
+		p.BirdBody, p.BirdWing, p.BirdBelly, p.Grid,
+	} {
+		fmt.Fprintf(&b, "%08x", c)
+	}
+	return b.String()
 }
 
 func colors(c *ui.Context, mode config.ThemeMode) palette {

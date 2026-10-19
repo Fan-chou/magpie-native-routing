@@ -189,6 +189,23 @@ type routeMetric struct {
 	key, label, value string
 }
 
+type routeMetricOption struct {
+	key       string
+	labelKey  string
+	available bool
+}
+
+var routeMetricOptions = []routeMetricOption{
+	{key: "duration", labelKey: "metrics.duration", available: true},
+	{key: "ttft", labelKey: "metrics.firstToken", available: true},
+	{key: "tokens", labelKey: "metrics.tokens", available: true},
+	{key: "cache", labelKey: "metrics.cache", available: true},
+	{key: "speed", labelKey: "metrics.speed", available: true},
+	// Magpie's public Route/history has no price catalog. Keep the original
+	// menu entry visible but disabled instead of inventing a cost.
+	{key: "cost", labelKey: "metrics.cost", available: false},
+}
+
 func routeMetrics(rv routing.RouteView, how string, loc Localization) []routeMetric {
 	out := make([]routeMetric, 0, 6)
 	if rv.Done || rv.Completeness.History {
@@ -207,6 +224,17 @@ func routeMetrics(rv routing.RouteView, how string, loc Localization) []routeMet
 		}
 		if speed := routeSpeed(rv, how); speed > 0 {
 			out = append(out, routeMetric{"speed", loc.T("metrics.speed"), loc.F("metrics.tokensPerSecond", speed)})
+		}
+	}
+	return out
+}
+
+func (m *Model) visibleRouteMetrics(rv routing.RouteView, how string, loc Localization) []routeMetric {
+	all := routeMetrics(rv, how, loc)
+	out := make([]routeMetric, 0, len(all))
+	for _, metric := range all {
+		if metric.key != "cost" && m.metricVisible(metric.key) {
+			out = append(out, metric)
 		}
 	}
 	return out

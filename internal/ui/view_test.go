@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"bytes"
+	"encoding/base64"
 	"image"
 	"math"
 	"os"
@@ -223,8 +225,52 @@ func TestLiveFlightRequestsAnimationFrames(t *testing.T) {
 	model, _ := testModel(t, store.Snapshot(), Actions{})
 	tester := render(t, model, 1240, 820)
 	tester.Frame()
-	if !tester.FramePending() {
-		t.Fatal("an in-flight request did not request the next animation frame")
+	before := tester.Image()
+	tester.Advance(routingAnimationInterval)
+	if bytes.Equal(before.Pix, tester.Image().Pix) {
+		t.Fatal("the in-flight bird did not move on its retained-tree repaint")
+	}
+}
+
+func TestPausedReplayWithRealTryDoesNotRequestAnimationFrames(t *testing.T) {
+	start := time.Date(2026, 10, 19, 5, 0, 0, 0, time.UTC)
+	route := routing.Route{
+		ID: 94, Time: start, Agent: "codex", Model: "qoder/model",
+		Provider: "qoder", Done: true, Status: 200, Millis: 2000,
+		HistoryDay: start.Format("2006-01-02"),
+		Tries: []routing.Try{{
+			ID: "qoder", Model: "qoder/model", Start: start,
+			Millis: 2000, Status: 200, Done: true,
+		}},
+	}
+	store := routing.NewStore()
+	store.ReplaceHistory([]routing.Route{route})
+	model, _ := testModel(t, store.Snapshot(), Actions{})
+	model.setTab(tabHistory)
+	model.SetHistoryDay(start.Format("2006-01-02"))
+	tester := render(t, model, 1240, 900)
+	tester.Frame()
+	if err := tester.Click("Play"); err != nil {
+		t.Fatal(err)
+	}
+	tester.Frame()
+	if err := tester.Click("Pause"); err != nil {
+		t.Fatal(err)
+	}
+	tester.Frame()
+	model.mu.RLock()
+	playing := model.replay.playing
+	flightCount := len(model.topology.flights)
+	model.mu.RUnlock()
+	if playing {
+		t.Fatal("Pause left the replay clock running")
+	}
+	if flightCount == 0 {
+		t.Fatal("test did not construct a real replay flight")
+	}
+	tester.Frame()
+	if tester.FramePending() {
+		t.Fatal("paused replay with a real Try kept requesting animation frames")
 	}
 }
 
@@ -267,6 +313,103 @@ func TestFlightFramesReuseStageGeometry(t *testing.T) {
 	model.mu.RUnlock()
 	if !sameGeometry {
 		t.Fatal("a bird-only frame rebuilt the stage geometry")
+	}
+}
+
+func TestFlightFramesReuseStaticStageContent(t *testing.T) {
+	now := time.Now()
+	store := routing.NewStore()
+	store.ApplyActive([]routing.LiveRequest{{
+		ID: 20, Agent: "codex", Provider: "qoder", RouteID: 1711,
+		Started: now, Millis: 600,
+	}})
+	model, _ := testModel(t, store.Snapshot(), Actions{})
+	tester := render(t, model, 1240, 820)
+	tester.Frame()
+	for i := 0; i < 8; i++ {
+		tester.Advance(routingAnimationInterval)
+	}
+	model.mu.RLock()
+	geometry := model.topology.stageGeometry
+	model.mu.RUnlock()
+	if geometry == nil {
+		t.Fatal("bird-only frames discarded the stage geometry")
+	}
+}
+
+func TestFlightPacingUsesTravelRateOnlyWhileTraveling(t *testing.T) {
+	now := time.Now()
+	phase := func(kind flightPhaseKind) flightTrack {
+		return flightTrack{
+			inReplay: true, replayPlay: true, firstSeen: now,
+			phases: []flightPhase{{kind: kind, start: 0, end: time.Second}},
+		}
+	}
+	for _, kind := range []flightPhaseKind{flightOutbound, flightRetryOut, flightRetryBack, flightInbound} {
+		if !flightTraveling(phase(kind), now.Add(100*time.Millisecond)) {
+			t.Errorf("phase %d did not use the travel cadence", kind)
+		}
+	}
+	if flightTraveling(phase(flightHold), now.Add(100*time.Millisecond)) {
+		t.Error("a provider hold used the travel cadence")
+	}
+}
+
+func TestProviderHoldDoesNotRequestAnimationFrames(t *testing.T) {
+	now := time.Now()
+	// A live request past the inbound leg is waiting at its account. The
+	// held packet is visible, but the retained painter must not keep
+	// scheduling animation frames for the whole upstream wait.
+	store := routing.NewStore()
+	store.ApplyActive([]routing.LiveRequest{{
+		ID: 41, Agent: "codex", Provider: "qoder", RouteID: 1741,
+		Started: now.Add(-5 * time.Second), Millis: 5000,
+	}})
+	model, _ := testModel(t, store.Snapshot(), Actions{})
+	tester := render(t, model, 1240, 820)
+	tester.Frame()
+	model.mu.RLock()
+	flights := append([]flightTrack(nil), model.topology.flights...)
+	model.mu.RUnlock()
+	if len(flights) != 1 {
+		t.Fatalf("flight tracks = %d, want 1", len(flights))
+	}
+	moment := flightMomentAt(flights[0], now)
+	if !moment.hasPhase || moment.phase.kind != flightHold || flightTraveling(flights[0], now) {
+		t.Fatalf("provider hold moment = %+v, want a static hold", moment)
+	}
+}
+
+func TestReplayPlaybackRebuildsViewBelowAnimationRate(t *testing.T) {
+	start := time.Date(2026, 10, 19, 5, 0, 0, 0, time.UTC)
+	route := routing.Route{
+		ID: 93, Time: start, Agent: "codex", Model: "qoder/model",
+		Provider: "qoder", Done: true, Status: 200, Millis: 2000,
+		HistoryDay: start.Format("2006-01-02"),
+		Tries: []routing.Try{{
+			ID: "qoder", Model: "qoder/model", Start: start,
+			Millis: 2000, Status: 200, Done: true,
+		}},
+	}
+	store := routing.NewStore()
+	store.ReplaceHistory([]routing.Route{route})
+	model, _ := testModel(t, store.Snapshot(), Actions{})
+	model.setTab(tabHistory)
+	model.SetHistoryDay(start.Format("2006-01-02"))
+	builds := 0
+	tester := ui.NewTester(func(c *ui.Context) {
+		builds++
+		model.View(c)
+	}, 1240, 900)
+	if err := tester.Click("Play"); err != nil {
+		t.Fatal(err)
+	}
+	builds = 0
+	for i := 0; i < 8; i++ {
+		tester.Advance(routingAnimationInterval)
+	}
+	if builds > 1 {
+		t.Fatalf("replay rebuilt the view %d times in 128ms at 60 Hz; want paint-only flight frames", builds)
 	}
 }
 
@@ -502,6 +645,23 @@ func TestNativeMagpieFlapChangesWingSilhouette(t *testing.T) {
 	}
 }
 
+func TestFlightDashPathKeepsDashCycle(t *testing.T) {
+	path := newFlightPath([]flightPoint{{x: 0, y: 10}, {x: 96, y: 10}})
+	for _, offset := range []float32{0, 1, 3, 5, 7.9} {
+		var flow ui.Path
+		for d := -offset; d < path.length(); d += 8 {
+			appendFlightArc(&flow, path, max(d, 0), min(d+3, path.length()))
+		}
+		got, ok := flightDashPath(path, offset, 3, 8)
+		if !ok {
+			t.Fatalf("offset %.1f produced no dashes", offset)
+		}
+		if flow.Bounds() != got.Bounds() {
+			t.Fatalf("offset %.1f bounds = %v, new = %v", offset, flow.Bounds(), got.Bounds())
+		}
+	}
+}
+
 func TestStageRendersWithoutRasterGhostingAtHighDPI(t *testing.T) {
 	now := time.Now()
 	store := routing.NewStore()
@@ -518,6 +678,91 @@ func TestStageRendersWithoutRasterGhostingAtHighDPI(t *testing.T) {
 		t.Fatalf("high-DPI frame = %v, want %dx%d", img.Bounds(), 1240*2, 820*2)
 	}
 	assertImageHasContrast(t, img, 0, 0, img.Bounds().Dx(), img.Bounds().Dy(), config.ThemeLight)
+}
+
+func TestStaticStageBitmapUsesDevicePixels(t *testing.T) {
+	now := time.Now()
+	store := routing.NewStore()
+	store.ApplyActive([]routing.LiveRequest{{
+		ID: 12, Agent: "codex", Provider: "qoder", RouteID: 1712,
+		Started: now, Millis: 600,
+	}})
+	model, _ := testModel(t, store.Snapshot(), Actions{})
+	tester := render(t, model, 1000, 760)
+	tester.SetScale(2)
+	tester.Frame()
+	model.mu.RLock()
+	bitmap := model.topology.staticStage
+	model.mu.RUnlock()
+	if bitmap == nil {
+		t.Fatal("static stage bitmap was not created")
+	}
+	w, h := bitmap.Size()
+	if w%2 != 0 || h%2 != 0 {
+		t.Fatalf("static stage bitmap = %dx%d, want device-pixel dimensions at 2x", w, h)
+	}
+	if w < 900 {
+		t.Fatalf("static stage bitmap = %dx%d, want device-resolution pixels", w, h)
+	}
+	if !tester.HasText("Codex") {
+		t.Fatalf("an accessible Codex element disappeared: %v", tester.Texts())
+	}
+}
+
+func TestFlightFramesDoNotInvalidateStaticStageBitmap(t *testing.T) {
+	now := time.Now()
+	store := routing.NewStore()
+	store.ApplyActive([]routing.LiveRequest{{
+		ID: 13, Agent: "codex", Provider: "qoder", RouteID: 1713,
+		Started: now, Millis: 600,
+	}})
+	model, _ := testModel(t, store.Snapshot(), Actions{})
+	tester := render(t, model, 1240, 820)
+	tester.Frame()
+	model.mu.RLock()
+	before := model.topology.staticStage
+	beforeKey := model.topology.staticStageKey
+	model.mu.RUnlock()
+	if before == nil {
+		t.Fatal("static stage bitmap was not created")
+	}
+	for i := 0; i < 6; i++ {
+		tester.Advance(routingAnimationInterval)
+	}
+	model.mu.RLock()
+	after := model.topology.staticStage
+	afterKey := model.topology.staticStageKey
+	model.mu.RUnlock()
+	if after != before || afterKey != beforeKey {
+		t.Fatal("a bird-only frame rebuilt the cached static stage bitmap")
+	}
+}
+
+func TestFlightFramesDoNotLayOutStaticStageText(t *testing.T) {
+	now := time.Now()
+	store := routing.NewStore()
+	store.ApplyActive([]routing.LiveRequest{{
+		ID: 21, Agent: "codex", Provider: "qoder", RouteID: 1721,
+		Started: now, Millis: 600,
+	}})
+	model, _ := testModel(t, store.Snapshot(), Actions{})
+	tester := render(t, model, 1240, 820)
+	tester.Frame()
+	// A flight frame is a retained-tree repaint. It may draw the live bird,
+	// but must sample the cached static stage instead of laying out its
+	// labels and account text again.
+	model.mu.RLock()
+	key := model.topology.staticStageKey
+	model.mu.RUnlock()
+	for i := 0; i < 10; i++ {
+		tester.Advance(routingAnimationInterval)
+	}
+	model.mu.RLock()
+	after := model.topology.staticStageKey
+	model.mu.RUnlock()
+	if after != key {
+		t.Fatal("flight frames invalidated the static stage bitmap")
+	}
 }
 
 func TestFlightGeometryCachesOutboundAndInboundPaths(t *testing.T) {
@@ -549,6 +794,59 @@ func TestFlightGeometryCachesOutboundAndInboundPaths(t *testing.T) {
 	moved.agents[0].y += 10
 	if newFlightGeometry(moved).key == first.key {
 		t.Fatal("node movement did not invalidate the geometry key")
+	}
+}
+
+func TestStageLayersShareOnePresentationPerFrame(t *testing.T) {
+	now := time.Now()
+	store := routing.NewStore()
+	store.ApplyActive([]routing.LiveRequest{{
+		ID: 31, Agent: "codex", Provider: "qoder", RouteID: 1731,
+		Started: now, Millis: 600,
+	}})
+	model, _ := testModel(t, store.Snapshot(), Actions{})
+	tester := ui.NewTester(func(c *ui.Context) {
+		model.View(c)
+	}, 1240, 820)
+	tester.Frame()
+	model.mu.RLock()
+	first := model.topology.flightGeometry
+	model.mu.RUnlock()
+	if first == nil {
+		t.Fatal("the shared stage presentation did not create geometry")
+	}
+	tester.Advance(routingAnimationInterval)
+	model.mu.RLock()
+	second := model.topology.flightGeometry
+	model.mu.RUnlock()
+	if second != first {
+		t.Fatal("a retained animation frame rebuilt the shared stage geometry")
+	}
+
+	stage := model.routingStagePresentationAt(store.Snapshot(), store.Snapshot().Routes,
+		routing.RouteView{}, false, tester.Now())
+	if stage == nil || len(stage.agents) != 1 || len(stage.rows) != 1 ||
+		len(stage.flights) != 1 || stage.stageIdentity == "" {
+		t.Fatalf("stage presentation = %+v, want one shared agent/row/flight", stage)
+	}
+}
+
+func TestFilteredRoutesAreReusedUntilSnapshotOrFilterChanges(t *testing.T) {
+	routes := readSyntheticRoutes(t)
+	store := routing.NewStore()
+	store.ReplaceHistory(routes)
+	model, _ := testModel(t, store.Snapshot(), Actions{})
+	first := model.viewRoutes(model.snapshot(), false)
+	second := model.viewRoutes(model.snapshot(), false)
+	if len(first) == 0 || &first[0] != &second[0] {
+		t.Fatal("an unchanged snapshot/filter rebuilt the filtered route slice")
+	}
+	model.mu.Lock()
+	model.query = "no route matches this"
+	model.mu.Unlock()
+	filtered := model.viewRoutes(model.snapshot(), false)
+	if len(filtered) != 0 {
+		t.Fatalf("filter change reused %d stale routes", len(filtered))
 	}
 }
 
@@ -739,7 +1037,7 @@ func TestReplaySeekIntoReturnRebuildsInboundFlight(t *testing.T) {
 		t.Fatalf("direct seek reconstructed %d flights, want 1", len(flights))
 	}
 	track := flights[0]
-	moment := flightMomentAt(track, start.Add(position))
+	moment := currentFlightPhase(track, tester.Now())
 	if track.routeID != route.ID || !track.done || moment.phase.kind != flightInbound {
 		t.Fatalf("direct seek flight = %+v, moment = %+v; want inbound for route %d", track, moment, route.ID)
 	}
@@ -1046,6 +1344,35 @@ func TestReplayCacheKeyIncludesTryDetails(t *testing.T) {
 	}
 }
 
+func TestReplaySyncFiltersDailyHistoryOnlyWhenSourceChanges(t *testing.T) {
+	start := time.Date(2026, 10, 19, 5, 0, 0, 0, time.UTC)
+	store := routing.NewStore()
+	store.ReplaceHistory([]routing.Route{{
+		ID: 902, Time: start, Agent: "codex", Model: "openai/gpt-6",
+		Provider: "openai", Done: true, Status: 200, Millis: 1000,
+		HistoryDay: start.Format("2006-01-02"),
+	}})
+	model, _ := testModel(t, store.Snapshot(), Actions{})
+	model.setTab(tabHistory)
+	model.SetHistoryDay(start.Format("2006-01-02"))
+	model.syncReplay(store.Snapshot(), start)
+	key := model.replay.builtKey
+	if key == "" {
+		t.Fatal("replay source was not built")
+	}
+	// Same committed snapshot and filters: the source walk must be skipped
+	// even when a replay frame is emitted several times a second.
+	model.syncReplay(store.Snapshot(), start.Add(5*time.Second))
+	if model.replay.builtKey != key {
+		t.Fatalf("replay key changed without source data: %q -> %q", key, model.replay.builtKey)
+	}
+	model.setStatus("failed", 3)
+	model.syncReplay(store.Snapshot(), start.Add(6*time.Second))
+	if model.replay.builtKey == key {
+		t.Fatal("filter change did not invalidate the replay source")
+	}
+}
+
 func TestFinalRouteFailureIgnoresRecoveredAttempt(t *testing.T) {
 	start := time.Date(2026, 10, 19, 5, 30, 0, 0, time.UTC)
 	recovered := routing.RouteView{Route: routing.Route{
@@ -1300,7 +1627,7 @@ func TestReplaySeekIntoAwayTailKeepsInboundBirdAlive(t *testing.T) {
 	if len(flights) != 1 {
 		t.Fatalf("away-tail seek reconstructed %d flights, want 1", len(flights))
 	}
-	moment := flightMomentAt(flights[0], start.Add(position))
+	moment := currentFlightPhase(flights[0], tester.Now())
 	release := moment.local - (moment.phase.end - moment.phase.start)
 	if moment.phase.kind != flightInbound || moment.progress < 1 || release < 0 || release >= flightAwayDuration {
 		t.Fatalf("away-tail moment = %+v, want an inbound bird in its 450ms away tail", moment)
@@ -1349,7 +1676,7 @@ func TestRoutingStageKeepsAllConcurrentNodes(t *testing.T) {
 	store.ApplyActive(active)
 	model, _ := testModel(t, store.Snapshot(), Actions{})
 	replay, replayActive := model.replayTopologyState()
-	agents := model.stageAgents(model.snapshot(), routing.RouteView{}, false, nil, replay, replayActive)
+	agents := model.stageAgents(model.snapshot(), routing.RouteView{}, false, nil, replay, replayActive, now)
 	rows := model.stageAccountRows(routing.RouteView{}, false, model.snapshot().Live, nil, replayActive)
 	if len(agents) != len(active) {
 		t.Fatalf("stage agents = %d, want all %d concurrent agents", len(agents), len(active))
@@ -1492,6 +1819,203 @@ func TestProviderAccountMaskingDoesNotLeakRawAccount(t *testing.T) {
 	tester.Frame()
 	if tester.HasText("user@example.test") {
 		t.Fatalf("masked view leaked the provider account: %v", tester.Texts())
+	}
+	if !tester.HasText("Accounts hidden") {
+		t.Fatalf("masked button did not switch to upstream's Accounts hidden label: %v", tester.Texts())
+	}
+}
+
+func TestAccountMaskUsesShapePreservingStandIns(t *testing.T) {
+	raw := "chou@example.com"
+	masked := maskWho(raw)
+	if masked == raw || strings.Contains(masked, "chou") {
+		t.Fatalf("maskWho leaked the account: %q", masked)
+	}
+	if len([]rune(masked)) != len([]rune(raw)) || strings.Count(masked, "@") != 1 || strings.Count(masked, ".") != 1 {
+		t.Fatalf("maskWho did not preserve the address shape: %q", masked)
+	}
+	if again := maskWho(raw); again != masked {
+		t.Fatalf("maskWho is not deterministic: %q then %q", masked, again)
+	}
+}
+
+func TestAccountMaskMatchesMagpieUTF16StandIns(t *testing.T) {
+	cases := map[string]string{
+		"chou@example.com":  "dGluckBzc3VsaG9kLm5paA==",
+		"张三@例子.中国":          "aGNAbGwuYWg=",
+		"😀user@example.com": "dGltdHNtQGR1bXRpcm8udW9y",
+		"a😀@b.com":          "cm5zQHMudGx1",
+	}
+	for in, want := range cases {
+		got := base64.StdEncoding.EncodeToString([]byte(maskWho(in)))
+		if got != want {
+			t.Errorf("maskWho(%q) = %q (%s), want Magpie's %s", in, maskWho(in), got, want)
+		}
+	}
+}
+
+func TestAccountMaskTransitionMatchesRTPII(t *testing.T) {
+	model, _ := testModel(t, routing.Snapshot{}, Actions{})
+	model.setAccountMask(true)
+	if blur, opacity := model.accountMaskStyle(time.Now()); blur != 2.2 || opacity != 0.5 {
+		t.Fatalf("restored mask style = %.2f/%.2f, want static 2.2/0.5", blur, opacity)
+	}
+	start := time.Now()
+	model.mu.Lock()
+	model.maskRevealAt = start
+	model.mu.Unlock()
+	if blur, opacity := model.accountMaskStyle(start); blur != 0 || opacity != 1 {
+		t.Fatalf("rtpii at 0ms = %.2f/%.2f, want 0/1", blur, opacity)
+	}
+	mid := start.Add(175 * time.Millisecond)
+	blur, opacity := model.accountMaskStyle(mid)
+	if blur <= 0 || blur >= 2.2 || opacity >= 1 || opacity <= 0.5 {
+		t.Fatalf("rtpii at 175ms = %.2f/%.2f, want an in-between state", blur, opacity)
+	}
+	if blur, opacity := model.accountMaskStyle(start.Add(350 * time.Millisecond)); blur != 2.2 || opacity != 0.5 {
+		t.Fatalf("rtpii final = %.2f/%.2f, want 2.2/0.5", blur, opacity)
+	}
+	if model.accountMaskAnimating(start.Add(350 * time.Millisecond)) {
+		t.Fatal("mask transition still requested frames after 350ms")
+	}
+	model.toggleAccountMask()
+	if model.accountsMasked() {
+		t.Fatal("mask toggle did not turn masking off")
+	}
+	if blur, opacity := model.accountMaskStyle(start.Add(175 * time.Millisecond)); blur != 0 || opacity != 1 {
+		t.Fatalf("unmask style = %.2f/%.2f, want immediate 0/1", blur, opacity)
+	}
+}
+
+func TestAccountMaskToggleRequestsOnlyTransitionFrames(t *testing.T) {
+	route := routing.RouteView{
+		Route: routing.Route{
+			ID: 44, Time: time.Now().Add(-time.Minute), Agent: "codex",
+			Model: "synthetic/model", Done: true, Status: 200,
+			Order: []routing.Weighed{{
+				ID: "acct", Provider: "synthetic", Name: "Synthetic",
+				Who: "private@example.test", Model: "model",
+			}},
+		},
+		CandidateOrderKnown: true,
+	}
+	model, _ := testModel(t, routing.Snapshot{Routes: []routing.RouteView{route}}, Actions{})
+	tester := render(t, model, 1240, 820)
+	tester.Frame()
+	if tester.FramePending() {
+		t.Fatal("idle route requested a frame before masking")
+	}
+	if err := tester.Click("Hide accounts"); err != nil {
+		t.Fatal(err)
+	}
+	tester.Frame()
+	model.mu.RLock()
+	revealing := model.accountMaskAnimating(tester.Now())
+	model.mu.RUnlock()
+	if !revealing && tester.Now().Sub(model.maskRevealAt) < 350*time.Millisecond {
+		// The test clock may already be past the transition; at minimum the
+		// click must have scheduled its 350ms animation window.
+		t.Fatal("mask toggle did not start the rtpii transition")
+	}
+	tester.Advance(400 * time.Millisecond)
+	tester.Frame()
+	if tester.FramePending() {
+		t.Fatal("masked page kept requesting frames after rtpii")
+	}
+}
+
+// Masked labels used to be retained Elements with Blur(). MyGo paints an
+// Element.Blur through a fresh offscreen layer every retained-tree repaint,
+// so a single request flight rebuilt several blur textures at 60 FPS. Keep
+// checking that the mask reaches those labels while the stage stays an
+// ordinary cached Painter layer.
+func TestAccountMaskPaintsStandInsWithoutPerFrameBlurLayers(t *testing.T) {
+	route := routing.RouteView{
+		Route: routing.Route{
+			ID: 45, Time: time.Now().Add(-time.Minute), Agent: "codex",
+			Model: "synthetic/model", Done: true, Status: 200,
+			Order: []routing.Weighed{{
+				ID: "acct", Provider: "synthetic", Name: "Synthetic",
+				Who: "private@example.test", Model: "model",
+			}},
+			Tries: []routing.Try{{
+				ID: "acct", Model: "synthetic/model", Done: true, Status: 200,
+			}},
+		},
+		CandidateOrderKnown: true,
+	}
+	model, _ := testModel(t, routing.Snapshot{Routes: []routing.RouteView{route}}, Actions{})
+	model.setAccountMask(true)
+	tester := render(t, model, 1240, 820)
+	tester.Frame()
+	if tester.FramePending() {
+		t.Fatal("stable masked stage kept asking for frames")
+	}
+	if tester.HasText("private@example.test") {
+		t.Fatalf("masked labels leaked the account: %v", tester.Texts())
+	}
+	if got := model.routeAccessibilityLabel(route); strings.Contains(got, "private") {
+		t.Fatalf("masked accessibility label leaked the account: %q", got)
+	}
+}
+
+func TestAccountMaskCoversRequestDestinationAndAccessibility(t *testing.T) {
+	route := routing.RouteView{
+		Route: routing.Route{
+			ID: 12, Time: time.Now(), Agent: "codex", Model: "synthetic/model",
+			Done: true, Status: 200,
+			Order: []routing.Weighed{{
+				ID: "acct", Provider: "synthetic", Name: "Synthetic",
+				Who: "private@example.test", Model: "model",
+			}},
+			Tries: []routing.Try{{
+				ID: "acct", Model: "synthetic/model", Done: true, Status: 200,
+			}},
+		},
+		CandidateOrderKnown: true,
+	}
+	model, _ := testModel(t, routing.Snapshot{Routes: []routing.RouteView{route}}, Actions{})
+	model.setAccountMask(true)
+	tester := render(t, model, 1240, 820)
+	if tester.HasText("private@example.test") {
+		t.Fatalf("masked request list leaked the account: %v", tester.Texts())
+	}
+	if got := model.routeAccessibilityLabel(route); strings.Contains(got, "private") {
+		t.Fatalf("masked accessibility label leaked the account: %q", got)
+	}
+}
+
+func TestAccountMaskPersistsInAppSettings(t *testing.T) {
+	route := routing.RouteView{
+		Route: routing.Route{
+			ID: 13, Time: time.Now(), Agent: "codex", Model: "synthetic/model",
+			Done: true, Status: 200,
+			Order: []routing.Weighed{{
+				ID: "acct", Provider: "synthetic", Name: "Synthetic",
+				Who: "private@example.test", Model: "model",
+			}},
+		},
+		CandidateOrderKnown: true,
+	}
+	var saved config.AppSettings
+	var model *Model
+	model, _ = testModel(t, routing.Snapshot{Routes: []routing.RouteView{route}}, Actions{
+		SaveSettings: func(cfg config.AppSettings) error {
+			saved = cfg
+			model.SetSettings(cfg)
+			return nil
+		},
+	})
+	tester := render(t, model, 1240, 820)
+	if err := tester.Click("Hide accounts"); err != nil {
+		t.Fatal(err)
+	}
+	if !saved.HideAccounts || !model.accountsMasked() {
+		t.Fatalf("mask preference was not persisted: saved=%t model=%t", saved.HideAccounts, model.accountsMasked())
+	}
+	reloaded := NewModel(model.store, saved, model.paths, model.actualMagpieDir, Actions{})
+	if !reloaded.accountsMasked() {
+		t.Fatal("mask preference was not restored from settings")
 	}
 }
 

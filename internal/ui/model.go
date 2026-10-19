@@ -1,11 +1,14 @@
 package ui
 
 import (
+	"fmt"
+	"math"
 	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
 
 	"github.com/Fan-chou/magpie-native-routing/internal/config"
 	"github.com/Fan-chou/magpie-native-routing/internal/routing"
@@ -45,6 +48,11 @@ const liveRouteLimit = 60
 type Model struct {
 	mu sync.RWMutex
 
+	windowWidth    float32
+	windowHeight   float32
+	historyVersion uint64
+	viewCache      uiViewCache
+
 	store           *routing.Store
 	settings        config.AppSettings
 	paths           config.Paths
@@ -60,6 +68,10 @@ type Model struct {
 	selectedID   int64
 	pinnedID     int64
 	maskAccounts bool
+	// maskRevealAt starts upstream's 350ms rtpii transition after the user
+	// turns masking on. It is zero for a restored preference: the first
+	// frame of a saved masked session must already be blurred, not animate.
+	maskRevealAt time.Time
 	expandedTry  int
 	listState    ui.ListState
 	requestSel   int
@@ -68,6 +80,7 @@ type Model struct {
 
 	historyDay string
 	replay     replayController
+	pageScroll ui.ScrollState
 
 	settingsOpen bool
 	draftURL     string
@@ -83,8 +96,26 @@ type Model struct {
 	groupNotice  string
 	splitPercent float32
 	contextOpen  bool
+	ctxTab       string
+	ctxShowAll   bool
+	metrics      map[string]bool
 	topology     topologyState
 	lastSnapshot routing.Snapshot
+}
+
+// uiViewCache holds derivations that are pure functions of the snapshot and
+// the user's filters. MyGo rebuilds the whole view for replay's low-rate
+// clock ticks and for store updates; walking and filtering all 4,000+ routes
+// each time was the dominant CPU cost in a continuous history replay.
+type uiViewCache struct {
+	filteredKey  string
+	filtered     []routing.RouteView
+	groupKey     string
+	groups       []routing.GroupView
+	routeByIDKey uint64
+	routeByID    map[int64]routing.RouteView
+	accountKey   string
+	accounts     []routeAccountTally
 }
 
 type replayController struct {
@@ -117,6 +148,22 @@ type topologyState struct {
 	flightGeometry *flightGeometry
 	reduceMotion   bool
 	layout         topologyFrameLayout
+	// animationCost is a slow estimate of how long one retained-tree
+	// repaint takes. MyGo repaints the whole retained tree for
+	// Painter.After, so spending 60 frames a second on a large history page
+	// can burn CPU even when only a bird moves. The budget keeps the
+	// original cadence when a frame is cheap and lowers it gradually when
+	// the same window cannot paint comfortably.
+	animationCost   time.Duration
+	animationFrames int
+	// staticStage caches the complete non-moving stage (cards, labels,
+	// icons, idle wires) as a device-resolution bitmap. ui.Render draws it
+	// in an independent, correctly scaled view, so the bitmap is safe under
+	// the page's scroll clip and MyGo does not have to repaint every text
+	// and icon on each animation frame.
+	staticStage      *ui.Bitmap
+	staticStageKey   string
+	staticStageScale float32
 }
 
 type topologyFeedback struct {
@@ -145,6 +192,7 @@ type flightTrack struct {
 	attempts    []flightAttempt
 	phases      []flightPhase
 	inReplay    bool
+	replayPlay  bool
 	failed      bool
 	done        bool
 	phaseKey    string
@@ -203,6 +251,9 @@ func NewModel(store *routing.Store, settings config.AppSettings, paths config.Pa
 		topology:     topologyState{},
 		splitPercent: 58,
 		requestSel:   -1,
+		ctxTab:       "all",
+		metrics:      defaultVisibleMetrics(),
+		maskAccounts: settings.HideAccounts,
 	}
 	if settings.Theme == "" {
 		m.settings.Theme = config.ThemeSystem
@@ -216,6 +267,13 @@ func NewModel(store *routing.Store, settings config.AppSettings, paths config.Pa
 // SetSnapshot is called on the UI thread with a copied snapshot.
 func (m *Model) SetSnapshot(s routing.Snapshot) {
 	m.mu.Lock()
+	if m.historyVersion != s.Version {
+		// A committed store version is the only event that can add,
+		// replace or remove a completed trace. Keep the filtered history
+		// slice for the replay builder so a playing replay does not walk
+		// and fingerprint all 3,500+ rows on every frame.
+		m.historyVersion = s.Version
+	}
 	m.lastSnapshot = s
 	if m.selectedID == 0 && len(s.Routes) > 0 {
 		m.selectedID = s.Routes[0].ID
@@ -347,6 +405,54 @@ func (m *Model) accountsMasked() bool {
 func (m *Model) toggleAccountMask() {
 	m.mu.Lock()
 	m.maskAccounts = !m.maskAccounts
+	if m.maskAccounts {
+		m.maskRevealAt = time.Now()
+	} else {
+		m.maskRevealAt = time.Time{}
+	}
+	m.mu.Unlock()
+}
+
+// accountMaskStyle is the animated part of upstream .pii. It is measured
+// from the UI clock by callers, never from a frame count.
+func (m *Model) accountMaskStyle(now time.Time) (blur, opacity float32) {
+	m.mu.RLock()
+	masked, revealAt := m.maskAccounts, m.maskRevealAt
+	m.mu.RUnlock()
+	if !masked {
+		return 0, 1
+	}
+	// CSS rtpii: from blur(0), opacity 1 to blur(2.2px), opacity .5 over
+	// .35s ease-out. Before the clock reaches revealAt (a Test's frozen
+	// clock) show the final .pii state; a restored preference never sets
+	// revealAt and starts there too.
+	if revealAt.IsZero() || now.Before(revealAt) {
+		return 2.2, 0.5
+	}
+	t := clamp01(float32(now.Sub(revealAt)) / float32(350*time.Millisecond))
+	if t >= 1 {
+		return 2.2, 0.5
+	}
+	k := easeOut(t)
+	return 2.2 * k, 1 - 0.5*k
+}
+
+// accountMaskAnimating reports whether the short reveal still needs
+// frames. Outside it, masked text is static.
+func (m *Model) accountMaskAnimating(now time.Time) bool {
+	m.mu.RLock()
+	masked, revealAt := m.maskAccounts, m.maskRevealAt
+	m.mu.RUnlock()
+	return masked && !revealAt.IsZero() && now.Sub(revealAt) < 350*time.Millisecond
+}
+
+// setAccountMask restores the app-local preference without touching
+// Magpie's settings or localStorage. Upstream keeps this switch in
+// magpie.maskEmails; this app stores it in its own settings file.
+func (m *Model) setAccountMask(on bool) {
+	m.mu.Lock()
+	m.maskAccounts = on
+	m.maskRevealAt = time.Time{}
 	m.mu.Unlock()
 }
 
@@ -360,6 +466,65 @@ func (m *Model) contextCardOpen() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.contextOpen
+}
+
+func (m *Model) contextTab() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.ctxTab
+}
+
+func (m *Model) setContextTab(tab string) {
+	m.mu.Lock()
+	m.ctxTab = tab
+	m.mu.Unlock()
+}
+
+func (m *Model) contextShowAll() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.ctxShowAll
+}
+
+func (m *Model) toggleContextShowAll() {
+	m.mu.Lock()
+	m.ctxShowAll = !m.ctxShowAll
+	m.mu.Unlock()
+}
+
+// metricVisible reports whether the request list shows one of the original
+// metric classes. Costs stay excluded until Magpie's public history has a
+// price source; choosing an unavailable metric must not invent a value.
+func (m *Model) metricVisible(key string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.metrics[key]
+}
+
+func (m *Model) toggleMetric(key string) {
+	m.mu.Lock()
+	if m.metrics == nil {
+		m.metrics = defaultVisibleMetrics()
+	}
+	// Upstream's metric menu can leave every class off. Rebuild the map so
+	// metricVisible's "absent means hidden" rule is unambiguous.
+	next := make(map[string]bool, len(m.metrics)+1)
+	for k, on := range m.metrics {
+		next[k] = on
+	}
+	next[key] = !next[key]
+	m.metrics = next
+	m.mu.Unlock()
+}
+
+func defaultVisibleMetrics() map[string]bool {
+	return map[string]bool{
+		"duration": true,
+		"ttft":     true,
+		"tokens":   true,
+		"cache":    true,
+		"speed":    true,
+	}
 }
 
 func (m *Model) setSettingsOpen(open bool) {
@@ -461,6 +626,8 @@ func (m *Model) Settings() config.AppSettings {
 func (m *Model) SetSettings(s config.AppSettings) {
 	m.mu.Lock()
 	m.settings = s
+	m.maskAccounts = s.HideAccounts
+	m.maskRevealAt = time.Time{}
 	m.loc = NewLocalization(s.Language)
 	m.draftURL, m.draftKey = s.GatewayURL, s.APIKey
 	m.draftDataDir, m.draftTheme, m.draftLang = s.MagpieDir, s.Theme, s.Language
@@ -520,7 +687,20 @@ func (m *Model) visibleRoutes(s routing.Snapshot, replayOnly bool) []routing.Rou
 	replay := m.replay
 	selected := m.selectedID
 	m.mu.RUnlock()
-	routes := f.Apply(s.Routes)
+	key := fmt.Sprintf("%d\x00%d\x00%s\x00%s\x00%s", s.Version, tab, f.Query, f.Status, f.HistoryDay)
+	m.mu.RLock()
+	cached, ok := m.viewCache.filtered, m.viewCache.filteredKey == key
+	m.mu.RUnlock()
+	routes := cached
+	if !ok {
+		routes = f.Apply(s.Routes)
+		m.mu.Lock()
+		if m.viewCache.filteredKey != key {
+			m.viewCache.filteredKey = key
+			m.viewCache.filtered = routes
+		}
+		m.mu.Unlock()
+	}
 	if tab == tabLive && f.HistoryDay == "" {
 		// The original keeps 60 routes in its live map. Today's JSONL may
 		// contain thousands; those belong to the day view and must not
@@ -545,6 +725,117 @@ func (m *Model) visibleRoutes(s routing.Snapshot, replayOnly bool) []routing.Rou
 	}
 	_ = selected
 	return routes
+}
+
+// routeViewIndex returns the snapshot's Route ID index, rebuilt only when a
+// new store version arrives. Replay and live flight reconciliation need it
+// every view build, and indexing 4,000+ routes each time dominated CPU in a
+// continuous replay.
+func (m *Model) routeViewIndex(s routing.Snapshot) map[int64]routing.RouteView {
+	m.mu.RLock()
+	if m.viewCache.routeByIDKey == s.Version && m.viewCache.routeByID != nil {
+		byID := m.viewCache.routeByID
+		m.mu.RUnlock()
+		return byID
+	}
+	m.mu.RUnlock()
+	byID := make(map[int64]routing.RouteView, len(s.Routes))
+	for _, rv := range s.Routes {
+		byID[rv.ID] = rv
+	}
+	m.mu.Lock()
+	if m.viewCache.routeByIDKey != s.Version {
+		m.viewCache.routeByIDKey = s.Version
+		m.viewCache.routeByID = byID
+	} else {
+		byID = m.viewCache.routeByID
+	}
+	m.mu.Unlock()
+	return byID
+}
+
+// cachedAccountTally reuses renderActs' projection across the view builds
+// caused by UI-only changes. The route slice is immutable for a store
+// version; the key also covers the visible IDs so a filtered list cannot
+// share another filter's tally.
+func (m *Model) cachedAccountTally(routes []routing.RouteView) []routeAccountTally {
+	var b strings.Builder
+	for i := range routes {
+		fmt.Fprintf(&b, "%d:%d\x00", routes[i].ID, routeTallyRevision(routes[i]))
+	}
+	key := b.String()
+	m.mu.RLock()
+	cached, ok := m.viewCache.accounts, m.viewCache.accountKey == key
+	m.mu.RUnlock()
+	if ok {
+		return cached
+	}
+	tally := accountTally(routes)
+	m.mu.Lock()
+	if m.viewCache.accountKey != key {
+		m.viewCache.accountKey = key
+		m.viewCache.accounts = tally
+	}
+	m.mu.Unlock()
+	return tally
+}
+
+// routeTallyRevision identifies the only Route fields accountTally reads.
+func routeTallyRevision(r routing.RouteView) uint64 {
+	var h uint64 = 1469598103934665603
+	mix := func(v uint64) {
+		h ^= v
+		h *= 1099511628211
+	}
+	mix(uint64(r.Time.UnixNano()))
+	if r.Active {
+		h ^= 1 << 8
+	}
+	mix(uint64(len(r.Order)))
+	for _, w := range r.Order {
+		for _, s := range []string{w.Provider, w.ID, w.Kind, w.Model, w.Name, w.Who, w.Plan, w.Icon, w.Preset, w.Routing} {
+			for i := 0; i < len(s); i++ {
+				mix(uint64(s[i]))
+			}
+		}
+		if w.Known {
+			mix(1)
+		}
+		mix(uint64(math.Float64bits(w.Used)))
+	}
+	mix(uint64(len(r.Tries)))
+	for _, tr := range r.Tries {
+		for _, s := range []string{tr.Model, tr.Served, tr.ID, tr.Fail, tr.Error} {
+			for i := 0; i < len(s); i++ {
+				mix(uint64(s[i]))
+			}
+		}
+		if tr.Done {
+			mix(2)
+		}
+		mix(uint64(tr.Status))
+	}
+	return h
+}
+
+// groupViews caches the read-only group projection. GroupView carries
+// copies, so callers may keep it without exposing mutable config storage.
+func (m *Model) groupViews(s routing.Snapshot) []routing.GroupView {
+	key := fmt.Sprintf("%d\x00%d\x00%d", s.Version, len(s.Config.Groups), len(s.Routes))
+	m.mu.RLock()
+	cached, ok := m.viewCache.groups, m.viewCache.groupKey == key
+	m.mu.RUnlock()
+	if ok {
+		return cached
+	}
+	groups := routing.GroupViews(s.Config, s.Routes)
+	m.mu.Lock()
+	if m.viewCache.groupKey != key {
+		m.viewCache.groupKey = key
+		m.viewCache.groups = groups
+	}
+	m.mu.Unlock()
+	return groups
 }
 
 func (m *Model) selectedRoute(routes []routing.RouteView) (routing.RouteView, bool) {
@@ -861,6 +1152,7 @@ func providerRows(r routing.RouteView, hidden bool) []providerNode {
 		for i := range out {
 			if out[i].Who != "" {
 				out[i].Who = maskWho(out[i].Who)
+				out[i].Masked = true
 			}
 		}
 	}
@@ -954,6 +1246,7 @@ type providerNode struct {
 	RestUntil time.Time
 	Answered  bool
 	WentOn    bool
+	Masked    bool
 }
 
 func providerOf(model string) string {
@@ -980,12 +1273,26 @@ func tryStatus(t routing.Try) string {
 	return "active"
 }
 
+// maskWho is app.js's stand-in for an account: letters of the same shape,
+// deterministic per address/name, so an address stays one recognisable
+// blurred shape without exposing a single real character. The caller draws
+// the result with the upstream 2.2px blur and 0.5 opacity.
 func maskWho(s string) string {
-	rs := []rune(s)
-	if len(rs) <= 2 {
-		return "••"
+	const alphabet = "aeiounrstlcmdh"
+	h := uint32(7)
+	var b strings.Builder
+	// app.js replaces each UTF-16 code unit, not each Go rune. Iterating
+	// runes made the stand-ins of emoji and other non-BMP names differ from
+	// Magpie even though ASCII addresses happened to match.
+	for _, unit := range utf16.Encode([]rune(s)) {
+		if unit == '@' || unit == '.' {
+			b.WriteRune(rune(unit))
+			continue
+		}
+		h = h*31 + uint32(unit)
+		b.WriteByte(alphabet[h%uint32(len(alphabet))])
 	}
-	return string(rs[:1]) + strings.Repeat("•", min(len(rs)-1, 6))
+	return b.String()
 }
 
 func itoa(n int) string {

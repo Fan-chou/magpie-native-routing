@@ -61,6 +61,10 @@ type application struct {
 
 	historyReader *routing.HistoryReader
 	configReader  routing.ConfigReader
+
+	publishMu      sync.Mutex
+	publishPending bool
+	publishTimer   *time.Timer
 }
 
 func main() {
@@ -160,6 +164,7 @@ func runGUI(cfg config.AppSettings, paths config.Paths, opts options) error {
 		historyReader: routing.NewHistoryReader(paths.RoutingDir),
 		configReader:  routing.NewConfigReader(paths.Providers),
 	}
+	app.loc = ui.NewLocalization(cfg.Language)
 	app.model = ui.NewModel(app.store, cfg, paths, paths.MagpieDir, ui.Actions{
 		Refresh:        app.refresh,
 		OpenDay:        app.openDay,
@@ -289,15 +294,58 @@ func (a *application) openDay(day string) {
 	}
 }
 
-// publishSnapshot copies the store on the worker's goroutine and delivers the
-// immutable copy to the UI thread. It intentionally does not read the store
-// from a draw callback, and it coalesces naturally because every callback
-// posts one Update.
+const snapshotPublishDelay = 120 * time.Millisecond
+
+// publishSnapshot copies the store off the UI thread and coalesces bursts of
+// worker updates into one UI rebuild. A live poll, a history append and a
+// config refresh often arrive together; publishing each separately rebuilt
+// the whole retained tree several times for one visible change. The newest
+// snapshot always wins, and shutdown flushes synchronously so no final state
+// is lost.
 func (a *application) publishSnapshot() {
+	a.mu.Lock()
+	if a.stopped {
+		a.mu.Unlock()
+		return
+	}
+	a.mu.Unlock()
+	a.publishMu.Lock()
+	if a.publishPending {
+		a.publishMu.Unlock()
+		return
+	}
+	a.publishPending = true
+	a.publishMu.Unlock()
+	a.schedulePublish(snapshotPublishDelay)
+}
+
+func (a *application) schedulePublish(delay time.Duration) {
+	a.publishMu.Lock()
+	if a.publishTimer != nil {
+		a.publishTimer.Stop()
+	}
+	a.publishTimer = time.AfterFunc(delay, a.flushSnapshot)
+	a.publishMu.Unlock()
+}
+
+func (a *application) flushSnapshot() {
+	a.publishMu.Lock()
+	a.publishTimer = nil
+	if !a.publishPending {
+		a.publishMu.Unlock()
+		return
+	}
+	a.publishPending = false
+	a.publishMu.Unlock()
+
 	snapshot := a.store.Snapshot()
 	a.mu.Lock()
 	win := a.win
+	stopped := a.stopped
 	a.mu.Unlock()
+	if stopped {
+		return
+	}
 	if win == nil {
 		a.model.SetSnapshot(snapshot)
 		return
@@ -308,6 +356,16 @@ func (a *application) publishSnapshot() {
 	win.Update(func() {
 		a.model.SetSnapshot(snapshot)
 	})
+}
+
+func (a *application) publishSnapshotNow() {
+	a.publishMu.Lock()
+	if a.publishTimer != nil {
+		a.publishTimer.Stop()
+		a.publishTimer = nil
+	}
+	a.publishMu.Unlock()
+	a.flushSnapshot()
 }
 
 func (a *application) chooseDataDir() {
@@ -410,6 +468,7 @@ func (a *application) shutdown() {
 	if supervisor != nil {
 		supervisor.Stop()
 	}
+	a.publishSnapshotNow()
 }
 
 func runDiagnostics(cfg config.AppSettings, paths config.Paths, opts options) int {

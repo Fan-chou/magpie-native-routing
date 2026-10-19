@@ -17,14 +17,21 @@ func (m *Model) syncReplay(s routing.Snapshot, now time.Time) {
 	m.mu.RLock()
 	day := m.historyDay
 	tab := m.tab
+	cachedKey := m.replay.builtKey
 	m.mu.RUnlock()
 	if tab != tabHistory || day == "" {
 		return
 	}
 
-	key, routes := replaySource(s, day, m.filters())
+	filter := m.filters()
+	key := replayFilterKey(s.Version, day, filter)
 	m.mu.Lock()
-	if m.replay.builtKey != key {
+	if key != cachedKey {
+		// Only filter and fingerprint the day when the identity of the
+		// source can change. The previous implementation did this in every
+		// View call; during playback that walked and serialized every
+		// completed trace five times a second.
+		_, routes := replaySource(s, day, filter)
 		next := routing.BuildDayReplay(routes, day)
 		next.Duration = max(next.Duration, replayPresentationDuration(next, routes))
 		m.replay.windows = buildReplayFlightWindows(next, routes)
@@ -54,6 +61,15 @@ func (m *Model) syncReplay(s routing.Snapshot, now time.Time) {
 		}
 	}
 	m.mu.Unlock()
+}
+
+// replayFilterKey identifies the replay input without walking the routes.
+// Version changes whenever the Store commits real data; day and filter are
+// copied from the model's current controls. The version is part of the key so
+// no caller has to remember to invalidate a separate cache on every state
+// transition.
+func replayFilterKey(version uint64, day string, f routing.RouteFilter) string {
+	return fmt.Sprintf("%d\x00%s\x00%s\x00%s\x00%t", version, day, f.Query, f.Status, f.ActiveOnly)
 }
 
 // buildReplayFlightWindows records the exact presentation interval of each
@@ -231,6 +247,32 @@ func (m *Model) replayState(now time.Time) (routing.ReplayTimeline, bool, float6
 		RouteCount: len(m.replay.timeline.Routes),
 	}
 	return m.replay.timeline, m.replay.playing, m.replay.speed, m.replay.position, state
+}
+
+// replayPositionAt is the replay cursor at now without committing it to the
+// controller. Painter-only frames use it to keep birds moving at the display
+// cadence while the replay bar and request list rebuild at a much lower rate.
+func (m *Model) replayPositionAt(now time.Time) time.Duration {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.replayPositionAtLocked(now)
+}
+
+func (m *Model) replayPositionAtLocked(now time.Time) time.Duration {
+	position := m.replay.position
+	if !m.replay.playing || m.replay.lastTick.IsZero() {
+		return position
+	}
+	if delta := now.Sub(m.replay.lastTick); delta > 0 {
+		position += time.Duration(float64(delta) * m.replay.speed)
+	}
+	if m.replay.timeline.Duration <= 0 || position >= m.replay.timeline.Duration {
+		return m.replay.timeline.Duration
+	}
+	if position < 0 {
+		return 0
+	}
+	return position
 }
 
 func (m *Model) toggleReplay(now time.Time) {

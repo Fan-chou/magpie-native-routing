@@ -19,8 +19,11 @@ func (m *Model) View(c *ui.Context) {
 	}
 	s := m.snapshot()
 	now := c.Now()
-	width, _ := c.Size()
-	routes := m.visibleRoutes(s, m.tabKind() == tabHistory)
+	width, height := c.Size()
+	m.mu.Lock()
+	m.windowWidth, m.windowHeight = width, height
+	m.mu.Unlock()
+	routes := m.viewRoutes(s, m.tabKind() == tabHistory)
 	m.syncReplay(s, now)
 	m.syncFlightTracks(s, routes, now)
 	m.mu.Lock()
@@ -222,11 +225,11 @@ func (m *Model) liveView(c *ui.Context, s routing.Snapshot, p palette, now time.
 // and account column. The selected request's detailed trail follows below;
 // it is not a permanent right-hand inspector.
 func (m *Model) routingHome(c *ui.Context, s routing.Snapshot, p palette, now time.Time, history bool, windowWidth float32) {
-	routes := m.visibleRoutes(s, history)
+	routes := m.viewRoutes(s, history)
 	m.prepareListSelection(routes)
 	sel, ok := m.selectedRoute(routes)
 	ui.Box(c).Fill().Background(p.Canvas).Children(func() {
-		ui.Scroll(c).Fill().Children(func() {
+		ui.Scroll(c).Fill().TrackScroll(&m.pageScroll).Children(func() {
 			ui.Column(c).WidthPercent(100).MaxWidth(1200).AlignSelf(ui.Center).Padding(14, 20, 24, 20).Gap(12).Children(func() {
 				m.routingPageHead(c, s, p, history)
 				if history {
@@ -238,6 +241,13 @@ func (m *Model) routingHome(c *ui.Context, s routing.Snapshot, p palette, now ti
 			})
 		})
 	})
+}
+
+// viewRoutes reuses the filtered route slice across the low-rate rebuilds
+// caused by playback, polling and redraws. The cache key includes the store
+// version and every filter that changes the slice.
+func (m *Model) viewRoutes(s routing.Snapshot, replayOnly bool) []routing.RouteView {
+	return m.visibleRoutes(s, replayOnly)
 }
 
 func (m *Model) routingPageHead(c *ui.Context, s routing.Snapshot, p palette, history bool) {
@@ -264,14 +274,43 @@ func (m *Model) routingPageHead(c *ui.Context, s routing.Snapshot, p palette, hi
 			m.setGroupNotice(loc.T("routing.newGroupUnsupported"))
 			m.setTab(tabGroups)
 		}
+		masked := m.accountsMasked()
 		mask := loc.T("app.hideAccounts")
-		if m.accountsMasked() {
-			mask = loc.T("app.showAccounts")
+		title := loc.T("routing.maskAccountsHint")
+		if masked {
+			mask = loc.T("app.accountsHidden")
+			title = loc.T("routing.accountsHiddenHint")
 		}
-		if ui.ButtonBase(c.Key("mask")).Padding(2, 6).Radius(6).Children(func() {
-			ui.Text(c, mask).FontSize(11).TextColor(p.Muted)
-		}).Clicked() {
+		btn := ui.ButtonBase(c.Key("mask")).Padding(2, 6).Radius(6).Tooltip(title).Children(func() {
+			drawEyeGlyph(c, 13, masked, boolColor(masked, p.Text2, p.Muted))
+			ui.Text(c, mask).FontSize(11).TextColor(boolColor(masked, p.Text2, p.Muted))
+		})
+		if btn.Clicked() {
 			m.toggleAccountMask()
+			// Persist in this app's own settings only, never in Magpie's
+			// localStorage or providers.json.
+			if m.actions.SaveSettings != nil {
+				cfg := m.Settings()
+				cfg.HideAccounts = m.accountsMasked()
+				_ = m.actions.SaveSettings(cfg)
+			}
+		}
+	})
+}
+
+func drawEyeGlyph(c *ui.Context, size float32, off bool, color ui.Color) {
+	ui.Box(c).Size(size, size).Draw(func(p *ui.Painter, r ui.Rect) {
+		cx, cy := r.X+r.W/2, r.Y+r.H/2
+		var eye ui.Path
+		eye.MoveTo(cx-5.4, cy)
+		eye.CubeTo(cx-3.4, cy-3.4, cx+3.4, cy-3.4, cx+5.4, cy)
+		eye.CubeTo(cx+3.4, cy+3.4, cx-3.4, cy+3.4, cx-5.4, cy)
+		p.StrokePath(&eye, 1.35, color)
+		var iris ui.Path
+		iris.Circle(cx, cy, 1.55)
+		p.StrokePath(&iris, 1.2, color)
+		if off {
+			p.Line(cx-5.7, cy+5.4, cx+5.7, cy-5.4, 1.35, color)
 		}
 	})
 }
@@ -316,6 +355,7 @@ func (m *Model) routingStageCard(c *ui.Context, s routing.Snapshot, routes []rou
 	if text := loc.T("routing.mode." + modeID); text != "routing.mode."+modeID {
 		detail = text
 	}
+	stage := m.routingStagePresentationAt(s, routes, sel, ok, now)
 	stageWidth := float32(0)
 	if w, _ := c.Size(); w > 0 {
 		// The stage sits inside 20px page padding and 16px card padding.
@@ -323,8 +363,12 @@ func (m *Model) routingStageCard(c *ui.Context, s routing.Snapshot, routes []rou
 		// ResizeObserver uses for its max560 layout, not the window's.
 		stageWidth = min(w, 1200) - 40 - 32
 	}
-	stageHeight := m.routingStageHeightForWidth(stageWidth, s, routes, sel, ok, now)
-	ui.Column(c).Shrink(0).Radius(14).Background(p.Panel).Border(1, p.Line).Clip().Children(func() {
+	stageHeight := m.routingStageHeightForPresentation(stageWidth, stage)
+	// MyGo 0.5.6 samples a Canvas painted under an ancestor Clip at the
+	// wrong source origin. The routing card holds the static stage Canvas,
+	// so it keeps its rounded background and border without clipping the
+	// subtree; no child is positioned to bleed outside the card.
+	ui.Column(c).Shrink(0).Radius(14).Background(p.Panel).Border(1, p.Line).Children(func() {
 		// The original Routing card opens with a two-line explanation of
 		// the actual routing mode, never with a dashboard title.
 		ui.Column(c).Padding(14, 16, 10, 16).Gap(3).Children(func() {
@@ -339,15 +383,41 @@ func (m *Model) routingStageCard(c *ui.Context, s routing.Snapshot, routes []rou
 		// routing.css: .rt-stage has 22px vertically and 2px horizontally.
 		// Those gutters live in layoutRoutingStage, so the draw box is the
 		// complete stage and node geometry is identical for every layer.
-		ui.Box(c).Height(stageHeight).Draw(func(pt *ui.Painter, r ui.Rect) {
-			m.drawRoutingStageCanvas(pt, r, s, routes, sel, ok, p, now, history)
-		})
+		//
+		// Cards and idle wires are cached in the static Canvas while birds
+		// and live wires stay in the dynamic callback above it.
+		m.routingStageLayers(c, stageHeight, stage, s, p, history)
+		if m.accountMaskAnimating(now) {
+			// rtpii lasts 350ms. It is the only time the masked account text
+			// changes without a store update; request frames just for that
+			// transition, never for an idle masked page.
+			c.After(16 * time.Millisecond)
+		}
 		if ok {
 			m.routingStory(c, sel, routes, p, loc)
 			if sel.Prompt != nil {
 				m.routingContextCard(c, sel, p, loc)
 			}
 		}
+	})
+}
+
+// routingStageLayers creates two overlapping retained paint callbacks. The
+// first owns the static cards and idle wires, the second owns only the
+// moving route geometry. Both receive the same stage rectangle and resolve
+// their node geometry through routingStageGeometry, so the visual layers
+// cannot drift apart after a resize or DPI change.
+func (m *Model) routingStageLayers(c *ui.Context, height float32, stage *routingStagePresentation, s routing.Snapshot, p palette, history bool) {
+	_ = history
+	ui.Box(c).Height(height).Children(func() {
+		ui.Box(c).Key("routing-stage-static").Absolute().Left(0).Top(0).Right(0).Bottom(0).
+			Draw(func(pt *ui.Painter, r ui.Rect) {
+				m.drawRoutingStageStatic(pt, r, stage, s, p, pt.Now())
+			})
+		ui.Box(c).Key("routing-stage-live").Absolute().Left(0).Top(0).Right(0).Bottom(0).
+			Draw(func(pt *ui.Painter, r ui.Rect) {
+				m.drawRoutingStageLive(pt, r, stage, p, pt.Now())
+			})
 	})
 }
 
@@ -359,20 +429,18 @@ func (m *Model) routingStageHeight(s routing.Snapshot, routes []routing.RouteVie
 }
 
 func (m *Model) routingStageHeightForWidth(width float32, s routing.Snapshot, routes []routing.RouteView, sel routing.RouteView, hasSel bool, now time.Time) float32 {
-	_ = now
-	replay, replayActive := m.replayTopologyState()
-	agents := m.stageAgents(s, sel, hasSel, routes, replay, replayActive)
-	rows := m.stageAccountRows(sel, hasSel, s.Live, replay.routes, replayActive)
-	if len(rows) == 0 {
-		rows = []providerNode{{}}
-	}
-	content := routingStageContentHeight(len(agents), len(rows))
+	return m.routingStageHeightForPresentation(width,
+		m.routingStagePresentationAt(s, routes, sel, hasSel, now))
+}
+
+func (m *Model) routingStageHeightForPresentation(width float32, stage *routingStagePresentation) float32 {
+	content := routingStageContentHeight(len(stage.agents), len(stage.rows))
 	if width > 0 && width <= routingStageNarrowWidth {
 		// Two columns above (agents and hub) and the accounts below,
 		// matching the max560 grid's 26px row gap.
-		metrics := routingStageMetrics(len(agents), len(rows))
-		top := max(stageStackHeight(len(agents), metrics.agentH, metrics.agentGap), routingStageHubH)
-		content = top + 26 + stageStackHeight(len(rows), metrics.rowH, metrics.rowGap)
+		metrics := routingStageMetrics(len(stage.agents), len(stage.rows))
+		top := max(stageStackHeight(len(stage.agents), metrics.agentH, metrics.agentGap), routingStageHubH)
+		content = top + 26 + stageStackHeight(len(stage.rows), metrics.rowH, metrics.rowGap)
 	}
 	return max(routingStageMinHeight, content+routingStagePadding*2)
 }
@@ -450,7 +518,16 @@ func (m *Model) routingStory(c *ui.Context, rv routing.RouteView, routes []routi
 					} else {
 						ui.Box(c).Size(6, 6).Radius(3).Margin(3, 2, 0, 0).Background(dotColor)
 					}
-					ui.Text(c, line.text).FontSize(12).TextColor(boolColor(line.kind == "bad", p.Danger, boolColor(line.kind == "aside", p.Muted, p.Text2))).Grow(1)
+					ink := boolColor(line.kind == "bad", p.Danger, boolColor(line.kind == "aside", p.Muted, p.Text2))
+					if line.account != "" && strings.HasPrefix(line.text, line.prefix) {
+						blur, opacity := m.accountMaskStyle(c.Now())
+						middle := strings.TrimSuffix(strings.TrimPrefix(line.text, line.prefix), line.suffix)
+						ui.Box(c).Grow(1).Height(17).Draw(func(pt *ui.Painter, r ui.Rect) {
+							drawMaskedLine(pt, r, line.prefix, middle, line.suffix, 12, blur, opacity, ink)
+						})
+					} else {
+						ui.Text(c, line.text).FontSize(12).TextColor(ink).Grow(1)
+					}
 				})
 			}
 		})
@@ -458,8 +535,11 @@ func (m *Model) routingStory(c *ui.Context, rv routing.RouteView, routes []routi
 }
 
 type routingStoryStep struct {
-	text string
-	kind string // why, aside, ok, bad, wait
+	text    string
+	kind    string // why, aside, ok, bad, wait
+	prefix  string // unmasked text before a .pii account
+	account string // stand-in for a real account address
+	suffix  string // unmasked text after the account
 }
 
 // routingStorySteps follows client.js's renderSteps: the initial request,
@@ -494,7 +574,12 @@ func routingStorySteps(rv routing.RouteView, masked bool, loc Localization) []ro
 		out = append(out, routingStoryStep{text: line})
 	}
 	if why := routingAffinityWhy(rv, masked, loc); why != "" {
-		out = append(out, routingStoryStep{text: why, kind: "why"})
+		step := routingStoryStep{text: why, kind: "why"}
+		if masked && rv.Affinity != nil && rv.Affinity.Last != "" {
+			step.prefix, step.suffix = splitStoryAccount(why, maskWho(rv.Affinity.Last))
+			step.account = maskWho(rv.Affinity.Last)
+		}
+		out = append(out, step)
 	}
 	if why := routingRuleWhy(rv, loc); why != "" {
 		out = append(out, routingStoryStep{text: why, kind: "why"})
@@ -513,10 +598,16 @@ func routingStorySteps(rv routing.RouteView, masked bool, loc Localization) []ro
 		line := loc.F("routing.tryStory",
 			loc.T("routing.attempt")+" "+itoa(i+1)+" · "+agentName(rv.Agent),
 			who, tryStatusText(tr), durationText(tr.Millis))
+		step := routingStoryStep{text: line, kind: kind}
+		if masked && who != "" {
+			step.prefix, step.suffix = splitStoryAccount(line, who)
+			step.account = who
+		}
 		if reason := routing.TryFailure(tr); reason != "" {
 			line += " · " + reason
 		}
-		out = append(out, routingStoryStep{text: line, kind: kind})
+		step.text = line
+		out = append(out, step)
 		if tr.TTFT > 0 {
 			out = append(out, routingStoryStep{
 				text: loc.F("routing.firstTokenStep", durationText(tr.TTFT)),
@@ -531,6 +622,19 @@ func routingStorySteps(rv routing.RouteView, masked bool, loc Localization) []ro
 		})
 	}
 	return out
+}
+
+// splitStoryAccount separates the one span that Magpie marks `.pii` from
+// the rest of a localized sentence. The caller draws the middle span with
+// the Painter's cached-text Gaussian approximation.
+func splitStoryAccount(line, account string) (prefix, suffix string) {
+	if account == "" {
+		return line, ""
+	}
+	if i := strings.Index(line, account); i >= 0 {
+		return line[:i], line[i+len(account):]
+	}
+	return line, ""
 }
 
 func routingAffinityWhy(rv routing.RouteView, masked bool, loc Localization) string {
@@ -611,7 +715,7 @@ func metricStack(c *ui.Context, label, value string, p palette) {
 // intentionally unavailable because providers.json is never written.
 func (m *Model) routingGroupsSection(c *ui.Context, s routing.Snapshot, p palette) {
 	loc := m.localization()
-	groups := routing.GroupViews(s.Config, s.Routes)
+	groups := m.groupViews(s)
 	ui.Column(c).Gap(7).Children(func() {
 		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
 			ui.Text(c, loc.T("groups.title")).Bold().FontSize(12)
@@ -776,6 +880,20 @@ func (m *Model) requestSectionHead(c *ui.Context, routes []routing.RouteView, se
 		}
 		ui.Spacer(c)
 		ui.Text(c, note).FontSize(10.5).TextColor(p.Muted).NoWrap()
+		menu := ui.MenuButton(c, loc.T("routing.metrics"), func(menu *ui.Menu) {
+			for _, option := range routeMetricOptions {
+				key := option.key
+				label := loc.T(option.labelKey)
+				item := menu.Item(label).Disabled(!option.available)
+				if item.Checked(m.metricVisible(key)).Chosen() {
+					m.toggleMetric(key)
+					c.Invalidate()
+				}
+			}
+		}).Padding(2, 6).Radius(6).PaddingStart(8)
+		if menu.Hovered() {
+			menu.Background(p.PanelMuted)
+		}
 	})
 }
 func (m *Model) dayChips(c *ui.Context, s routing.Snapshot, p palette, history bool) {
@@ -830,7 +948,7 @@ func (m *Model) routingRequestList(c *ui.Context, routes []routing.RouteView, p 
 	}
 	m.mu.Lock()
 	m.listState.Key = func(i int) any { return routes[i].ID }
-	m.listState.Label = func(i int) string { return routeLabel(routes[i]) }
+	m.listState.Label = func(i int) string { return m.routeAccessibilityLabel(routes[i]) }
 	m.listState.Selected = &m.requestSel
 	sel := m.requestSel
 	m.mu.Unlock()
@@ -875,7 +993,7 @@ func (m *Model) routingRequestRow(c *ui.Context, rv routing.RouteView, selected 
 		})
 		ui.Row(c).MinWidth(100).Gap(6).AlignItems(ui.Center).Children(func() {
 			ui.Box(c).Grow(1).Height(20).Clip().Draw(func(pt *ui.Painter, r ui.Rect) {
-				drawRequestDestination(pt, r, said, how, p)
+				drawRequestDestination(pt, r, said, how, p, m.accountsMasked())
 			})
 			for _, tag := range routeDestinationTags(rv, tr, loc) {
 				ui.Box(c).Padding(0, 5).Radius(5).Background(boolColor(tag.warn, p.WarningSoft, p.PanelMuted)).Children(func() {
@@ -883,7 +1001,7 @@ func (m *Model) routingRequestRow(c *ui.Context, rv routing.RouteView, selected 
 				})
 			}
 		})
-		metrics := routeMetrics(rv, how, loc)
+		metrics := m.visibleRouteMetrics(rv, how, loc)
 		meta := ui.Row(c).Gap(5).AlignItems(ui.Center)
 		if metaUnder {
 			meta = meta.RowStart(2).ColumnStart(2).ColumnSpan(2).Justify(ui.Start)
@@ -917,6 +1035,45 @@ func (m *Model) routingRequestRow(c *ui.Context, rv routing.RouteView, selected 
 	})
 }
 
+func maskAccountText(text string) string {
+	return maskWho(text)
+}
+
+// drawMaskedSecondary draws a mixed row (model · account) without blending
+// the model with the account's mask cue. A stable masked label is ordinary
+// Painter text with a sampled Gaussian: Element.Blur would create an
+// offscreen layer on every retained-tree repaint, including each flight
+// frame. Only the brief mask reveal varies, which the store update or the
+// dedicated rtpii timer already redraws.
+func drawMaskedSecondary(c *ui.Context, whole, rawWho string, masked bool, ink ui.Color, blur, opacity float32) {
+	if !masked || rawWho == "" {
+		ui.Text(c, whole).FontSize(8).TextColor(ink).NoWrap()
+		return
+	}
+	maskedWho := maskWho(rawWho)
+	head := strings.TrimSuffix(whole, maskedWho)
+	ui.Box(c).Height(12).Draw(func(p *ui.Painter, r ui.Rect) {
+		drawMaskedLine(p, r, head, maskedWho, "", 8, blur, opacity, ink)
+	})
+}
+
+func drawMaskedLine(p *ui.Painter, r ui.Rect, prefix, masked, suffix string, size, sigma, opacity float32, ink ui.Color) {
+	x := r.X
+	if prefix != "" {
+		p.Text(x, r.Y, prefix, size, ink)
+		w, _ := p.MeasureText(0, ui.Span{Text: prefix, Size: size})
+		x += w
+	}
+	if masked != "" {
+		drawMaskedText(p, x, r.Y, masked, size, sigma, opacity, ink)
+		w, _ := p.MeasureText(0, ui.Span{Text: masked, Size: size})
+		x += w
+	}
+	if suffix != "" {
+		p.Text(x, r.Y, suffix, size, ink)
+	}
+}
+
 func splitRouteEndpoint(said string) (account, model string) {
 	if i := strings.LastIndex(said, " · "); i >= 0 {
 		return strings.TrimSpace(said[:i]), strings.TrimSpace(said[i+3:])
@@ -928,8 +1085,11 @@ func splitRouteEndpoint(said string) (account, model string) {
 // font metrics. The previous two Text widgets could overflow their grid
 // cell and paint through the metrics; a clipped painter keeps the original
 // account/model split without that overlap.
-func drawRequestDestination(p *ui.Painter, r ui.Rect, said, how string, pal palette) {
+func drawRequestDestination(p *ui.Painter, r ui.Rect, said, how string, pal palette, masked bool) {
 	account, model := splitRouteEndpoint(said)
+	if masked {
+		account = maskAccountText(account)
+	}
 	status := pal.Success
 	if how == "moved" {
 		status = pal.Accent
@@ -1016,7 +1176,7 @@ func (m *Model) routingAccountColumn(c *ui.Context, routes []routing.RouteView, 
 			ui.Spacer(c)
 			ui.Text(c, loc.T("routing.overThoseRequests")).FontSize(11).TextColor(p.Muted)
 		})
-		rows := accountTally(routes)
+		rows := m.cachedAccountTally(routes)
 		if len(rows) == 0 {
 			ui.Text(c, loc.T("status.noProvider")).FontSize(11).TextColor(p.Muted)
 			return
@@ -1039,9 +1199,13 @@ func (m *Model) routingAccountColumn(c *ui.Context, routes []routing.RouteView, 
 				ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
 					who := accountTallyTitle(row)
 					if hidden {
-						who = maskWho(who)
+						blur, opacity := m.accountMaskStyle(now)
+						ui.Box(c).Grow(1).Height(17).Draw(func(pt *ui.Painter, r ui.Rect) {
+							drawMaskedText(pt, r.X, r.Y, maskWho(who), 12, blur, opacity, p.Text)
+						})
+					} else {
+						ui.Text(c, who).FontSize(12).Bold().TextColor(p.Text).NoWrap().Grow(1)
 					}
-					ui.Text(c, who).FontSize(12).Bold().TextColor(p.Text).NoWrap().Grow(1)
 					if plan := accountTallyPlan(row, loc); plan != "" {
 						ui.Text(c, plan).FontSize(11).TextColor(p.Muted).NoWrap()
 					}
@@ -1227,7 +1391,7 @@ func (m *Model) requestList(c *ui.Context, s routing.Snapshot, routes []routing.
 			}
 			return i
 		}
-		m.listState.Label = func(i int) string { return routeLabel(routes[i]) }
+		m.listState.Label = func(i int) string { return m.routeAccessibilityLabel(routes[i]) }
 		m.listState.Selected = &m.requestSel
 		sel := m.requestSel
 		m.mu.Unlock()
@@ -1455,7 +1619,8 @@ func (m *Model) candidateRow(c *ui.Context, i int, w routing.Weighed, rv routing
 				}
 				secondary += " · " + who
 			}
-			ui.Text(c, secondary).FontSize(8).TextColor(p.Faint).NoWrap()
+			blur, opacity := m.accountMaskStyle(c.Now())
+			drawMaskedSecondary(c, secondary, w.Who, m.accountsMasked(), p.Faint, blur, opacity)
 		})
 		if note != "" {
 			ui.Text(c, note).FontSize(8).TextColor(color)
@@ -1550,7 +1715,7 @@ func (m *Model) routeFacts(c *ui.Context, rv routing.RouteView, p palette, loc L
 }
 
 func (m *Model) historyView(c *ui.Context, s routing.Snapshot, p palette, now time.Time) {
-	routes := m.visibleRoutes(s, true)
+	routes := m.viewRoutes(s, true)
 	m.prepareListSelection(routes)
 	sel, ok := m.selectedRoute(routes)
 	loc := m.localization()
@@ -1654,7 +1819,13 @@ func (m *Model) replayBar(c *ui.Context, s routing.Snapshot, routes []routing.Ro
 			}
 		})
 		if playing {
-			c.AnimationFrame()
+			// The stage's painter advances birds from the replay clock at
+			// 60 FPS without rebuilding the view. This timer only commits
+			// the cursor to the retained route list and clock. A full tree
+			// build is far more expensive than a paint, so one second is
+			// enough for row/window membership while seeking and pause stay
+			// immediate through their click handlers.
+			c.After(time.Second)
 		}
 		_ = replayState
 		_ = routes
@@ -1663,7 +1834,7 @@ func (m *Model) replayBar(c *ui.Context, s routing.Snapshot, routes []routing.Ro
 
 func (m *Model) groupsView(c *ui.Context, s routing.Snapshot, p palette) {
 	loc := m.localization()
-	groups := routing.GroupViews(s.Config, s.Routes)
+	groups := m.groupViews(s)
 	ui.Box(c).Fill().Background(p.Canvas).Children(func() {
 		ui.Scroll(c).Fill().Children(func() {
 			ui.Column(c).WidthPercent(100).MaxWidth(1200).AlignSelf(ui.Center).Padding(14, 20, 24, 20).Gap(10).Children(func() {
@@ -1937,6 +2108,18 @@ func filterDash(s string) string {
 
 func routeLabel(r routing.RouteView) string {
 	return shortID(r.ID) + " " + r.Agent + " " + r.Model
+}
+
+// routeAccessibilityLabel never exposes an account name while masking is
+// on. The route row itself paints maskAccountText's stand-ins; this covers
+// the native list's accessibility label, which is built from text rather
+// than pixels.
+func (m *Model) routeAccessibilityLabel(rv routing.RouteView) string {
+	if !m.accountsMasked() {
+		return routeLabel(rv)
+	}
+	said, _, _ := routeOutcome(rv)
+	return maskAccountText(said) + " " + clockText(rv.Time)
 }
 
 func routeMillis(r routing.RouteView) int64 {

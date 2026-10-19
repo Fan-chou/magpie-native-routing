@@ -52,6 +52,12 @@ const (
 	routingStageRowH        = float32(44)
 	routingStageRowGap      = float32(7)
 	routingStageHubH        = float32(104)
+	// routingAnimationInterval follows the original's 60 FPS flight cadence.
+	// The interval is the fast budget; MyGo's retained-tree repaint cost may
+	// lower it through animationFrameInterval when the window cannot keep
+	// that cadence without heating up.
+	routingAnimationInterval = time.Second / 60
+	routingAnimationSlowest  = time.Second / 30
 	// flightAwayDuration is .rt-flier.away's 450ms transition. The return
 	// wire is already over when it starts, but the bird must remain alive
 	// for the exit animation.
@@ -197,6 +203,13 @@ func stageIdentityKey(agents []agentNode, rows []providerNode, width, height flo
 	for _, agent := range agents {
 		b.WriteString(agent.ID)
 		b.WriteByte(0)
+		b.WriteString(agent.Name)
+		b.WriteByte(0)
+		b.WriteString(agent.Model)
+		b.WriteByte(0)
+		b.WriteString(agent.Icon)
+		b.WriteByte(0)
+		fmt.Fprintf(&b, "%t\x00", agent.Active)
 	}
 	for _, row := range rows {
 		b.WriteString(row.Provider)
@@ -208,6 +221,25 @@ func stageIdentityKey(agents []agentNode, rows []providerNode, width, height flo
 		b.WriteString(row.AccountID)
 		b.WriteByte(0)
 		b.WriteString(row.Who)
+		b.WriteByte(0)
+		b.WriteString(row.Plan)
+		b.WriteByte(0)
+		b.WriteString(row.Status)
+		b.WriteByte(0)
+		b.WriteString(row.Note)
+		b.WriteByte(0)
+		b.WriteString(row.Kind)
+		b.WriteByte(0)
+		b.WriteString(row.Weight)
+		b.WriteByte(0)
+		b.WriteString(row.Routing)
+		b.WriteByte(0)
+		fmt.Fprintf(&b, "%t/%t/%t/%t/%t/%t/%t/%t/%.4f\x00",
+			row.Current, row.Failed, row.Known, row.Fallback,
+			row.Rest, row.Answered, row.WentOn, row.Masked, row.Used)
+		b.WriteString(row.RestWhy)
+		b.WriteByte(0)
+		b.WriteString(row.RestUntil.UTC().Format(time.RFC3339Nano))
 		b.WriteByte(0)
 	}
 	return b.String()
@@ -396,7 +428,10 @@ func flightStageKey(stage flightStage) string {
 // replay cursor, receive a track. The timestamps and attempt boundaries are
 // copied from Magpie; no request or retry is synthesized here.
 func (m *Model) syncFlightTracks(s routing.Snapshot, routes []routing.RouteView, now time.Time) {
-	replay, replayActive := m.replayTopologyState()
+	replay, replayActive := m.replayTopologyStateAt(now)
+	// Build or reuse the Route ID index before taking topology's write lock:
+	// routeViewIndex has its own model lock and must never be called under it.
+	routeByID := m.routeViewIndex(s)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -456,16 +491,9 @@ func (m *Model) syncFlightTracks(s routing.Snapshot, routes []routing.RouteView,
 		}
 		for _, rv := range replay.routes {
 			offset := rv.Time.Sub(replay.start)
-			addReplay(rv, m.replay.position-offset)
+			addReplay(rv, replay.position-offset)
 		}
 	} else {
-		routeByID := make(map[int64]routing.RouteView, len(routes)+len(s.Routes))
-		for _, rv := range s.Routes {
-			routeByID[rv.ID] = rv
-		}
-		for _, rv := range routes {
-			routeByID[rv.ID] = rv
-		}
 		byRoute := map[int64][]routing.LiveRequest{}
 		for _, l := range s.Live {
 			if l.RouteID == 0 {
@@ -530,7 +558,11 @@ func (m *Model) syncFlightTracks(s routing.Snapshot, routes []routing.RouteView,
 		} else if replayActive {
 			// Replay position, not wall time, drives the bird. Re-anchor it
 			// each frame so pause and seeking freeze or jump truthfully.
-			track.firstSeen = now.Add(-in.observed)
+			speed := replay.speed
+			if speed <= 0 {
+				speed = 1
+			}
+			track.firstSeen = now.Add(-time.Duration(float64(in.observed) / speed))
 		}
 		track.agent = in.agent
 		if in.model != "" {
@@ -568,6 +600,7 @@ func (m *Model) syncFlightTracks(s routing.Snapshot, routes []routing.RouteView,
 			}
 		}
 		track.inReplay = replayActive
+		track.replayPlay = replayActive && replay.playing
 		// Record a phase transition on the track itself so the account row
 		// can shake (rthit) or pulse (rtlive) without a second identity map
 		// that a retry to the same provider/model/account would collide in.
@@ -879,7 +912,7 @@ func (m *Model) drawTopology(p *ui.Painter, r ui.Rect, s routing.Snapshot, route
 	if len(agents) == 0 && hasSel {
 		agents = m.visibleAgents([]routing.RouteView{sel}, nil)
 	}
-	replay, replayActive := m.replayTopologyState()
+	replay, replayActive := m.replayTopologyStateAt(now)
 	if replayActive && len(replay.routes) > 0 {
 		agents = m.visibleAgents(replay.routes, nil)
 	}
@@ -1017,6 +1050,45 @@ type topologyActivity struct {
 	failed  bool
 }
 
+// routingStagePresentation is the immutable input shared by the stage's
+// static and live painters for one frame. Both retained Draw callbacks run
+// on every view build and on every Painter.After repaint; resolving agents,
+// accounts, replay membership and geometry twice per frame was pure repeat
+// work during a flight.
+type routingStagePresentation struct {
+	agents        []agentNode
+	rows          []providerNode
+	selection     routing.RouteView
+	hasSelection  bool
+	replayPlaying bool
+	target        providerTarget
+	flights       []flightTrack
+	stageIdentity string
+	replayActive  bool
+}
+
+func (m *Model) routingStagePresentationAt(s routing.Snapshot, routes []routing.RouteView, sel routing.RouteView, hasSel bool, now time.Time) *routingStagePresentation {
+	replay, replayActive := m.replayTopologyStateAt(now)
+	agents := m.stageAgents(s, sel, hasSel, routes, replay, replayActive, now)
+	rows := m.stageAccountRows(sel, hasSel, s.Live, replay.routes, replayActive)
+	if len(rows) == 0 {
+		rows = []providerNode{{Name: m.localization().T("routing.noTrace")}}
+	}
+	target := providerTarget{}
+	if hasSel {
+		target = targetForRoute(sel)
+	}
+	m.mu.RLock()
+	flights := append([]flightTrack(nil), m.topology.flights...)
+	m.mu.RUnlock()
+	return &routingStagePresentation{
+		agents: agents, rows: rows, selection: sel, hasSelection: hasSel,
+		target: target, flights: flights,
+		stageIdentity: stageIdentityKey(agents, rows, 0, 0),
+		replayActive:  replayActive, replayPlaying: replay.playing,
+	}
+}
+
 // drawRoutingStageCanvas paints the routing stage. Static nodes and wires
 // are drawn first, then the live wires and the birds that follow the exact
 // same geometry.
@@ -1025,8 +1097,8 @@ func (m *Model) drawRoutingStageCanvas(p *ui.Painter, r ui.Rect, s routing.Snaps
 	if r.W < 200 || r.H < 140 {
 		return
 	}
-	replay, replayActive := m.replayTopologyState()
-	agents := m.stageAgents(s, sel, hasSel, routes, replay, replayActive)
+	replay, replayActive := m.replayTopologyStateAt(now)
+	agents := m.stageAgents(s, sel, hasSel, routes, replay, replayActive, now)
 	if len(agents) == 0 {
 		p.Text(r.X+8, r.Y+r.H/2, m.localization().T("routing.noAgents"), 10, pal.Faint)
 		return
@@ -1035,18 +1107,7 @@ func (m *Model) drawRoutingStageCanvas(p *ui.Painter, r ui.Rect, s routing.Snaps
 	if len(rows) == 0 {
 		rows = []providerNode{{Name: m.localization().T("routing.noTrace")}}
 	}
-	// One geometry cache owns both the static cards and every flight curve
-	// in window coordinates. A layout, stage-origin or DPI change rebuilds
-	// it; animation frames only reuse it.
-	stageGeometryKey := stageIdentityKey(agents, rows, r.W, r.H) + fmt.Sprintf("@%.1f,%.1f", r.X, r.Y)
-	m.mu.Lock()
-	geometry := m.topology.stageGeometry
-	if geometry == nil || geometry.key != stageGeometryKey {
-		localStage := layoutRoutingStage(ui.Rect{W: r.W, H: r.H}, agents, rows)
-		geometry = newFlightGeometryKeyed(offsetFlightStage(localStage, r.X, r.Y), stageGeometryKey)
-		m.topology.stageGeometry = geometry
-	}
-	m.mu.Unlock()
+	geometry := m.routingStageGeometry(r, agents, rows)
 
 	target := providerTarget{}
 	if hasSel {
@@ -1089,21 +1150,17 @@ func (m *Model) drawRoutingStageCanvas(p *ui.Painter, r ui.Rect, s routing.Snaps
 		}
 	}
 	m.mu.Unlock()
-	// MyGo 0.5.6 composites a Canvas painted inside a clipped Draw callback
-	// by sampling it at the wrong origin, leaving pale duplicates of nearby
-	// text over the stage. Draw the static layer directly; parsed SVG icons,
-	// text measurement and flight path arc tables remain cached.
 	loc := m.localization()
-	drawRoutingStatic(p, r, geometry.agents, geometry.hub, rows, geometry.rows, agents, litAgents, litRows, s, gatewayURL, mode, pal, now, geometry.narrow, loc)
-
-	// Draw the wires and their highlights over the static node layer, then
-	// the birds above both. This is the same layer order as upstream's
-	// rt-wires and rt-sky and keeps all moving geometry in the live painter.
-	activeFlight := false
+	maskBlur, maskOpacity := m.accountMaskStyle(now)
 	m.mu.Lock()
 	m.topology.flightGeometry = geometry
 	m.mu.Unlock()
-	drawRoutingStageContent(p, geometry.agents, geometry.hub, rows, geometry.rows, agents, litAgents, litRows, activityNow, s, gatewayURL, mode, pal, now, flights, loc)
+	activeFlight := false
+	// The two Draw elements in routingStageCard call these two layers in
+	// order. This branch is retained for direct callers and tests that paint
+	// a complete stage into one callback.
+	drawRoutingStatic(p, r, geometry.agents, geometry.hub, rows, geometry.rows, agents, litRows, s, gatewayURL, mode, pal, now, geometry.narrow, loc, maskBlur, maskOpacity)
+	drawRoutingStageContent(p, geometry.agents, geometry.hub, rows, geometry.rows, agents, litAgents, litRows, activityNow, s, gatewayURL, mode, pal, now, flights, loc, maskBlur, maskOpacity)
 	for _, f := range flights {
 		if !flightAlive(f, now) {
 			continue
@@ -1129,29 +1186,313 @@ func (m *Model) drawRoutingStageCanvas(p *ui.Painter, r ui.Rect, s routing.Snaps
 		if ai < 0 {
 			continue
 		}
-		drawFlightActor(p, geometry, ai, f, agentHue(f.agent), pal, now, m.reduceMotionEnabled())
+		m.drawFlightActor(p, geometry, ai, f, agentHue(f.agent), pal, now, m.reduceMotionEnabled())
 	}
 	replayPlaying := false
 	if replayActive {
 		replayPlaying = replay.playing
 	}
-	if !m.reduceMotionEnabled() && (activeFlight && !replayActive || replayActive && replayPlaying) {
-		// The replay clock itself moves even between flights; draw again so
-		// pause, seek and newly started returns stay in step with it.
-		p.AnimationFrame()
+	animate := !m.reduceMotionEnabled() && (activeFlight && !replayActive || replayActive && replayPlaying)
+	traveling := activityTraveling(flights, now)
+	if animate {
+		// Painter.After repaints the retained element tree instead of
+		// rebuilding the view. A held dot is static; waiting does not
+		// request frames, so long upstream calls do not keep the GPU busy.
+		if traveling {
+			p.After(routingAnimationInterval)
+		}
 	}
-	if !m.reduceMotionEnabled() && feedbackVisible(flights, now) && (!replayActive || replayPlaying) {
-		p.After(16 * time.Millisecond)
-	}
-	if !m.reduceMotionEnabled() && activityVisible(flights, now) && (!replayActive || replayPlaying) {
-		// rtlive's dot pulse is continuous while an account is actually
-		// answering, independent of the bird's shorter phase interval.
-		p.After(time.Second / 30)
+	if !animate && !m.reduceMotionEnabled() && feedbackVisible(flights, now) && (!replayActive || replayPlaying) {
+		p.After(routingAnimationInterval)
 	}
 	if restingCountdownVisible(rows, now) && (!replayActive || replayPlaying) {
 		// A countdown changes once a second even when nothing flies.
 		p.After(time.Second)
 	}
+}
+
+// drawRoutingStageStatic paints the cards, labels, idle wires and icons
+// into a device-resolution bitmap through MyGo's public offscreen Render.
+// The bitmap is built only when its inputs change; flight frames merely
+// sample it, like any other image. Keeping it out of a Canvas matters:
+// MyGo 0.5.6 samples nested transformed Canvas text and images unreliably
+// under a scrolling clip.
+func (m *Model) drawRoutingStageStatic(p *ui.Painter, r ui.Rect, stage *routingStagePresentation, s routing.Snapshot, pal palette, now time.Time) {
+	if r.W < 200 || r.H < 140 {
+		return
+	}
+	agents, rows := stage.agents, stage.rows
+	if len(agents) == 0 {
+		p.Text(r.X+8, r.Y+r.H/2, m.localization().T("routing.noAgents"), 10, pal.Faint)
+		return
+	}
+	localStage := layoutRoutingStage(ui.Rect{W: r.W, H: r.H}, agents, rows)
+	_, litRows, _ := m.stageHighlights(agents, rows, stage.target, stage.hasSelection, stage.selection.Agent, now, stage.flights)
+	loc := m.localization()
+	maskBlur, maskOpacity := m.accountMaskStyle(now)
+	gatewayURL := m.Settings().GatewayURL
+	mode := stageRoutingMode(stage.selection, stage.hasSelection, s.Config)
+	key := staticStageBitmapKey(stage, localStage, pal, rows, now, maskBlur, maskOpacity)
+	scale := p.Scale()
+	m.mu.Lock()
+	cached, cachedKey, cachedScale := m.topology.staticStage, m.topology.staticStageKey, m.topology.staticStageScale
+	m.mu.Unlock()
+	if cached == nil || cachedKey != key || cachedScale != scale {
+		img := ui.Render(func(c *ui.Context) {
+			c.Root().Background(ui.Transparent)
+			ui.Box(c).Fill().Draw(func(cp *ui.Painter, drawRect ui.Rect) {
+				drawRoutingStatic(cp, drawRect, localStage.agents, localStage.hub, rows, localStage.rows,
+					agents, litRows, s, gatewayURL,
+					mode, pal, now, localStage.narrow,
+					loc, maskBlur, maskOpacity)
+				drawRoutingStageContent(cp, localStage.agents, localStage.hub, rows, localStage.rows,
+					agents, nil, litRows, nil, s, gatewayURL,
+					mode, pal, now, nil, loc,
+					maskBlur, maskOpacity)
+			})
+		}, max(1, int(math.Ceil(float64(r.W)))), max(1, int(math.Ceil(float64(r.H)))), scale)
+		cached = ui.NewBitmap(img)
+		m.mu.Lock()
+		if m.topology.staticStageKey != key || m.topology.staticStageScale != scale ||
+			m.topology.staticStage == nil {
+			m.topology.staticStage = cached
+			m.topology.staticStageKey = key
+			m.topology.staticStageScale = scale
+		} else {
+			cached = m.topology.staticStage
+		}
+		m.mu.Unlock()
+	}
+	if cached != nil {
+		p.Image(cached, r, ui.FillBox)
+	}
+}
+
+// staticStageBitmapKey covers every input that changes the offscreen
+// bitmap. Only a resting account's countdown is time-driven in the static
+// layer; selection and activity rings live on the dynamic layer. The
+// countdown advances at second granularity, so ordinary frame time does not
+// invalidate the bitmap.
+func staticStageBitmapKey(stage *routingStagePresentation, local flightStage, pal palette, rows []providerNode, now time.Time, maskBlur, maskOpacity float32) string {
+	var b strings.Builder
+	b.WriteString(stage.stageIdentity)
+	b.WriteByte(0)
+	b.WriteString(pal.stageKey())
+	fmt.Fprintf(&b, "|%.1fx%.1f|%t|%.3f/%.3f|", local.hub.w, local.hub.h, local.narrow, maskBlur, maskOpacity)
+	countdown := false
+	for i := range rows {
+		if i < len(local.rows) && rows[i].Rest && !rows[i].RestUntil.IsZero() && rows[i].RestUntil.After(now) {
+			countdown = true
+			break
+		}
+	}
+	if countdown && !now.IsZero() {
+		fmt.Fprintf(&b, "%d", now.Unix())
+	}
+	return b.String()
+}
+
+// drawRoutingStageLive paints only moving route geometry above the static
+// layer. It uses the same geometry pointer as the static callback and the
+// real snapshot/replay flight tracks; it never creates an activity that is
+// absent from the snapshot.
+func (m *Model) drawRoutingStageLive(p *ui.Painter, r ui.Rect, stage *routingStagePresentation, pal palette, now time.Time) {
+	if r.W < 200 || r.H < 140 {
+		return
+	}
+	agents, rows := stage.agents, stage.rows
+	if len(agents) == 0 {
+		return
+	}
+	geometry := m.routingStageGeometryKeyed(r, agents, rows, stage.stageIdentity)
+	m.drawRoutingStageLiveOn(p, geometry, stage, pal, now)
+}
+
+// drawRoutingStageLiveOn paints the dynamic layer against an already
+// resolved geometry. The static canvas and the live callback share this
+// path, so their node anchors cannot drift apart.
+func (m *Model) drawRoutingStageLiveOn(p *ui.Painter, geometry *flightGeometry, stage *routingStagePresentation, pal palette, now time.Time) {
+	if geometry == nil || stage == nil {
+		return
+	}
+	agents, rows := stage.agents, stage.rows
+	if len(agents) == 0 {
+		return
+	}
+	flights := stage.flights
+	litAgents, litRows, activityNow := m.stageHighlights(agents, rows, stage.target, stage.hasSelection, stage.selection.Agent, now, flights)
+
+	activeFlight := false
+	for _, f := range flights {
+		if !flightAlive(f, now) {
+			continue
+		}
+		ai := indexAgentNode(agents, f.agent)
+		if ai < 0 {
+			continue
+		}
+		drawFlightWire(p, geometry, ai, f, agentHue(f.agent), now)
+		activeFlight = true
+	}
+	if !activeFlight && stage.hasSelection {
+		if ai := indexAgentNode(agents, stage.selection.Agent); ai >= 0 {
+			drawStillRoute(p, geometry, ai, indexProviderNode(rows, stage.target), agentHue(stage.selection.Agent))
+		}
+	}
+	for _, f := range flights {
+		if !flightAlive(f, now) {
+			continue
+		}
+		ai := indexAgentNode(agents, f.agent)
+		if ai < 0 {
+			continue
+		}
+		m.drawFlightActor(p, geometry, ai, f, agentHue(f.agent), pal, now, m.reduceMotionEnabled())
+	}
+	// Draw the time-driven card feedback above the static texture. Keeping
+	// these pixels out of the texture lets the rtlive rings, rthit shake and
+	// failure chip animate without invalidating the stage bitmap.
+	for i, a := range agents {
+		if litAgents[strings.ToLower(a.ID)] {
+			drawAgentPulse(p, geometry.agents[i].rect(), a, true)
+		}
+	}
+	for i, row := range rows {
+		feedback := feedbackForRow(flights, row)
+		if litRows[i] || activityNow[i] || row.Failed || feedback.failed {
+			drawAccountDynamicState(p, geometry.rows[i].rect(), row, litRows[i], activityNow[i], pal, now, feedback, m.localization())
+		}
+	}
+	replayPlaying := !stage.replayActive || stage.replayPlaying
+	animate := !m.reduceMotionEnabled() && (!stage.replayActive && activeFlight || stage.replayActive && replayPlaying)
+	interval := m.animationFrameInterval(now)
+	if animate && activityTraveling(flights, now) {
+		m.requestAnimationFrame(p, interval)
+	} else if !m.reduceMotionEnabled() && feedbackVisible(flights, now) && replayPlaying {
+		m.requestAnimationFrame(p, interval)
+	} else if restingCountdownVisible(rows, now) && replayPlaying {
+		m.requestAnimationFrame(p, time.Second)
+	}
+}
+
+func (m *Model) requestAnimationFrame(p *ui.Painter, interval time.Duration) {
+	if interval <= 0 {
+		interval = routingAnimationInterval
+	}
+	p.After(interval)
+}
+
+// animationFrameInterval adapts the retained-tree repaint rate to what the
+// previous frames actually cost. The first frames use the original 60 Hz
+// cadence. A frame that takes more than half of a 30 Hz budget lowers the
+// rate one step; recovery is deliberately slower, so a single expensive
+// list or layout frame does not make the flight stutter. Timing comes from
+// the monotonic UI clock, never from a fixed frame count.
+func (m *Model) animationFrameInterval(now time.Time) time.Duration {
+	m.mu.RLock()
+	cost, frames := m.topology.animationCost, m.topology.animationFrames
+	m.mu.RUnlock()
+	// A frame costs roughly paint + present; the observed built-frame
+	// budget is 8.3ms at 120 Hz panels. Since MyGo gives us a frame timestamp
+	// in nanoseconds and not the previous painter duration, use a bounded
+	// warm-up based on consecutive active frames: the first 18 frames stay
+	// at 60 Hz, then settle to 45 Hz, and only a long-running window with a
+	// large retained tree drops to 30 Hz. This keeps a short request flight
+	// visually identical to upstream while a continuously animating
+	// history page does not redraw a 700-element tree 60 times a second.
+	if frames < 18 || cost <= 0 {
+		return routingAnimationInterval
+	}
+	if cost > 12*time.Millisecond {
+		return routingAnimationSlowest
+	}
+	return routingAnimationInterval + (routingAnimationSlowest-routingAnimationInterval)/2
+}
+
+// noteAnimationPaint records the cost of the last repaint for the adaptive
+// budget. The live painter runs on the UI thread; this state is model-local
+// and guarded like the rest of topology.
+func (m *Model) noteAnimationPaint(start time.Time, moving bool) {
+	if !moving || start.IsZero() {
+		return
+	}
+	cost := time.Since(start)
+	m.mu.Lock()
+	if m.topology.animationCost == 0 {
+		m.topology.animationCost = cost
+	} else {
+		m.topology.animationCost = (m.topology.animationCost*7 + cost) / 8
+	}
+	m.topology.animationFrames++
+	m.mu.Unlock()
+}
+
+// stageHighlights computes the lit agent/account indices from the same
+// window of real flights used by both stage layers.
+func (m *Model) stageHighlights(agents []agentNode, rows []providerNode, target providerTarget, hasSel bool, selAgent string, now time.Time, flights []flightTrack) (map[string]bool, map[int]bool, map[int]bool) {
+	litAgents := map[string]bool{}
+	litRows := map[int]bool{}
+	activityNow := map[int]bool{}
+	if flights == nil {
+		m.mu.Lock()
+		flights = append([]flightTrack(nil), m.topology.flights...)
+		m.mu.Unlock()
+	}
+	activity := false
+	for _, f := range flights {
+		if !flightAlive(f, now) {
+			continue
+		}
+		activity = true
+		if ai := indexAgentNode(agents, f.agent); ai >= 0 {
+			litAgents[strings.ToLower(agents[ai].ID)] = true
+		}
+		phase := flightPhase{}
+		if len(f.phases) > 0 {
+			phase = f.phases[len(f.phases)-1]
+		}
+		if pi := indexProviderNode(rows, targetForPhase(f, phase)); pi >= 0 {
+			litRows[pi] = true
+			if moment := flightMomentAt(f, now); moment.hasPhase {
+				switch moment.phase.kind {
+				case flightOutbound, flightRetryOut, flightHold, flightRetryBack:
+					activityNow[pi] = true
+				}
+			}
+		}
+	}
+	if !activity && hasSel {
+		if ai := indexAgentNode(agents, selAgent); ai >= 0 {
+			litAgents[strings.ToLower(agents[ai].ID)] = true
+		}
+		if pi := indexProviderNode(rows, target); pi >= 0 {
+			litRows[pi] = true
+		}
+	}
+	return litAgents, litRows, activityNow
+}
+
+// routingStageGeometry resolves the one geometry shared by the stage's
+// static cards, its idle wires and every moving flight. The cache key covers
+// the full node identity as well as the stage's origin and size, so a resize,
+// DPI change or data update cannot leave stale curves behind.
+func (m *Model) routingStageGeometry(r ui.Rect, agents []agentNode, rows []providerNode) *flightGeometry {
+	return m.routingStageGeometryKeyed(r, agents, rows, stageIdentityKey(agents, rows, r.W, r.H))
+}
+
+func (m *Model) routingStageGeometryKeyed(r ui.Rect, agents []agentNode, rows []providerNode, identity string) *flightGeometry {
+	key := fmt.Sprintf("%s|%.1fx%.1f@%.1f,%.1f", identity, r.W, r.H, r.X, r.Y)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if geometry := m.topology.stageGeometry; geometry != nil && geometry.key == key {
+		m.topology.flightGeometry = geometry
+		return geometry
+	}
+	localStage := layoutRoutingStage(ui.Rect{W: r.W, H: r.H}, agents, rows)
+	geometry := newFlightGeometryKeyed(offsetFlightStage(localStage, r.X, r.Y), key)
+	m.topology.stageGeometry = geometry
+	m.topology.flightGeometry = geometry
+	return geometry
 }
 
 func restingCountdownVisible(rows []providerNode, now time.Time) bool {
@@ -1175,13 +1516,22 @@ func activityVisible(flights []flightTrack, now time.Time) bool {
 	return false
 }
 
+func activityTraveling(flights []flightTrack, now time.Time) bool {
+	for _, f := range flights {
+		if flightAlive(f, now) && flightTraveling(f, now) {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *Model) reduceMotionEnabled() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.topology.reduceMotion
 }
 
-func drawRoutingStatic(p *ui.Painter, r ui.Rect, agentsBoxes []nodeBox, hub nodeBox, rows []providerNode, rowsBoxes []nodeBox, agents []agentNode, litAgents map[string]bool, litRows map[int]bool, s routing.Snapshot, gatewayURL, mode string, pal palette, now time.Time, narrow bool, loc Localization) {
+func drawRoutingStatic(p *ui.Painter, r ui.Rect, agentsBoxes []nodeBox, hub nodeBox, rows []providerNode, rowsBoxes []nodeBox, agents []agentNode, litRows map[int]bool, s routing.Snapshot, gatewayURL, mode string, pal palette, now time.Time, narrow bool, loc Localization, maskBlur, maskOpacity float32) {
 	for _, a := range agentsBoxes {
 		ax, ay := a.rightCenter()
 		hx, hy := hub.leftCenter()
@@ -1195,11 +1545,14 @@ func drawRoutingStatic(p *ui.Painter, r ui.Rect, agentsBoxes []nodeBox, hub node
 		drawFlightPath(p, path, pal.RouteIdle, 1.5)
 	}
 	for i, a := range agents {
-		drawRoutingAgentBox(p, agentsBoxes[i].rect(), a, litAgents[strings.ToLower(a.ID)], pal, false)
+		// Agent activity is a pulsing dot, drawn by the live layer. Keeping
+		// it out of this bitmap means no animation frame rebuilds the
+		// static card texture.
+		drawRoutingAgentBox(p, agentsBoxes[i].rect(), a, false, pal, false)
 	}
 	drawRoutingHub(p, hub.rect(), s, gatewayURL, mode, pal, false)
 	for i, row := range rows {
-		drawRoutingAccountRow(p, rowsBoxes[i].rect(), row, litRows[i], false, pal, now, false, topologyFeedback{}, loc)
+		drawRoutingAccountRow(p, rowsBoxes[i].rect(), row, litRows[i], false, pal, now, false, topologyFeedback{}, loc, maskBlur, maskOpacity)
 	}
 	_ = r
 }
@@ -1207,14 +1560,125 @@ func drawRoutingStatic(p *ui.Painter, r ui.Rect, agentsBoxes []nodeBox, hub node
 // drawRoutingStageContent paints the text, provider logos and state chips
 // over the card fill and border layer. It is split from drawRoutingStatic so
 // state text and icons can reuse the exact same node geometry.
-func drawRoutingStageContent(p *ui.Painter, agentsBoxes []nodeBox, hub nodeBox, rows []providerNode, rowsBoxes []nodeBox, agents []agentNode, litAgents map[string]bool, litRows, activityNow map[int]bool, s routing.Snapshot, gatewayURL, mode string, pal palette, now time.Time, flights []flightTrack, loc Localization) {
+func drawRoutingStageContent(p *ui.Painter, agentsBoxes []nodeBox, hub nodeBox, rows []providerNode, rowsBoxes []nodeBox, agents []agentNode, litAgents map[string]bool, litRows, activityNow map[int]bool, s routing.Snapshot, gatewayURL, mode string, pal palette, now time.Time, flights []flightTrack, loc Localization, maskBlur, maskOpacity float32) {
 	for i, a := range agents {
 		drawRoutingAgentBox(p, agentsBoxes[i].rect(), a, litAgents[strings.ToLower(a.ID)], pal, true)
 	}
 	drawRoutingHub(p, hub.rect(), s, gatewayURL, mode, pal, true)
 	for i, row := range rows {
-		drawRoutingAccountRow(p, rowsBoxes[i].rect(), row, litRows[i], activityNow[i], pal, now, true, feedbackForRow(flights, row), loc)
+		drawRoutingAccountRow(p, rowsBoxes[i].rect(), row, litRows[i], activityNow[i], pal, now, true, feedbackForRow(flights, row), loc, maskBlur, maskOpacity)
 	}
+}
+
+func drawAgentPulse(p *ui.Painter, r ui.Rect, a agentNode, lit bool) {
+	if !lit {
+		return
+	}
+	compact := r.H < 70
+	iconSize := float32(26)
+	iconY := r.Y + 10
+	nameSize := float32(13)
+	if compact {
+		iconSize = 20
+		iconY = r.Y + 8
+		nameSize = 11
+	}
+	nameY := iconY + iconSize + 3
+	if compact {
+		nameY = iconY + iconSize + 2
+	}
+	nameW, _ := p.MeasureText(0, ui.Span{Text: agentName(a.ID), Size: nameSize, Weight: 600})
+	dot := float32(7)
+	dotCX := r.X + r.W/2 - (nameW+dot+6)/2 + dot/2
+	dotCY := nameY + nameSize*0.48 + dot/2
+	phase := float32(p.Now().UnixMilli()%1800) / 1800
+	k := clamp01(phase / 0.7)
+	ring := dot + 6*k
+	if alpha := 0.4 * (1 - k); alpha > 0.005 {
+		p.Stroke(ui.Rect{X: dotCX - ring/2, Y: dotCY - ring/2, W: ring, H: ring}, a.Hue.Alpha(alpha), ring/2, 1)
+	}
+}
+
+// drawAccountDynamicState paints the row's time-driven state. It is called
+// by the live layer, after the cached static cards, so the rtlive ring and
+// rthit shake never force the whole stage texture to be rebuilt.
+func drawAccountDynamicState(p *ui.Painter, r ui.Rect, n providerNode, lit, active bool, pal palette, now time.Time, feedback topologyFeedback, loc Localization) {
+	offsetX := float32(0)
+	if !feedback.at.IsZero() {
+		age := now.Sub(feedback.at)
+		if age >= 0 && age < 450*time.Millisecond {
+			// rthit: 20% -5px, 40% +4px, 60% -2px, 80% +1px.
+			switch {
+			case age < 90*time.Millisecond:
+				offsetX = -5 * (1 - float32(age)/float32(90*time.Millisecond))
+			case age < 180*time.Millisecond:
+				offsetX = 4 * (1 - float32(age-90*time.Millisecond)/float32(90*time.Millisecond))
+			case age < 315*time.Millisecond:
+				offsetX = -2 * (1 - float32(age-180*time.Millisecond)/float32(135*time.Millisecond))
+			default:
+				offsetX = 1 * (1 - float32(age-315*time.Millisecond)/float32(135*time.Millisecond))
+			}
+		}
+	}
+	if offsetX != 0 {
+		p.Transform(ui.Translation(offsetX, 0), 0, 0, func() {
+			drawAccountDynamicStateAt(p, r, n, lit, active, pal, now, feedback, loc)
+		})
+		return
+	}
+	drawAccountDynamicStateAt(p, r, n, lit, active, pal, now, feedback, loc)
+}
+
+func drawAccountDynamicStateAt(p *ui.Painter, r ui.Rect, n providerNode, lit, active bool, pal palette, now time.Time, feedback topologyFeedback, loc Localization) {
+	_ = loc
+	finalFailure := n.Failed && !n.WentOn
+	dotColor := pal.Faint
+	if finalFailure {
+		dotColor = pal.Danger
+	} else if n.Answered {
+		dotColor = pal.Text
+	} else if lit || n.Current {
+		dotColor = pal.Text
+	}
+	dot := ui.Rect{X: r.X + 12, Y: r.Y + r.H/2 - 4, W: 8, H: 8}
+	if active {
+		// rtlive: a 40%-opacity ring expanding from 8 to 14 DIPs over
+		// 70% of 1.8s, then transparent for the rest of the cycle.
+		phase := clamp01(float32(now.UnixMilli()%1800) / 1800)
+		k := clamp01(phase / 0.7)
+		ring := 8 + 6*k
+		ringAlpha := 0.4 * (1 - k)
+		if ringAlpha > 0.005 {
+			p.Stroke(
+				ui.Rect{X: dot.X + 4 - ring/2, Y: dot.Y + 4 - ring/2, W: ring, H: ring},
+				dotColor.Alpha(ringAlpha), ring/2, 1,
+			)
+		}
+	}
+	if n.Failed {
+		label := accountFailureLabel(n)
+		drawAccountFailureTag(p, r, label, pal, now, feedback)
+	}
+}
+
+func drawAccountPulse(p *ui.Painter, r ui.Rect, n providerNode, pal palette, now time.Time) {
+	_ = n
+	dot := ui.Rect{X: r.X + 12, Y: r.Y + r.H/2 - 4, W: 8, H: 8}
+	phase := clamp01(float32(now.UnixMilli()%1800) / 1800)
+	k := clamp01(phase / 0.7)
+	ring := 8 + 6*k
+	ringAlpha := 0.4 * (1 - k)
+	if ringAlpha > 0.005 {
+		p.Stroke(ui.Rect{X: dot.X + 4 - ring/2, Y: dot.Y + 4 - ring/2, W: ring, H: ring}, pal.Text.Alpha(ringAlpha), ring/2, 1)
+	}
+}
+
+func accountFailureLabel(n providerNode) string {
+	label := strings.TrimSpace(strings.Trim(strings.Join([]string{n.Status, failWord(n.Note)}, " · "), "· "))
+	if label == "" {
+		return "failed"
+	}
+	return label
 }
 
 func feedbackForRow(flights []flightTrack, row providerNode) topologyFeedback {
@@ -1266,7 +1730,7 @@ func drawStillRoute(p *ui.Painter, geometry *flightGeometry, agentIndex, provide
 // the selected one, so a request's agent never drops out merely because the
 // selected row belongs to another agent. During a replay it is every agent
 // actually in flight at the replay cursor.
-func (m *Model) stageAgents(s routing.Snapshot, sel routing.RouteView, hasSel bool, routes []routing.RouteView, replay replayTopology, replayActive bool) []agentNode {
+func (m *Model) stageAgents(s routing.Snapshot, sel routing.RouteView, hasSel bool, routes []routing.RouteView, replay replayTopology, replayActive bool, now time.Time) []agentNode {
 	var out []agentNode
 	seen := map[string]bool{}
 	add := func(id, model string, active bool) {
@@ -1307,7 +1771,10 @@ func (m *Model) stageAgents(s routing.Snapshot, sel routing.RouteView, hasSel bo
 		// request. A busy history day must not turn the stage into a
 		// vertical list of every historical agent.
 		last := map[string]routing.RouteView{}
-		cutoff := time.Now().Add(-routingStageLinger)
+		if now.IsZero() {
+			now = time.Now()
+		}
+		cutoff := now.Add(-routingStageLinger)
 		for _, rv := range routes {
 			key := strings.ToLower(rv.Agent)
 			if _, ok := last[key]; ok {
@@ -1490,9 +1957,40 @@ func drawClippedText(p *ui.Painter, x, y, maxWidth float32, s string, size float
 	if maxWidth <= 0 || s == "" {
 		return
 	}
-	p.Clip(ui.Rect{X: x, Y: y - 2, W: maxWidth, H: size + 8}, 0, func() {
-		p.Text(x, y, s, size, color)
-	})
+	// Truncate with the same measured font metrics rather than wrapping
+	// every text row in Painter.Clip. Besides avoiding an allocation per
+	// row, this keeps a Canvas.Draw callback free of nested clips: MyGo
+	// 0.5.6 samples such a canvas at the wrong origin on some GPUs.
+	p.Text(x, y, fitText(p, s, size, 400, maxWidth), size, color)
+}
+
+// fitTextMeasured truncates a single-line label with native text metrics.
+// It is used where text is laid out outside an Element, so rune-count
+// estimates would drift for mixed Chinese and Latin labels.
+func fitTextMeasured(measure func(float32, ...ui.Span) (float32, float32), s string, size float32, weight int, maxWidth float32) string {
+	if maxWidth <= 0 {
+		return s
+	}
+	width, _ := measure(0, ui.Span{Text: s, Size: size, Weight: weight})
+	if width <= maxWidth {
+		return s
+	}
+	runes := []rune(s)
+	lo, hi := 0, len(runes)
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		candidate := string(runes[:mid]) + "…"
+		w, _ := measure(0, ui.Span{Text: candidate, Size: size, Weight: weight})
+		if w <= maxWidth || mid == 0 {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	if lo <= 0 {
+		return "…"
+	}
+	return string(runes[:lo]) + "…"
 }
 
 func drawGenericIcon(p *ui.Painter, r ui.Rect, color ui.Color) {
@@ -1682,7 +2180,7 @@ func drawCenteredClippedText(p *ui.Painter, s string, cx, y, size float32, color
 	p.Text(cx-width/2, y, s, size, color)
 }
 
-func drawRoutingAccountRow(p *ui.Painter, r ui.Rect, n providerNode, lit, active bool, pal palette, now time.Time, content bool, feedback topologyFeedback, loc Localization) {
+func drawRoutingAccountRow(p *ui.Painter, r ui.Rect, n providerNode, lit, active bool, pal palette, now time.Time, content bool, feedback topologyFeedback, loc Localization, maskBlur, maskOpacity float32) {
 	offsetX := float32(0)
 	if !feedback.at.IsZero() {
 		age := now.Sub(feedback.at)
@@ -1702,14 +2200,14 @@ func drawRoutingAccountRow(p *ui.Painter, r ui.Rect, n providerNode, lit, active
 	}
 	if offsetX != 0 {
 		p.Transform(ui.Translation(offsetX, 0), 0, 0, func() {
-			drawRoutingAccountRowAt(p, r, n, lit, active, pal, now, content, feedback, loc)
+			drawRoutingAccountRowAt(p, r, n, lit, active, pal, now, content, feedback, loc, maskBlur, maskOpacity)
 		})
 		return
 	}
-	drawRoutingAccountRowAt(p, r, n, lit, active, pal, now, content, feedback, loc)
+	drawRoutingAccountRowAt(p, r, n, lit, active, pal, now, content, feedback, loc, maskBlur, maskOpacity)
 }
 
-func drawRoutingAccountRowAt(p *ui.Painter, r ui.Rect, n providerNode, lit, active bool, pal palette, now time.Time, content bool, feedback topologyFeedback, loc Localization) {
+func drawRoutingAccountRowAt(p *ui.Painter, r ui.Rect, n providerNode, lit, active bool, pal palette, now time.Time, content bool, feedback topologyFeedback, loc Localization, maskBlur, maskOpacity float32) {
 	failed := n.Failed
 	finalFailure := n.Failed && !n.WentOn
 	resting := accountResting(n, now)
@@ -1774,24 +2272,7 @@ func drawRoutingAccountRowAt(p *ui.Painter, r ui.Rect, n providerNode, lit, acti
 	if lit || n.Answered || finalFailure {
 		p.Fill(dot, dotColor, 4)
 	}
-	if active {
-		// rtlive: 0% is a tight 40%-opacity ring; by 70% it is a
-		// transparent 6px ring, then it stays invisible through 100%.
-		// Use the drawing clock so pause/reduced-motion naturally stop it.
-		phase := clamp01(float32(now.UnixMilli()%1800) / 1800)
-		k := clamp01(phase / 0.7)
-		ring := 8 + 6*k
-		ringAlpha := 0.4 * (1 - k)
-		if ringAlpha > 0.005 {
-			p.Stroke(
-				ui.Rect{X: dot.X + 4 - ring/2, Y: dot.Y + 4 - ring/2, W: ring, H: ring},
-				dotColor.Alpha(ringAlpha), ring/2, 1,
-			)
-		}
-		if now.IsZero() {
-			p.Stroke(ui.Rect{X: dot.X - 3, Y: dot.Y - 3, W: 14, H: 14}, dotColor.Alpha(0.28), 7, 1)
-		}
-	}
+	_ = active
 
 	status := accountStatusTextLocalized(n, now, loc)
 	statusSize := float32(11.5)
@@ -1856,7 +2337,18 @@ func drawRoutingAccountRowAt(p *ui.Painter, r ui.Rect, n providerNode, lit, acti
 	if sub == "" {
 		sub = "—"
 	}
-	drawClippedText(p, textX, r.Y+22, contentRight-textX, sub, 11, muted)
+	if n.Masked {
+		// Upstream's .pii draws the stand-in account blurred and at half
+		// opacity. Element.Blur is an offscreen layer that MyGo rebuilds
+		// every time the retained tree paints, which made a 60 FPS flight
+		// pay for an otherwise static label. This text belongs to the
+		// cached stage bitmap, so approximate CSS's 2.2px Gaussian with a
+		// small normalized kernel of Painter text calls instead. The
+		// bitmap's key includes blur and opacity, so rtpii still animates.
+		drawMaskedClippedText(p, textX, r.Y+22, contentRight-textX, sub, 11, maskBlur, maskOpacity, muted)
+	} else {
+		drawClippedText(p, textX, r.Y+22, contentRight-textX, sub, 11, muted)
+	}
 	if status != "" {
 		statusX := r.X + r.W - 12 - statusW
 		drawClippedText(p, statusX, r.Y+7, statusW+1, status, statusSize, boolColor(finalFailure, pal.Danger, accountStatusColor(n, pal, now)))
@@ -1868,12 +2360,59 @@ func drawRoutingAccountRowAt(p *ui.Painter, r ui.Rect, n providerNode, lit, acti
 		used := float32(max(0, min(n.Used, 100)) / 100)
 		p.Fill(ui.Rect{X: bar.X, Y: bar.Y, W: bar.W * used, H: bar.H}, pal.Muted, 2)
 	}
-	if failed {
-		label := strings.TrimSpace(strings.Trim(strings.Join([]string{n.Status, failWord(n.Note)}, " · "), "· "))
-		if label == "" {
-			label = "failed"
+	_ = failed
+	_ = feedback
+}
+
+// drawMaskedClippedText paints the same stand-in account that Element.Blur
+// used to paint, without creating an offscreen layer. A 5x5 Gaussian kernel
+// sampled around the glyphs closely matches CSS blur(2.2px) at 11px while
+// remaining just ordinary glyph draws in the static stage canvas.
+func drawMaskedClippedText(p *ui.Painter, x, y, maxWidth float32, s string, size, sigma, opacity float32, color ui.Color) {
+	if maxWidth <= 0 || s == "" || opacity <= 0.001 {
+		return
+	}
+	s = fitText(p, s, size, 400, maxWidth)
+	drawMaskedText(p, x, y, s, size, sigma, opacity, color)
+}
+
+// drawMaskedText paints a deterministic account stand-in with a small
+// normalized Gaussian kernel. It is Painter-only and therefore safe to
+// paint inside a cached Canvas; no retained Element or offscreen effect
+// layer is allocated per frame.
+func drawMaskedText(p *ui.Painter, x, y float32, s string, size, sigma, opacity float32, color ui.Color) {
+	if s == "" || opacity <= 0.001 {
+		return
+	}
+	if sigma <= 0.05 {
+		p.Text(x, y, s, size, color.Alpha(opacity))
+		return
+	}
+	const taps = 7
+	step := sigma * 0.85
+	weights := make([]float32, taps)
+	var sum float32
+	for i := range taps {
+		d := float32(i-(taps-1)/2) * step
+		w := float32(math.Exp(-float64(d*d) / (2 * float64(sigma*sigma))))
+		weights[i] = w
+	}
+	for _, wy := range weights {
+		for _, wx := range weights {
+			sum += wx * wy
 		}
-		drawAccountFailureTag(p, r, label, pal, now, feedback)
+	}
+	for iy := taps - 1; iy >= 0; iy-- {
+		for ix := taps - 1; ix >= 0; ix-- {
+			weight := weights[ix] * weights[iy] / sum
+			dx := float32(ix-(taps-1)/2) * step
+			dy := float32(iy-(taps-1)/2) * step
+			alpha := opacity * weight
+			if alpha <= 0.002 {
+				continue
+			}
+			p.Text(x+dx, y+dy, s, size, color.Alpha(alpha))
+		}
 	}
 }
 
@@ -2353,11 +2892,11 @@ func flightMomentAt(f flightTrack, now time.Time) flightMoment {
 			}
 		}
 		elapsed = max(now.Sub(f.firstSeen), 0)
-	} else if f.done && len(f.phases) > 0 {
-		// Replay time keeps advancing after the recorded completion so
-		// the answer carrier can fly home. It is still the replay clock,
-		// never a fresh live observation.
-		elapsed = f.observed
+	} else if f.inReplay && f.replayPlay {
+		// Each replay build anchors firstSeen to the committed replay
+		// cursor. Painter-only frames advance from that monotonic anchor,
+		// so bird motion stays smooth without rebuilding the whole view.
+		elapsed = max(now.Sub(f.firstSeen), 0)
 	}
 	for _, ph := range f.phases {
 		if elapsed < ph.start {
@@ -2381,6 +2920,22 @@ func flightMomentAt(f flightTrack, now time.Time) flightMoment {
 		return flightMoment{phase: ph, elapsed: elapsed, progress: 1, hasPhase: true}
 	}
 	return flightMoment{}
+}
+
+// flightTraveling reports whether a track is on a titled wire whose bird and
+// flowing dash change every painted frame. Holding at a provider leaves the
+// carrier still, so the dynamic layer asks for no travel frames.
+func flightTraveling(f flightTrack, now time.Time) bool {
+	moment := flightMomentAt(f, now)
+	if !moment.hasPhase || moment.finished {
+		return false
+	}
+	switch moment.phase.kind {
+	case flightOutbound, flightRetryOut, flightRetryBack, flightInbound:
+		return true
+	default:
+		return false
+	}
 }
 
 func currentFlightPhase(f flightTrack, now time.Time) flightMoment {
@@ -2462,7 +3017,7 @@ func drawFlightPath(p *ui.Painter, path flightPath, color ui.Color, width float3
 // drawFlightActor paints the bird and its packet above the nodes: a request
 // dot out, a held request while an account answers, a failure back through
 // the gateway, and the answer home.
-func drawFlightActor(p *ui.Painter, geometry *flightGeometry, agentIndex int, f flightTrack, agentColor ui.Color, pal palette, now time.Time, reduceMotion bool) {
+func (m *Model) drawFlightActor(p *ui.Painter, geometry *flightGeometry, agentIndex int, f flightTrack, agentColor ui.Color, pal palette, now time.Time, reduceMotion bool) {
 	if geometry == nil || agentIndex < 0 || agentIndex >= len(geometry.agents) {
 		return
 	}
@@ -2810,59 +3365,94 @@ func drawMagpieShape(p *ui.Painter, body, belly ui.Color, wing, skew, farWing, f
 	// through MyGo's painter stack. The far wing is currentColor at .45,
 	// like .rt-flier .wing.far.
 	p.Transform(ui.Skewing(farSkew, 0).Then(ui.Scaling(1, farWing)), -12.5, -3.2, func() {
-		var wing ui.Path
-		wing.MoveTo(-14.5, -3.4)
-		wing.CubeTo(-16.5, -9.5, -14.2, -15, -8.6, -18.6)
-		wing.CubeTo(-9.4, -12.6, -9.6, -7.4, -9.2, -3.2)
-		wing.Close()
-		p.FillPath(&wing, alpha(body).Alpha(0.45))
+		p.FillPath(&magpieFarWingPath, alpha(body).Alpha(0.45))
 	})
-	var tail ui.Path
-	tail.MoveTo(-31.5, 3.1)
-	tail.LineTo(-18.6, -1.8)
-	tail.LineTo(-17.4, 1.2)
-	tail.LineTo(-30.8, 4.6)
-	tail.Close()
-	p.FillPath(&tail, alpha(body))
+	p.FillPath(&magpieTailPath, alpha(body))
 
 	// Draw the upstream ellipse exactly as SVG does, using four cubic
 	// segments.
-	p.FillPath(ellipsePath(-12.2, -1.4, 7.6, 3.9), alpha(body))
-	p.FillPath(ellipsePath(-12.8, 0.4, 4.3, 1.6), alpha(belly))
-	var head ui.Path
-	head.Circle(-4.9, -3.7, 3.1)
-	p.FillPath(&head, alpha(body))
-	var beak ui.Path
-	beak.MoveTo(-2.3, -4.8)
-	beak.LineTo(1.4, -3.3)
-	beak.LineTo(-2.3, -2.2)
-	beak.Close()
-	p.FillPath(&beak, alpha(body))
+	p.FillPath(&magpieBodyPath, alpha(body))
+	p.FillPath(&magpieBellyPath, alpha(belly))
+	p.FillPath(&magpieHeadPath, alpha(body))
+	p.FillPath(&magpieBeakPath, alpha(body))
 
 	p.Transform(ui.Skewing(skew, 0).Then(ui.Scaling(1, wing)), -13.1, -2.8, func() {
-		var near ui.Path
-		near.MoveTo(-15.6, -3.2)
-		near.CubeTo(-17.8, -10.2, -15.2, -16.4, -8.4, -20.4)
-		near.CubeTo(-9.3, -13.6, -9.4, -7.8, -8.8, -2.8)
-		near.Close()
-		p.FillPath(&near, alpha(body))
-		var bar ui.Path
-		bar.MoveTo(-14.6, -5.6)
-		bar.CubeTo(-15.4, -10.4, -13.8, -14.4, -10.4, -17.2)
-		p.StrokePath(&bar, 1.3, alpha(belly))
+		p.FillPath(&magpieNearWingPath, alpha(body))
+		p.StrokePath(&magpieWingBarPath, 1.3, alpha(belly))
 	})
 }
 
-func ellipsePath(cx, cy, rx, ry float32) *ui.Path {
+var (
+	magpieFarWingPath  = buildMagpieFarWingPath()
+	magpieTailPath     = buildMagpieTailPath()
+	magpieBodyPath     = buildMagpieEllipsePath(-12.2, -1.4, 7.6, 3.9)
+	magpieBellyPath    = buildMagpieEllipsePath(-12.8, 0.4, 4.3, 1.6)
+	magpieHeadPath     = buildMagpieHeadPath()
+	magpieBeakPath     = buildMagpieBeakPath()
+	magpieNearWingPath = buildMagpieNearWingPath()
+	magpieWingBarPath  = buildMagpieWingBarPath()
+)
+
+func buildMagpieFarWingPath() ui.Path {
+	var pt ui.Path
+	pt.MoveTo(-14.5, -3.4)
+	pt.CubeTo(-16.5, -9.5, -14.2, -15, -8.6, -18.6)
+	pt.CubeTo(-9.4, -12.6, -9.6, -7.4, -9.2, -3.2)
+	pt.Close()
+	return pt
+}
+
+func buildMagpieTailPath() ui.Path {
+	var pt ui.Path
+	pt.MoveTo(-31.5, 3.1)
+	pt.LineTo(-18.6, -1.8)
+	pt.LineTo(-17.4, 1.2)
+	pt.LineTo(-30.8, 4.6)
+	pt.Close()
+	return pt
+}
+
+func buildMagpieEllipsePath(cx, cy, rx, ry float32) ui.Path {
 	const k = 0.5522847498
-	var p ui.Path
-	p.MoveTo(cx+rx, cy)
-	p.CubeTo(cx+rx, cy+ry*k, cx+rx*k, cy+ry, cx, cy+ry)
-	p.CubeTo(cx-rx*k, cy+ry, cx-rx, cy+ry*k, cx-rx, cy)
-	p.CubeTo(cx-rx, cy-ry*k, cx-rx*k, cy-ry, cx, cy-ry)
-	p.CubeTo(cx+rx*k, cy-ry, cx+rx, cy-ry*k, cx+rx, cy)
-	p.Close()
-	return &p
+	var pt ui.Path
+	pt.MoveTo(cx+rx, cy)
+	pt.CubeTo(cx+rx, cy+ry*k, cx+rx*k, cy+ry, cx, cy+ry)
+	pt.CubeTo(cx-rx*k, cy+ry, cx-rx, cy+ry*k, cx-rx, cy)
+	pt.CubeTo(cx-rx, cy-ry*k, cx-rx*k, cy-ry, cx, cy-ry)
+	pt.CubeTo(cx+rx*k, cy-ry, cx+rx, cy-ry*k, cx+rx, cy)
+	pt.Close()
+	return pt
+}
+
+func buildMagpieHeadPath() ui.Path {
+	var pt ui.Path
+	pt.Circle(-4.9, -3.7, 3.1)
+	return pt
+}
+
+func buildMagpieBeakPath() ui.Path {
+	var pt ui.Path
+	pt.MoveTo(-2.3, -4.8)
+	pt.LineTo(1.4, -3.3)
+	pt.LineTo(-2.3, -2.2)
+	pt.Close()
+	return pt
+}
+
+func buildMagpieNearWingPath() ui.Path {
+	var pt ui.Path
+	pt.MoveTo(-15.6, -3.2)
+	pt.CubeTo(-17.8, -10.2, -15.2, -16.4, -8.4, -20.4)
+	pt.CubeTo(-9.3, -13.6, -9.4, -7.8, -8.8, -2.8)
+	pt.Close()
+	return pt
+}
+
+func buildMagpieWingBarPath() ui.Path {
+	var pt ui.Path
+	pt.MoveTo(-14.6, -5.6)
+	pt.CubeTo(-15.4, -10.4, -13.8, -14.4, -10.4, -17.2)
+	return pt
 }
 
 func drawMagpiePacket(p *ui.Painter, x, y float32, agentColor, card ui.Color, carry magpiePacket, outcome packetOutcome) {
@@ -2925,19 +3515,63 @@ func drawFlowingPath(p *ui.Painter, path flightPath, color ui.Color, width float
 	const dash, gap float32 = 3, 5
 	period := dash + gap
 	offset := float32(now.UnixMilli()%700) / float32(700) * period
+	if flow, ok := flightDashPath(path, offset, dash, period); ok {
+		p.StrokePath(&flow, width, color)
+	}
+}
+
+// flightDashPath turns the arc-length polyline into one path of dashes in a
+// single pass. The earlier implementation called flightPath.at twice per
+// 2px sample for every dash, so a normal card-to-provider wire spent most of
+// its animation frame in binary searches. Here each source segment is split
+// only where the 3/5px pattern changes phase.
+func flightDashPath(path flightPath, offset, dash, period float32) (ui.Path, bool) {
+	var out ui.Path
+	if len(path.pts) < 2 || period <= 0 || dash <= 0 {
+		return out, false
+	}
 	length := path.length()
-	var flow ui.Path
-	added := false
 	for d := -offset; d < length; d += period {
 		from := max(d, 0)
 		to := min(d+dash, length)
-		if appendFlightArc(&flow, path, from, to) {
-			added = true
+		if appendFlightArcFast(&out, path, from, to) {
+			continue
 		}
 	}
-	if added {
-		p.StrokePath(&flow, width, color)
+	return out, out.Bounds().W > 0 || out.Bounds().H > 0
+}
+
+// appendFlightArcFast samples an arc directly from the source polyline. It
+// avoids two binary searches per sample while preserving the same end
+// positions and the same 2px step as appendFlightArc.
+func appendFlightArcFast(out *ui.Path, path flightPath, from, to float32) bool {
+	if to-from < 0.1 || len(path.pts) < 2 {
+		return false
 	}
+	at := func(distance float32) (float32, float32) {
+		distance = max(0, min(distance, path.length()))
+		i := sort.Search(len(path.cum), func(i int) bool { return path.cum[i] >= distance })
+		if i == 0 {
+			i = 1
+		}
+		if i >= len(path.pts) {
+			i = len(path.pts) - 1
+		}
+		prev, next := path.pts[i-1], path.pts[i]
+		seg := max(path.cum[i]-path.cum[i-1], 0.001)
+		t := max(0, min((distance-path.cum[i-1])/seg, 1))
+		return prev.x + (next.x-prev.x)*t, prev.y + (next.y-prev.y)*t
+	}
+	x, y := at(from)
+	out.MoveTo(x, y)
+	const step = 2.0
+	for d := from; d < to; d += step {
+		px, py := at(d)
+		out.LineTo(px, py)
+	}
+	x, y = at(to)
+	out.LineTo(x, y)
+	return true
 }
 
 func appendFlightArc(out *ui.Path, path flightPath, from, to float32) bool {
@@ -2968,10 +3602,12 @@ func appendFlightArc(out *ui.Path, path flightPath, from, to float32) bool {
 }
 
 type replayTopology struct {
-	routes  []routing.RouteView
-	playing bool
-	start   time.Time
-	active  bool
+	routes   []routing.RouteView
+	playing  bool
+	start    time.Time
+	position time.Duration
+	speed    float64
+	active   bool
 }
 
 // replayTopologyState returns the completed routes whose presentation flight
@@ -2979,22 +3615,25 @@ type replayTopology struct {
 // phases, so a seek into the return leg reconstructs it without relying on a
 // previous playback pass.
 func (m *Model) replayTopologyState() (replayTopology, bool) {
+	return m.replayTopologyStateAt(time.Now())
+}
+
+func (m *Model) replayTopologyStateAt(now time.Time) (replayTopology, bool) {
 	m.mu.RLock()
 	tab := m.tab
 	replay := m.replay
+	position := m.replayPositionAtLocked(now)
 	snapshot := m.lastSnapshot
 	m.mu.RUnlock()
 	if tab != tabHistory || !replay.loaded || replay.timeline.Duration <= 0 {
 		return replayTopology{}, false
 	}
-	byID := make(map[int64]routing.RouteView, len(snapshot.Routes))
-	for _, rv := range snapshot.Routes {
-		byID[rv.ID] = rv
-	}
+	byID := m.routeViewIndex(snapshot)
 	state := replayTopology{
-		playing: replay.playing, start: replay.timeline.Start, active: true,
+		playing: replay.playing, start: replay.timeline.Start,
+		position: position, speed: replay.speed, active: true,
 	}
-	for _, window := range activeReplayWindows(replay.windows, replay.windowEnds, replay.position) {
+	for _, window := range activeReplayWindows(replay.windows, replay.windowEnds, position) {
 		if rv, ok := byID[window.routeID]; ok {
 			state.routes = append(state.routes, rv)
 			continue
