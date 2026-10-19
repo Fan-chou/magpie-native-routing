@@ -93,6 +93,28 @@ MAGPIE_API_KEY='...' ./bin/magpie-native
 
 诊断只读取 Gateway 和本地历史，不会修改 Magpie。
 
+### 打包与发布
+
+`bin/magpie-native` 是命令行可执行文件，在 Finder 中双击会先打开“终端”。应用包由 MyGo CLI（在 `go.mod` 中作为 tool 固定版本）按 `mygo.json` 生成：
+
+```sh
+go tool mygo build                                  # 本机平台
+go tool mygo build -platform darwin/arm64,windows/amd64
+```
+
+输出在 `build/<os>-<arch>/`：macOS 为 `Magpie Native Routing.app` 与 `.dmg`，Windows 为 GUI 子系统的 `.exe`，安装了 NSIS 时另有 `… Setup … .exe` 安装包。图标为 `resources/icon.png`（由上游 `magpie.svg` 渲染）。
+
+发布由 `.github/workflows/release.yml` 完成：把 `mygo.json` 的 `version` 改为新版本并提交，再推送同名标签：
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+工作流先校验标签与 `mygo.json` 版本一致并创建草稿 Release，运行 `go vet`/`go test`，然后并行打包 macOS（arm64、amd64 的 `.dmg`，macOS runner）与 Windows（amd64、arm64 的安装包，Ubuntu runner + NSIS），全部上传成功后发布 Release。
+
+当前构建未使用开发者证书：macOS 应用为 ad hoc 签名，首次打开需在 Finder 中右键“打开”（或执行 `xattr -dr com.apple.quarantine "/Applications/Magpie Native Routing.app"`）；Windows 安装包未签名，SmartScreen 会提示“仍要运行”。
+
 ## 使用
 
 1. 启动 Magpie Desktop，并保持 Gateway 开启。
