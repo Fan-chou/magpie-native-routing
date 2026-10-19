@@ -53,3 +53,41 @@ func TestDiscoverExplicit(t *testing.T) {
 		t.Fatalf("paths = %+v", p)
 	}
 }
+
+func TestPersistedSettingsKeepsLaunchOverridesOutOfDisk(t *testing.T) {
+	persisted := DefaultSettings()
+	launch := persisted
+	launch.APIKey = "env-key"
+	launch.GatewayURL = "http://127.0.0.1:9999"
+	launch.Theme = ThemeDark
+	launch.Language = "en"
+	launch.MagpieDir = "/tmp/cli-dir"
+
+	// An unrelated save (for example the account-mask button) carries the
+	// injected values and must write the on-disk ones back.
+	in := launch
+	in.HideAccounts = true
+	got := PersistedSettings(in, persisted, launch)
+	want := persisted
+	want.HideAccounts = true
+	if got != want {
+		t.Fatalf("persisted = %+v, want %+v", got, want)
+	}
+
+	// A key the user edited in the dialog is persisted as typed.
+	in.APIKey = "typed-key"
+	got = PersistedSettings(in, persisted, launch)
+	if got.APIKey != "typed-key" {
+		t.Fatalf("APIKey = %q, want typed-key", got.APIKey)
+	}
+	if got.GatewayURL != persisted.GatewayURL {
+		t.Fatalf("GatewayURL = %q, want persisted", got.GatewayURL)
+	}
+
+	// Without overrides, settings pass through unchanged.
+	in = persisted
+	in.APIKey = "k"
+	if got := PersistedSettings(in, persisted, persisted); got != in {
+		t.Fatalf("passthrough = %+v, want %+v", got, in)
+	}
+}

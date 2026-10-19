@@ -44,8 +44,13 @@ type options struct {
 
 type application struct {
 	settings config.AppSettings
-	paths    config.Paths
-	loc      ui.Localization
+	// persisted is the settings file as loaded (then as last saved), and
+	// launch the effective settings after env/CLI overrides. Saves write
+	// config.PersistedSettings so overrides stay process-local.
+	persisted config.AppSettings
+	launch    config.AppSettings
+	paths     config.Paths
+	loc       ui.Localization
 
 	store      *routing.Store
 	client     *magpie.Client
@@ -69,7 +74,7 @@ type application struct {
 
 func main() {
 	opts := parseFlags()
-	cfg, paths, err := loadConfiguration(opts)
+	cfg, persisted, paths, err := loadConfiguration(opts)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, sanitize(err.Error()))
 		os.Exit(1)
@@ -77,7 +82,7 @@ func main() {
 	if opts.diagnose {
 		os.Exit(runDiagnostics(cfg, paths, opts))
 	}
-	if err := runGUI(cfg, paths, opts); err != nil {
+	if err := runGUI(cfg, persisted, paths, opts); err != nil {
 		fmt.Fprintln(os.Stderr, sanitize(err.Error()))
 		os.Exit(1)
 	}
@@ -96,22 +101,27 @@ func parseFlags() options {
 	return o
 }
 
-func loadConfiguration(opts options) (config.AppSettings, config.Paths, error) {
+// loadConfiguration returns the effective settings (disk plus env/CLI
+// overrides), the settings exactly as stored on disk, and the paths.
+func loadConfiguration(opts options) (config.AppSettings, config.AppSettings, config.Paths, error) {
 	// Locate the app's own settings directory before reading Magpie's data.
 	// Discover returns the app paths even when Magpie has not created its
 	// folder yet; loading settings can then override the auto-detected one.
 	base, err := config.Discover("")
 	if err != nil {
-		return config.AppSettings{}, config.Paths{}, err
+		return config.AppSettings{}, config.AppSettings{}, config.Paths{}, err
 	}
 	if err := config.EnsureAppDirs(base); err != nil {
-		return config.AppSettings{}, config.Paths{}, err
+		return config.AppSettings{}, config.AppSettings{}, config.Paths{}, err
 	}
 	settingsStore := config.NewSettingsStore(base.AppConfig)
 	cfg, err := settingsStore.Load()
 	if err != nil {
-		return config.AppSettings{}, config.Paths{}, err
+		return config.AppSettings{}, config.AppSettings{}, config.Paths{}, err
 	}
+	// Overrides below apply to this process only; keep the stored settings so
+	// saves do not write them back.
+	persisted := cfg
 	if v := strings.TrimSpace(opts.gateway); v != "" {
 		cfg.GatewayURL = v
 	}
@@ -131,24 +141,16 @@ func loadConfiguration(opts options) (config.AppSettings, config.Paths, error) {
 		cfg.Language = strings.ToLower(v)
 	}
 	if err := cfg.Validate(); err != nil {
-		return cfg, base, err
-	}
-	if strings.TrimSpace(os.Getenv("MAGPIE_API_KEY")) != "" {
-		// An environment-injected key is applied for this process only. Do
-		// not persist it just because the user launched the app.
-		cfg.APIKey = strings.TrimSpace(os.Getenv("MAGPIE_API_KEY"))
-	}
-	if strings.TrimSpace(opts.apiKey) != "" {
-		cfg.APIKey = strings.TrimSpace(opts.apiKey)
+		return cfg, persisted, base, err
 	}
 	paths, err := config.Discover(cfg.MagpieDir)
 	if err != nil {
-		return cfg, base, err
+		return cfg, persisted, base, err
 	}
-	return cfg, paths, nil
+	return cfg, persisted, paths, nil
 }
 
-func runGUI(cfg config.AppSettings, paths config.Paths, opts options) error {
+func runGUI(cfg, persisted config.AppSettings, paths config.Paths, opts options) error {
 	client, err := magpie.NewClient(magpie.Options{
 		BaseURL: cfg.GatewayURL,
 		APIKey:  cfg.APIKey,
@@ -158,7 +160,7 @@ func runGUI(cfg config.AppSettings, paths config.Paths, opts options) error {
 		return err
 	}
 	app := &application{
-		settings: cfg, paths: paths, loc: ui.NewLocalization(cfg.Language),
+		settings: cfg, persisted: persisted, launch: cfg, paths: paths, loc: ui.NewLocalization(cfg.Language),
 		store:         routing.NewStore(),
 		client:        client,
 		historyReader: routing.NewHistoryReader(paths.RoutingDir),
@@ -388,6 +390,7 @@ func (a *application) saveSettings(cfg config.AppSettings) error {
 	a.mu.Lock()
 	old := a.settings
 	oldPaths := a.paths
+	persisted, launch := a.persisted, a.launch
 	a.mu.Unlock()
 	var newPaths config.Paths
 	if cfg.MagpieDir != old.MagpieDir {
@@ -397,10 +400,13 @@ func (a *application) saveSettings(cfg config.AppSettings) error {
 		}
 		newPaths = paths
 	}
-	if err := config.NewSettingsStore(oldPaths.AppConfig).Save(cfg); err != nil {
+	// Env/CLI overrides the user did not edit stay out of settings.json.
+	toSave := config.PersistedSettings(cfg, persisted, launch)
+	if err := config.NewSettingsStore(oldPaths.AppConfig).Save(toSave); err != nil {
 		return err
 	}
 	a.mu.Lock()
+	a.persisted = toSave
 	a.settings = cfg
 	a.loc = ui.NewLocalization(cfg.Language)
 	a.mu.Unlock()

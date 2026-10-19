@@ -144,3 +144,30 @@ func (s SettingsStore) Save(cfg AppSettings) error {
 	}
 	return nil
 }
+
+// PersistedSettings returns what a Save should write for in. Launch overrides
+// (MAGPIE_API_KEY, -api-key, -gateway, -data-dir, -theme, -lang) apply to the
+// running process only: when a field still equals its launch override, the
+// value read from disk is kept, so an unrelated save never persists it. A
+// field the user changed away from the override is written as edited.
+// persisted is the settings as loaded from disk, launch the effective
+// settings after overrides.
+func PersistedSettings(in, persisted, launch AppSettings) AppSettings {
+	out := in
+	if in.GatewayURL == launch.GatewayURL {
+		out.GatewayURL = persisted.GatewayURL
+	}
+	if in.MagpieDir == launch.MagpieDir {
+		out.MagpieDir = persisted.MagpieDir
+	}
+	if in.APIKey == launch.APIKey {
+		out.APIKey = persisted.APIKey
+	}
+	if in.Theme == launch.Theme {
+		out.Theme = persisted.Theme
+	}
+	if in.Language == launch.Language {
+		out.Language = persisted.Language
+	}
+	return out
+}
