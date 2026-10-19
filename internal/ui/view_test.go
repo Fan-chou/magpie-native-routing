@@ -5,6 +5,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -167,6 +168,51 @@ func TestIdleViewDoesNotRequestContinuousFrames(t *testing.T) {
 	}
 }
 
+func TestRequestLayoutFollowsUpstreamBreakpoints(t *testing.T) {
+	narrow := requestSectionLayout(600)
+	if narrow.twoColumn || narrow.metaUnder {
+		t.Fatalf("600px layout = %+v, want one column without meta-under", narrow)
+	}
+	wide := requestSectionLayout(1240)
+	if !wide.twoColumn || !wide.metaUnder {
+		t.Fatalf("1240px layout = %+v, want accounts beside a meta-under list", wide)
+	}
+	if math.Abs(float64(wide.accountWidth-336)) > 0.1 {
+		t.Fatalf("account column = %.1f, want 28%% of the page", wide.accountWidth)
+	}
+}
+
+func TestAccountTallyUsesCurrentPlanAndAllowance(t *testing.T) {
+	start := time.Date(2026, 10, 19, 12, 10, 0, 0, time.UTC)
+	routes := []routing.RouteView{
+		{Route: routing.Route{
+			ID: 1, Time: start, Provider: "qoder",
+			Order: []routing.Weighed{{
+				ID: "qoder", Provider: "qoder", Name: "Qoder", Who: "first@example.test",
+				Kind: "account", Plan: "Pro", Model: "old-model", Known: true, Used: 20,
+			}},
+		}},
+		{Route: routing.Route{
+			ID: 2, Time: start.Add(time.Minute), Provider: "qoder",
+			Order: []routing.Weighed{{
+				ID: "qoder", Provider: "qoder", Name: "Qoder", Who: "second@example.test",
+				Kind: "account", Plan: "Teams", Model: "new-model", Known: true, Used: 29,
+			}},
+		}},
+	}
+	rows := accountTally(routes)
+	if len(rows) != 1 {
+		t.Fatalf("account tally = %+v, want one", rows)
+	}
+	row := rows[0]
+	if row.Who != "second@example.test" || row.Plan != "Teams" || row.Model != "new-model" {
+		t.Fatalf("latest identity = %+v, want the newest seat", row)
+	}
+	if !row.Known || math.Abs(row.Used-29) > 0.001 || !row.ObservedAt.Equal(start.Add(time.Minute)) {
+		t.Fatalf("latest allowance = %+v, want 29%% at %v", row, start.Add(time.Minute))
+	}
+}
+
 func TestLiveFlightRequestsAnimationFrames(t *testing.T) {
 	now := time.Now()
 	store := routing.NewStore()
@@ -199,7 +245,7 @@ func TestReducedMotionStopsFlightFrames(t *testing.T) {
 	}
 }
 
-func TestStaticStageCanvasReusedAcrossFlightFrames(t *testing.T) {
+func TestFlightFramesReuseStageGeometry(t *testing.T) {
 	now := time.Now()
 	store := routing.NewStore()
 	store.ApplyActive([]routing.LiveRequest{{
@@ -209,24 +255,22 @@ func TestStaticStageCanvasReusedAcrossFlightFrames(t *testing.T) {
 	model, _ := testModel(t, store.Snapshot(), Actions{})
 	tester := render(t, model, 1240, 820)
 	model.mu.RLock()
-	canvas := model.topology.stageCanvas
-	key := model.topology.stageCanvasKey
+	geometry := model.topology.flightGeometry
 	model.mu.RUnlock()
-	if canvas == nil {
-		t.Fatal("stage canvas was not created")
+	if geometry == nil {
+		t.Fatal("flight geometry was not created")
 	}
 	tester.Advance(16 * time.Millisecond)
 	tester.Frame()
 	model.mu.RLock()
-	sameCanvas := model.topology.stageCanvas == canvas
-	sameKey := model.topology.stageCanvasKey == key
+	sameGeometry := model.topology.flightGeometry == geometry
 	model.mu.RUnlock()
-	if !sameCanvas || !sameKey {
-		t.Fatal("static stage canvas was redrawn during a bird-only frame")
+	if !sameGeometry {
+		t.Fatal("a bird-only frame rebuilt the stage geometry")
 	}
 }
 
-func TestStageCanvasResizesWithWindowAndDPI(t *testing.T) {
+func TestStageGeometryTracksWindowAndDPI(t *testing.T) {
 	now := time.Now()
 	store := routing.NewStore()
 	store.ApplyActive([]routing.LiveRequest{{
@@ -236,40 +280,28 @@ func TestStageCanvasResizesWithWindowAndDPI(t *testing.T) {
 	model, _ := testModel(t, store.Snapshot(), Actions{})
 	tester := render(t, model, 1000, 760)
 	model.mu.RLock()
-	before := model.topology.stageCanvas
-	beforeW, beforeH := model.topology.stageCanvasW, model.topology.stageCanvasH
+	before := model.topology.flightGeometry
 	model.mu.RUnlock()
-	if before == nil || beforeW <= 0 || beforeH < int(routingStageMinHeight) {
-		t.Fatalf("initial canvas = %v (%dx%d), want at least the stage minimum %v", before != nil, beforeW, beforeH, routingStageMinHeight)
+	if before == nil {
+		t.Fatal("initial flight geometry was not created")
 	}
 
 	tester.SetSize(1240, 900)
 	tester.Frame()
 	model.mu.RLock()
-	afterResize := model.topology.stageCanvas
-	resizedW, resizedH := model.topology.stageCanvasW, model.topology.stageCanvasH
+	afterResize := model.topology.flightGeometry
 	model.mu.RUnlock()
 	if afterResize == before {
-		t.Fatal("window resize reused a canvas with the old raster size")
-	}
-	if resizedW <= beforeW || resizedH < beforeH {
-		t.Fatalf("resized canvas = %dx%d, want wider than %dx%d and not shorter", resizedW, resizedH, beforeW, beforeH)
-	}
-	if gotW, gotH := afterResize.Size(); gotW != resizedW || gotH != resizedH {
-		t.Fatalf("actual canvas bitmap = %dx%d, tracked %dx%d", gotW, gotH, resizedW, resizedH)
+		t.Fatal("window resize reused geometry from the old layout")
 	}
 
 	tester.SetScale(2)
 	tester.Frame()
 	model.mu.RLock()
-	afterScale := model.topology.stageCanvas
-	scaledW, scaledH := model.topology.stageCanvasW, model.topology.stageCanvasH
+	afterScale := model.topology.flightGeometry
 	model.mu.RUnlock()
-	if afterScale == afterResize {
-		t.Fatal("DPI change reused a canvas rendered for the old scale")
-	}
-	if scaledW != resizedW*2 || scaledH != resizedH*2 {
-		t.Fatalf("High-DPI canvas = %dx%d, want %dx%d", scaledW, scaledH, resizedW*2, resizedH*2)
+	if afterScale != afterResize {
+		t.Fatal("DPI change rebuilt geometry that did not move in DIPs")
 	}
 }
 
@@ -319,6 +351,57 @@ func TestWingFlapMatchesUpstreamKeyframes(t *testing.T) {
 		if math.Abs(float64(scale-c.scale)) > 0.02 || math.Abs(float64(skew-c.skew)) > 0.1 {
 			t.Errorf("wingFrame(%v) = (%v,%v), want (%v,%v)", c.phase, scale, skew, c.scale, c.skew)
 		}
+	}
+}
+
+func TestFlightViaJoinsWiresWithoutHubCenterDetour(t *testing.T) {
+	agent := nodeBox{x: 10, y: 80, w: 124, h: 82}
+	hub := nodeBox{x: 190, y: 70, w: 124, h: 104}
+	provider := nodeBox{x: 370, y: 100, w: 260, h: 44}
+	path := stageOutboundPath(agent, hub, &provider, false)
+	if len(path.pts) < 4 {
+		t.Fatalf("outbound path has only %d points", len(path.pts))
+	}
+	ax, ay := agent.rightCenter()
+	px, py := provider.leftCenter()
+	first, last := path.pts[0], path.pts[len(path.pts)-1]
+	if math.Abs(float64(first.x-ax)) > 0.01 || math.Abs(float64(first.y-ay)) > 0.01 {
+		t.Fatalf("path starts at (%v,%v), want agent anchor (%v,%v)", first.x, first.y, ax, ay)
+	}
+	if math.Abs(float64(last.x-px)) > 0.01 || math.Abs(float64(last.y-py)) > 0.01 {
+		t.Fatalf("path ends at (%v,%v), want provider anchor (%v,%v)", last.x, last.y, px, py)
+	}
+	hcx, hcy := hub.x+hub.w/2, hub.y+hub.h/2
+	for _, pt := range path.pts {
+		if math.Hypot(float64(pt.x-hcx), float64(pt.y-hcy)) < 0.5 {
+			t.Fatal("outbound bird passed through the hub center instead of the via arc")
+		}
+	}
+	// A return is the exact reverse geometry, so it cannot jump lanes.
+	back := path.reversed()
+	if math.Abs(float64(back.length()-path.length())) > 0.01 {
+		t.Fatalf("reverse path length = %v, want %v", back.length(), path.length())
+	}
+	lastBack := back.pts[len(back.pts)-1]
+	if math.Abs(float64(lastBack.x-ax)) > 0.01 || math.Abs(float64(lastBack.y-ay)) > 0.01 {
+		t.Fatalf("reverse path ends at (%v,%v), want agent anchor (%v,%v)", lastBack.x, lastBack.y, ax, ay)
+	}
+}
+
+func TestHeldPacketPulseMatchesRtheldEndpoints(t *testing.T) {
+	pulseAt := func(now time.Time) float32 {
+		phase := float32(now.UnixMilli()%1200) / 1200
+		return 1 - 0.55*cosineEase(phase*2)
+	}
+	base := time.UnixMilli(1_200_000)
+	if got := pulseAt(base); math.Abs(float64(got-1)) > 0.001 {
+		t.Fatalf("rtheld at 0%% = %v, want 1", got)
+	}
+	if got := pulseAt(base.Add(600 * time.Millisecond)); math.Abs(float64(got-0.45)) > 0.001 {
+		t.Fatalf("rtheld at 50%% = %v, want .45", got)
+	}
+	if got := pulseAt(base.Add(1200 * time.Millisecond)); math.Abs(float64(got-1)) > 0.001 {
+		t.Fatalf("rtheld at 100%% = %v, want 1", got)
 	}
 }
 
@@ -393,7 +476,6 @@ func TestNativeMagpiePortraitIsNotBlank(t *testing.T) {
 }
 
 func TestNativeMagpieFlapChangesWingSilhouette(t *testing.T) {
-	pal := colors(nil, config.ThemeDark)
 	render := func(phase float32) *image.RGBA {
 		return ui.NewTester(func(c *ui.Context) {
 			ui.Box(c).Fill().Background(ui.RGB(255, 255, 255)).Draw(func(p *ui.Painter, r ui.Rect) {
@@ -402,7 +484,7 @@ func TestNativeMagpieFlapChangesWingSilhouette(t *testing.T) {
 				p.Transform(ui.Translation(r.X+r.W/2, r.Y+r.H/2), 0, 0, func() {
 					p.Transform(ui.Scaling(5, 5), 0, 0, func() {
 						drawMagpieShape(p, ui.RGB(20, 20, 20), ui.RGB(255, 255, 255),
-							pal.BirdWing, wing, skew, farWing, farSkew, 1)
+							wing, skew, farWing, farSkew, 1)
 					})
 				})
 			})
@@ -420,7 +502,7 @@ func TestNativeMagpieFlapChangesWingSilhouette(t *testing.T) {
 	}
 }
 
-func TestStageCanvasMatchesHighDPIRaster(t *testing.T) {
+func TestStageRendersWithoutRasterGhostingAtHighDPI(t *testing.T) {
 	now := time.Now()
 	store := routing.NewStore()
 	store.ApplyActive([]routing.LiveRequest{{
@@ -430,13 +512,12 @@ func TestStageCanvasMatchesHighDPIRaster(t *testing.T) {
 	model, _ := testModel(t, store.Snapshot(), Actions{})
 	tester := ui.NewTester(model.View, 1240, 820)
 	tester.SetScale(2)
-	tester.SetScale(1)
-	model.mu.RLock()
-	w, h := model.topology.stageCanvasW, model.topology.stageCanvasH
-	model.mu.RUnlock()
-	if w <= 0 || h <= 0 {
-		t.Fatalf("stage canvas has no DIP size: %dx%d", w, h)
+	tester.Frame()
+	img := tester.Image()
+	if img.Bounds().Dx() != 1240*2 || img.Bounds().Dy() != 820*2 {
+		t.Fatalf("high-DPI frame = %v, want %dx%d", img.Bounds(), 1240*2, 820*2)
 	}
+	assertImageHasContrast(t, img, 0, 0, img.Bounds().Dx(), img.Bounds().Dy(), config.ThemeLight)
 }
 
 func TestFlightGeometryCachesOutboundAndInboundPaths(t *testing.T) {
@@ -554,6 +635,10 @@ func TestReplayFlightPausesWithReplayClock(t *testing.T) {
 	store.ReplaceHistory([]routing.Route{{
 		ID: 77, Time: start, Agent: "codex", Model: "qoder/model",
 		Provider: "qoder", Done: true, Status: 200, Millis: 2000,
+		HistoryDay: start.Format("2006-01-02"),
+		Order: []routing.Weighed{{
+			ID: "qoder", Provider: "qoder", Name: "Qoder", Model: "qoder/model",
+		}},
 		Tries: []routing.Try{{
 			ID: "qoder", Model: "qoder/model", Start: start,
 			Millis: 2000, Status: 200, Done: true,
@@ -574,6 +659,12 @@ func TestReplayFlightPausesWithReplayClock(t *testing.T) {
 	model.mu.Unlock()
 	tester := render(t, model, 1240, 900)
 	tester.Frame()
+	model.mu.RLock()
+	flights := len(model.topology.flights)
+	model.mu.RUnlock()
+	if flights == 0 {
+		t.Fatal("paused replay fixture did not produce a real flight to test")
+	}
 	if tester.FramePending() {
 		t.Fatal("a paused history replay requested animation frames")
 	}
@@ -585,6 +676,9 @@ func TestReplayPauseStopsFramesWithLivePhaseFeedback(t *testing.T) {
 	store.ReplaceHistory([]routing.Route{{
 		ID: 78, Time: start, Agent: "codex", Model: "qoder/model",
 		Provider: "qoder", Done: true, Status: 200, Millis: 2000,
+		Order: []routing.Weighed{{
+			ID: "qoder", Provider: "qoder", Name: "Qoder", Model: "qoder/model",
+		}},
 		Tries: []routing.Try{{
 			ID: "qoder", Model: "qoder/model", Start: start,
 			Millis: 2000, Status: 200, Done: true,
@@ -990,6 +1084,114 @@ func TestRoutingStatsCountRequestsNotTries(t *testing.T) {
 	}
 }
 
+func TestRoutingModeEmptyMeansSmartOnlyWithObservedEvidence(t *testing.T) {
+	cfg := routing.ConfigSnapshot{Providers: []routing.ProviderInfo{{
+		ID: "openai", Name: "OpenAI", Routing: "",
+	}}}
+	withOrder := routing.RouteView{Route: routing.Route{
+		Time: time.Now(), Model: "openai/gpt-6",
+		Order: []routing.Weighed{{ID: "key-a", Provider: "openai", Model: "gpt-6"}},
+	}}
+	if got := stageRoutingMode(withOrder, true, cfg); got != "Smart" {
+		t.Fatalf("empty order routing = %q, want Smart", got)
+	}
+	observedWithoutConfig := withOrder
+	if got := stageRoutingMode(observedWithoutConfig, true, routing.ConfigSnapshot{}); got != "Smart" {
+		t.Fatalf("observed order with no config = %q, want Smart", got)
+	}
+	configOnly := routing.RouteView{Route: routing.Route{
+		Time: time.Now(), Model: "openai/gpt-6", Provider: "openai",
+	}}
+	if got := stageRoutingMode(configOnly, true, cfg); got != "Smart" {
+		t.Fatalf("empty provider routing = %q, want Smart", got)
+	}
+	unknown := routing.RouteView{Route: routing.Route{Time: time.Now(), Model: "other/model"}}
+	if got := stageRoutingMode(unknown, true, cfg); got != "routing ?" {
+		t.Fatalf("unobserved mode = %q, want an honest unknown", got)
+	}
+	if got := stageRoutingMode(withOrder, false, cfg); got != "" {
+		t.Fatalf("no selected route mode = %q, want empty", got)
+	}
+}
+
+func TestRoutingModeNamesMatchUpstreamVocabulary(t *testing.T) {
+	cases := map[string]string{
+		"":       "Smart",
+		"order":  "In order",
+		"rotate": "In turn",
+		"usage":  "Least used",
+		"pace":   "Weekly pace",
+		"manual": "Manual",
+		"weight": "By weight",
+	}
+	for id, want := range cases {
+		rv := routing.RouteView{Route: routing.Route{
+			Group: &routing.GroupRef{ID: "g", Routing: id},
+		}}
+		if got := routeModeLabel(rv, true, "", true); got != want {
+			t.Errorf("mode %q = %q, want %q", id, got, want)
+		}
+	}
+}
+
+func TestAccountStatusUsesUpstreamFailureAndRestWords(t *testing.T) {
+	now := time.Date(2026, 10, 19, 6, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name string
+		row  providerNode
+		want string
+	}{
+		{
+			name: "went on with status and mapped reason",
+			row: providerNode{
+				WentOn: true, Status: "HTTP 500", Note: "rate",
+			},
+			want: "HTTP 500 · rate limited · went on to the next",
+		},
+		{
+			name: "rest with reason and countdown",
+			row: providerNode{
+				Rest: true, RestWhy: "rate",
+				RestUntil: now.Add(90 * time.Second),
+			},
+			want: "rate limited · back in 2m",
+		},
+		{
+			name: "rest without separator when reason absent",
+			row: providerNode{
+				Rest: true, RestUntil: now.Add(30 * time.Second),
+			},
+			want: "back in 30s",
+		},
+		{
+			name: "final failure keeps literal unknown reason",
+			row: providerNode{
+				Failed: true, Status: "HTTP 418", Note: "vendor-specific reason",
+			},
+			want: "HTTP 418 · vendor-specific reason",
+		},
+	}
+	for _, c := range cases {
+		if got := accountStatusText(c.row, now); got != c.want {
+			t.Errorf("%s = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+func TestRestingRowExpiresWhenClockPassesUntil(t *testing.T) {
+	now := time.Now()
+	row := providerNode{Rest: true, RestUntil: now.Add(time.Second)}
+	if !accountResting(row, now) {
+		t.Fatal("future rest was not treated as resting")
+	}
+	if accountResting(row, now.Add(2*time.Second)) {
+		t.Fatal("expired rest stayed active")
+	}
+	if !accountResting(providerNode{Rest: true}, now) {
+		t.Fatal("a rest without an end should remain resting")
+	}
+}
+
 func TestProviderRowsUseReadOnlyConfigIdentity(t *testing.T) {
 	rv := routing.RouteView{Route: routing.Route{
 		ID: 920, Time: time.Now(), Agent: "codex", Model: "deepseek/deepseek-flash",
@@ -1010,25 +1212,6 @@ func TestProviderRowsUseReadOnlyConfigIdentity(t *testing.T) {
 	}
 	if rows[0].Name != "DeepSeek" || rows[0].Icon != "deepseek-color" {
 		t.Fatalf("config identity = name %q icon %q", rows[0].Name, rows[0].Icon)
-	}
-}
-
-func TestStageCanvasKeyChangesWithBrandIdentityAndGateway(t *testing.T) {
-	pal := colors(nil, config.ThemeLight)
-	agents := []agentNode{{ID: "codex", Icon: "codex-color"}}
-	rows := []providerNode{{Provider: "openai", Icon: "openai", Model: "gpt-6"}}
-	a := stageCanvasKey(agents, rows, "", false, pal, true, "127.0.0.1:3425", nil, nil)
-	b := stageCanvasKey(agents, rows, "", false, pal, true, "127.0.0.1:3425", nil, nil)
-	if a != b {
-		t.Fatal("stable stage key changed between identical frames")
-	}
-	rows[0].Icon = "anthropic"
-	if c := stageCanvasKey(agents, rows, "", false, pal, true, "127.0.0.1:3425", nil, nil); c == a {
-		t.Fatal("provider logo change did not invalidate the static canvas")
-	}
-	rows[0].Icon = "openai"
-	if d := stageCanvasKey(agents, rows, "", false, pal, true, "127.0.0.1:4000", nil, nil); d == a {
-		t.Fatal("gateway address change did not invalidate the hub text canvas")
 	}
 }
 
@@ -1081,6 +1264,49 @@ func TestNarrowLayoutAndRequestSectionDoNotClip(t *testing.T) {
 		if r, ok := tester.Find(label); ok && (r.X < 0 || r.X+r.W > 600) {
 			t.Fatalf("%s control clipped by narrow window: %+v", label, r)
 		}
+	}
+}
+
+func TestReplaySeekIntoAwayTailKeepsInboundBirdAlive(t *testing.T) {
+	start := time.Date(2026, 10, 19, 3, 10, 0, 0, time.UTC)
+	route := routing.Route{
+		ID: 89, Time: start, Agent: "codex", Model: "qoder/model",
+		Provider: "qoder", Done: true, Status: 200, Millis: 2000,
+		HistoryDay: start.Format("2006-01-02"),
+		Tries: []routing.Try{{
+			ID: "qoder", Model: "qoder/model", Start: start,
+			Millis: 2000, Status: 200, Done: true,
+		}},
+	}
+	store := routing.NewStore()
+	store.ReplaceHistory([]routing.Route{route})
+	model, _ := testModel(t, store.Snapshot(), Actions{})
+	model.setTab(tabHistory)
+	model.SetHistoryDay(start.Format("2006-01-02"))
+	tester := render(t, model, 1240, 900)
+	routes := store.Snapshot().Routes
+	attempts, total := traceFlightAttempts(routes[0])
+	phases := buildFlightPhases(attempts, total, true)
+	end := flightPhaseEnd(phases)
+	position := end + 200*time.Millisecond
+	if position >= end+flightAwayDuration {
+		t.Fatalf("seek position %v is not inside the away tail", position)
+	}
+	model.seekReplay(position.Seconds())
+	tester.Frame()
+	model.mu.RLock()
+	flights := append([]flightTrack(nil), model.topology.flights...)
+	model.mu.RUnlock()
+	if len(flights) != 1 {
+		t.Fatalf("away-tail seek reconstructed %d flights, want 1", len(flights))
+	}
+	moment := flightMomentAt(flights[0], start.Add(position))
+	release := moment.local - (moment.phase.end - moment.phase.start)
+	if moment.phase.kind != flightInbound || moment.progress < 1 || release < 0 || release >= flightAwayDuration {
+		t.Fatalf("away-tail moment = %+v, want an inbound bird in its 450ms away tail", moment)
+	}
+	if tester.FramePending() {
+		t.Fatal("paused away-tail seek requested animation frames")
 	}
 }
 
@@ -1137,10 +1363,10 @@ func TestRoutingStageKeepsAllConcurrentNodes(t *testing.T) {
 	}
 	tester := render(t, model, 1240, 1200)
 	model.mu.RLock()
-	canvasH := model.topology.stageCanvasH
+	geometry := model.topology.flightGeometry
 	model.mu.RUnlock()
-	if canvasH < int(height) {
-		t.Fatalf("stage canvas height = %d, want at least %.0f for all concurrent nodes", canvasH, height)
+	if geometry == nil || len(geometry.agents) != len(agents) || len(geometry.rows) != len(rows) {
+		t.Fatalf("flight geometry = %+v, want all %d agents and %d rows", geometry, len(agents), len(rows))
 	}
 
 	model.syncFlightTracks(model.snapshot(), model.snapshot().Routes, now)
@@ -1210,7 +1436,7 @@ func TestHistoryViewLabelsReplayAndHasControls(t *testing.T) {
 	}
 	// Presentation time runs until the final return leg lands; recorded
 	// request duration itself remains 150ms.
-	tester.Advance(4500 * time.Millisecond)
+	tester.Advance(5000 * time.Millisecond)
 	tester.Frame()
 	if !tester.HasText("Play") {
 		t.Fatalf("playback did not stop at the timeline end: %v", tester.Texts())
@@ -1281,5 +1507,245 @@ func TestLiveAndHistoryMergeStaysLabeled(t *testing.T) {
 	tester := render(t, model, 1240, 900)
 	if !tester.HasText("Live and completed history") {
 		t.Fatalf("merged route provenance is not explicit: %v", tester.Texts())
+	}
+}
+
+func TestProviderRowsFoldTryIntoExactOrderSeat(t *testing.T) {
+	start := time.Date(2026, 10, 19, 7, 0, 0, 0, time.UTC)
+	rv := routing.RouteView{Route: routing.Route{
+		ID: 1201, Time: start, Agent: "codex", Model: "openai/gpt-6",
+		Done: true, Status: 200, Order: []routing.Weighed{
+			{ID: "key-a", Provider: "openai", Name: "OpenAI", Who: "alice", Model: "gpt-6"},
+			{ID: "key-b", Provider: "openai", Name: "OpenAI", Who: "bob", Model: "gpt-5.6"},
+		},
+		Tries: []routing.Try{{
+			ID: "key-b", Model: "openai/gpt-5.6", Start: start,
+			Millis: 200, Status: 200, Done: true,
+		}},
+	}}
+	rows := providerRows(rv, false)
+	if len(rows) != 2 {
+		t.Fatalf("rows = %+v, want exactly two order seats", rows)
+	}
+	if rows[1].AccountID != "key-b" || rows[1].Model != "gpt-5.6" {
+		t.Fatalf("try was not folded into its exact seat: %+v", rows[1])
+	}
+	if !rows[1].Answered {
+		t.Fatal("the exact seat to which the try went is not marked answered")
+	}
+}
+
+func TestProviderRowsKeepUnmatchedAccountAsExplicitTry(t *testing.T) {
+	start := time.Date(2026, 10, 19, 7, 10, 0, 0, time.UTC)
+	rv := routing.RouteView{Route: routing.Route{
+		ID: 1202, Time: start, Agent: "codex", Model: "openai/gpt-6",
+		Done: true, Status: 200, Order: []routing.Weighed{{
+			ID: "key-a", Provider: "openai", Name: "OpenAI", Model: "gpt-6",
+		}},
+		Tries: []routing.Try{{
+			ID: "key-z", Model: "openai/gpt-6", Start: start,
+			Millis: 200, Status: 200, Done: true,
+		}},
+	}}
+	rows := providerRows(rv, false)
+	if len(rows) != 2 {
+		t.Fatalf("rows = %+v, want the order row plus the unmatched observed try", rows)
+	}
+	if rows[1].AccountID != "key-z" {
+		t.Fatalf("unmatched try account = %q, want key-z", rows[1].AccountID)
+	}
+}
+
+func TestMagpieFlipPlacesBeakOnFlightSide(t *testing.T) {
+	pal := colors(nil, config.ThemeDark)
+	renderBird := func(flip float32) *image.RGBA {
+		return ui.NewTester(func(c *ui.Context) {
+			ui.Box(c).Fill().Background(ui.RGB(255, 255, 255)).Draw(func(p *ui.Painter, r ui.Rect) {
+				drawMagpie(p, magpiePose{
+					x: r.X + r.W/2, y: r.Y + r.H/2, scale: 2, flip: flip,
+					body: pal.BirdBody, belly: pal.BirdBelly, far: pal.BirdWing,
+					appear: 1,
+				}, ui.Hex("#6366f1"), magpieCarryNone, packetOutcomeUnknown, true)
+			})
+		}, 180, 140).Image()
+	}
+	right, left := renderBird(1), renderBird(-1)
+	silhouette := func(img *image.RGBA) (float64, int) {
+		var sum float64
+		n := 0
+		for y := 0; y < img.Bounds().Dy(); y++ {
+			for x := 0; x < img.Bounds().Dx(); x++ {
+				i := img.PixOffset(x, y)
+				if img.Pix[i] < 220 || img.Pix[i+1] < 220 || img.Pix[i+2] < 220 {
+					sum += float64(x)
+					n++
+				}
+			}
+		}
+		if n == 0 {
+			return 0, 0
+		}
+		return sum / float64(n), n
+	}
+	rightBird, rn := silhouette(right)
+	leftBird, ln := silhouette(left)
+	if rn == 0 || ln == 0 {
+		t.Fatalf("bird pixels missing: right=%d left=%d", rn, ln)
+	}
+	if !(leftBird > rightBird+4) {
+		t.Fatalf("flipped bird centroid = %.1f, right-facing = %.1f; bird did not face the flight direction", leftBird, rightBird)
+	}
+}
+
+func TestRestingCountdownRequestsOnlyIdleRepaint(t *testing.T) {
+	now := time.Now()
+	rows := []providerNode{{Rest: true, RestUntil: now.Add(90 * time.Second)}}
+	if !restingCountdownVisible(rows, now) {
+		t.Fatal("active countdown did not request a timed repaint")
+	}
+	if restingCountdownVisible(rows, now.Add(2*time.Minute)) {
+		t.Fatal("expired countdown kept requesting frames")
+	}
+	if restingCountdownVisible([]providerNode{{Rest: true}}, now) {
+		t.Fatal("a rest with no known end is static and needs no countdown frame")
+	}
+}
+
+func TestStageDoesNotAppendSelectedConcurrencyAliasAsAccount(t *testing.T) {
+	now := time.Now()
+	route := routing.RouteView{Route: routing.Route{
+		ID: 1300, Time: now, Agent: "codex", Model: "group/auto-model",
+		Provider: "qoder",
+		Order: []routing.Weighed{{
+			ID: "qoder", Provider: "qoder", Name: "Qoder", Model: "dfmodel", Who: "alice",
+		}},
+		Tries: []routing.Try{{
+			ID: "qoder", Model: "qoder/dfmodel", Start: now, Done: false,
+		}},
+	}}
+	route.Active = true
+	store := routing.NewStore()
+	store.ApplyActive([]routing.LiveRequest{{
+		ID: 9, RouteID: route.ID, Agent: "codex", Provider: "qoder",
+		Model: "group/auto-model", Started: now, Phase: routing.PhaseUpstream,
+	}})
+	model, _ := testModel(t, store.Snapshot(), Actions{})
+	snap := model.snapshot()
+	snap.Routes = []routing.RouteView{route}
+	rows := model.stageAccountRows(route, true, snap.Live, nil, false)
+	if len(rows) != 1 {
+		t.Fatalf("selected live stage rows = %+v, want only the trace account", rows)
+	}
+	if rows[0].Model != "dfmodel" || rows[0].AccountID != "qoder" {
+		t.Fatalf("stage row = %+v, want the real qoder/dfmodel seat", rows[0])
+	}
+}
+
+func TestOutcomeUsesOrderWhoInsteadOfRepeatingModel(t *testing.T) {
+	start := time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)
+	rv := routing.RouteView{Route: routing.Route{
+		ID: 1401, Time: start, Agent: "codex", Model: "group/auto-deepseek-flash",
+		Provider: "qoder", Done: true, Status: 200,
+		Order: []routing.Weighed{
+			{ID: "qoder", Provider: "qoder", Name: "Qoder", Who: "user@example.test", Model: "dfmodel", Kind: "account"},
+			{ID: "deepseek", Provider: "deepseek", Name: "DeepSeek", Model: "deepseek-flash", Kind: "provider"},
+		},
+		Tries: []routing.Try{{
+			ID: "qoder", Model: "dfmodel", Served: "dfmodel", Start: start,
+			Millis: 1200, Status: 200, Done: true,
+		}},
+	}}
+	said, how, _ := routeOutcome(rv)
+	if how != "ok" || said != "user@example.test · dfmodel" {
+		t.Fatalf("outcome = %q/%q, want the real account and served model once", said, how)
+	}
+	if strings.Contains(said, "qoder") || said == "dfmodel · dfmodel" {
+		t.Fatalf("outcome repeated internal or duplicate identity: %q", said)
+	}
+}
+
+func TestAccountTallyUsesOrderSeatNotUnmatchedTry(t *testing.T) {
+	start := time.Date(2026, 10, 19, 12, 10, 0, 0, time.UTC)
+	rv := routing.RouteView{Route: routing.Route{
+		ID: 1402, Time: start, Agent: "codex", Model: "group/auto-deepseek-flash",
+		Provider: "qoder", Done: true, Status: 200,
+		Order: []routing.Weighed{{
+			ID: "qoder", Provider: "qoder", Name: "Qoder", Who: "user@example.test",
+			Model: "dfmodel", Kind: "account",
+		}},
+		Tries: []routing.Try{{
+			ID: "qoder", Model: "dfmodel", Start: start,
+			Millis: 1200, Status: 200, Done: true,
+		}},
+	}}
+	rows := accountTally([]routing.RouteView{rv})
+	if len(rows) != 1 {
+		t.Fatalf("account tally = %+v, want exactly one recorded seat", rows)
+	}
+	if rows[0].Who != "user@example.test" || rows[0].Model != "dfmodel" || rows[0].OK != 1 {
+		t.Fatalf("account tally identity = %+v", rows[0])
+	}
+}
+
+func TestLiveRoutesAreLimitedToOriginalSixtyWindow(t *testing.T) {
+	routes := make([]routing.RouteView, 0, liveRouteLimit+5)
+	base := time.Date(2026, 10, 19, 0, 0, 0, 0, time.UTC)
+	for i := 0; i < liveRouteLimit+5; i++ {
+		routes = append(routes, routing.RouteView{Route: routing.Route{
+			ID: int64(i + 1), Time: base.Add(time.Duration(i) * time.Second),
+			Agent: "codex", Model: "m", Done: true, Status: 200,
+			HistoryDay: "2026-10-19",
+		}, Completeness: routing.Completeness{History: true}})
+	}
+	model, _ := testModel(t, routing.Snapshot{Routes: routes}, Actions{})
+	got := model.visibleRoutes(model.snapshot(), false)
+	if len(got) != liveRouteLimit {
+		t.Fatalf("live routes = %d, want the original 60-row map window", len(got))
+	}
+	model.setTab(tabHistory)
+	model.SetHistoryDay("2026-10-19")
+	day := model.visibleRoutes(model.snapshot(), false)
+	if len(day) != len(routes) {
+		t.Fatalf("history day routes = %d, want all %d", len(day), len(routes))
+	}
+}
+
+func TestToolbarTabsSwitchRealViews(t *testing.T) {
+	model, _ := testModel(t, routing.Snapshot{
+		GatewayOnline: true, LastPoll: time.Now(),
+	}, Actions{})
+	tester := render(t, model, 1240, 820)
+	tester.SetTitleBar(ui.TitleBar{Height: 50, Left: 82})
+	tester.Frame()
+	if err := tester.Click("History"); err != nil {
+		t.Fatal(err)
+	}
+	tester.Frame()
+	if got := model.tabKind(); got != tabHistory {
+		t.Fatalf("toolbar History selected tab %v", got)
+	}
+	if err := tester.Click("Groups"); err != nil {
+		t.Fatal(err)
+	}
+	tester.Frame()
+	if got := model.tabKind(); got != tabGroups {
+		t.Fatalf("toolbar Groups selected tab %v", got)
+	}
+	if err := tester.Click("Live"); err != nil {
+		t.Fatal(err)
+	}
+	tester.Frame()
+	if got := model.tabKind(); got != tabLive {
+		t.Fatalf("toolbar Live selected tab %v", got)
+	}
+}
+
+func TestNamedAndPrintfLocalizationPlaceholders(t *testing.T) {
+	en := NewLocalization("en")
+	if got := en.F("routing.listScope", 60); got != "the last 60 the gateway keeps" {
+		t.Fatalf("named placeholder = %q", got)
+	}
+	if got := en.F("routing.accountTally.tried", 7); got != "tried 7" {
+		t.Fatalf("printf placeholder = %q", got)
 	}
 }

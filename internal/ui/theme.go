@@ -29,6 +29,12 @@ type palette struct {
 	DangerSoft  ui.Color
 	Violet      ui.Color
 	Cyan        ui.Color
+	C1          ui.Color
+	C2          ui.Color
+	C3          ui.Color
+	C4          ui.Color
+	C5          ui.Color
+	C6          ui.Color
 	Shadow      ui.Color
 	RouteIdle   ui.Color
 	RouteLit    ui.Color
@@ -77,6 +83,12 @@ func colors(c *ui.Context, mode config.ThemeMode) palette {
 			DangerSoft:  ui.Hex("#45272a"),
 			Violet:      ui.Hex("#c4b5fd"),
 			Cyan:        ui.Hex("#7dd3fc"),
+			C1:          ui.Hex("#a5b4fc"),
+			C2:          ui.Hex("#7dd3fc"),
+			C3:          ui.Hex("#6ee7b7"),
+			C4:          ui.Hex("#fcd34d"),
+			C5:          ui.Hex("#f9a8d4"),
+			C6:          ui.Hex("#c4b5fd"),
 			Shadow:      ui.RGBA(0, 0, 0, 0.32),
 			RouteIdle:   ui.Hex("#333339"),
 			RouteLit:    ui.Hex("#a5b4fc"),
@@ -110,6 +122,12 @@ func colors(c *ui.Context, mode config.ThemeMode) palette {
 		DangerSoft:  ui.Hex("#fbe9e9"),
 		Violet:      ui.Hex("#8b5cf6"),
 		Cyan:        ui.Hex("#0ea5e9"),
+		C1:          ui.Hex("#4f46e5"),
+		C2:          ui.Hex("#0ea5e9"),
+		C3:          ui.Hex("#10b981"),
+		C4:          ui.Hex("#f59e0b"),
+		C5:          ui.Hex("#ec4899"),
+		C6:          ui.Hex("#8b5cf6"),
 		Shadow:      ui.RGBA(20, 22, 30, 0.10),
 		RouteIdle:   ui.Hex("#e3e3e8"),
 		RouteLit:    ui.Hex("#4f46e5"),

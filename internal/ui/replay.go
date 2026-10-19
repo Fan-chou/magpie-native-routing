@@ -79,7 +79,7 @@ func buildReplayFlightWindows(tl routing.ReplayTimeline, routes []routing.RouteV
 		windows = append(windows, replayFlightWindow{
 			routeID: rv.ID,
 			start:   start,
-			end:     start + flightPhaseEnd(phases),
+			end:     start + flightPhaseEnd(phases) + flightAwayDuration,
 		})
 	}
 	sort.SliceStable(windows, func(i, j int) bool {
@@ -145,7 +145,7 @@ func replayPresentationDuration(tl routing.ReplayTimeline, routes []routing.Rout
 		if at < 0 {
 			at = 0
 		}
-		end = max(end, at+flightPhaseEnd(phases))
+		end = max(end, at+flightPhaseEnd(phases)+flightAwayDuration)
 	}
 	return end
 }

@@ -36,6 +36,10 @@ const (
 	tabGroups
 )
 
+// liveRouteLimit is client.js's last 60 routes: the gateway's live trace
+// window, not every request found in today's completed history file.
+const liveRouteLimit = 60
+
 // Model owns UI-only state. It never performs I/O and reads only immutable
 // routing snapshots.
 type Model struct {
@@ -78,6 +82,7 @@ type Model struct {
 	groupID      string
 	groupNotice  string
 	splitPercent float32
+	contextOpen  bool
 	topology     topologyState
 	lastSnapshot routing.Snapshot
 }
@@ -106,16 +111,12 @@ type replayFlightWindow struct {
 }
 
 type topologyState struct {
-	flights          []flightTrack
-	frameAt          time.Time
-	stageCanvas      *ui.Canvas
-	stageCanvasKey   string
-	stageCanvasW     int
-	stageCanvasH     int
-	stageCanvasScale float32
-	flightGeometry   *flightGeometry
-	reduceMotion     bool
-	layout           topologyFrameLayout
+	flights        []flightTrack
+	frameAt        time.Time
+	stageGeometry  *flightGeometry
+	flightGeometry *flightGeometry
+	reduceMotion   bool
+	layout         topologyFrameLayout
 }
 
 type topologyFeedback struct {
@@ -128,27 +129,28 @@ type topologyFeedback struct {
 // exact Magpie Route ID and every timing input comes from the observed route.
 // It never creates a request that is absent from the snapshot.
 type flightTrack struct {
-	routeID   int64
-	agent     string
-	model     string
-	provider  string
-	accountID string
-	who       string
-	firstSeen time.Time
-	lastSeen  time.Time
-	removedAt time.Time
-	doneAt    time.Time
-	returnDur time.Duration
-	observed  time.Duration
-	total     time.Duration
-	attempts  []flightAttempt
-	phases    []flightPhase
-	inReplay  bool
-	failed    bool
-	done      bool
-	phaseKey  string
-	phaseKind flightPhaseKind
-	phaseAt   time.Time
+	routeID     int64
+	agent       string
+	model       string
+	provider    string
+	accountID   string
+	who         string
+	firstSeen   time.Time
+	lastSeen    time.Time
+	removedAt   time.Time
+	doneAt      time.Time
+	returnDur   time.Duration
+	observed    time.Duration
+	total       time.Duration
+	attempts    []flightAttempt
+	phases      []flightPhase
+	inReplay    bool
+	failed      bool
+	done        bool
+	phaseKey    string
+	phaseKind   flightPhaseKind
+	phaseFailed bool
+	phaseAt     time.Time
 }
 
 // flightAttempt is the geometry-independent part of one recorded attempt.
@@ -348,6 +350,18 @@ func (m *Model) toggleAccountMask() {
 	m.mu.Unlock()
 }
 
+func (m *Model) toggleContextCard() {
+	m.mu.Lock()
+	m.contextOpen = !m.contextOpen
+	m.mu.Unlock()
+}
+
+func (m *Model) contextCardOpen() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.contextOpen
+}
+
 func (m *Model) setSettingsOpen(open bool) {
 	m.mu.Lock()
 	m.settingsOpen = open
@@ -499,13 +513,22 @@ func (m *Model) filters() routing.RouteFilter {
 func (m *Model) visibleRoutes(s routing.Snapshot, replayOnly bool) []routing.RouteView {
 	m.mu.RLock()
 	f := routing.RouteFilter{Query: m.query, Status: m.status}
-	if m.tab == tabHistory {
+	tab := m.tab
+	if tab == tabHistory {
 		f.HistoryDay = m.historyDay
 	}
 	replay := m.replay
 	selected := m.selectedID
 	m.mu.RUnlock()
 	routes := f.Apply(s.Routes)
+	if tab == tabLive && f.HistoryDay == "" {
+		// The original keeps 60 routes in its live map. Today's JSONL may
+		// contain thousands; those belong to the day view and must not
+		// pollute live stats or the account tally.
+		if len(routes) > liveRouteLimit {
+			routes = routes[:liveRouteLimit]
+		}
+	}
 	if replayOnly && replay.loaded && replay.timeline.Duration > 0 {
 		started, _ := routing.ReplayVisibleRoutes(replay.timeline, replay.position)
 		allowed := make(map[int64]bool, len(started))
@@ -761,13 +784,6 @@ func providerRows(r routing.RouteView, hidden bool) []providerNode {
 		failed := false
 		status := ""
 		note := ""
-		if i < len(r.Tries) {
-			tr := r.Tries[i]
-			failed = tryFailed(tr)
-			status = tryStatus(tr)
-			note = routing.TryFailure(tr)
-			current = !tr.Done && tr.Fail == "" && tr.Error == ""
-		}
 		if w.Barred {
 			note = "barred"
 		}
@@ -775,23 +791,51 @@ func providerRows(r routing.RouteView, hidden bool) []providerNode {
 		if len(out) > i {
 			out[i].Fallback = w.Fallback
 			out[i].Rest = w.Rest != nil
-			out[i].Answered = i < len(r.Tries) && r.Tries[i].Done && !tryFailed(r.Tries[i])
-			out[i].WentOn = i < len(r.Tries) && r.Tries[i].Done && tryFailed(r.Tries[i]) && i+1 < len(r.Tries)
+			if w.Rest != nil {
+				out[i].RestWhy = w.Rest.Why
+				out[i].RestUntil = w.Rest.Until
+			}
 			out[i].Known = w.Known
 			out[i].Used = w.Used
 		}
 	}
-	for _, tr := range r.Tries {
+	for ti, tr := range r.Tries {
 		provider := providerOf(tr.Model)
 		if provider == "" {
 			provider = tr.ID
 		}
-		if len(r.Order) > 0 && providerMatchesOrder(r.Order, provider, tr.Model) {
-			continue
+		// traceAttemptTarget is the authoritative seat mapping used by the
+		// flight layer. Resolve the Try against the already-built order rows
+		// with that same function; providerMatchesOrder alone was too weak
+		// and could leave an alias/account mismatch as a duplicate row.
+		target := traceAttemptTarget(r, tr)
+		row := -1
+		for ri := range out {
+			if providerMatchScore(out[ri], target) > 0 {
+				row = ri
+				break
+			}
 		}
-		status := tryStatus(tr)
-		add(provider, provider, tr.Served, tr.Model, tr.ID, "", providerIconKey(r, provider, tr), status, routing.TryFailure(tr), "", "", "",
-			r.Active && !tr.Done && !tryFailed(tr), tryFailed(tr))
+		if row < 0 {
+			add(provider, provider, tr.Served, tr.Model, tr.ID, "", providerIconKey(r, provider, tr),
+				tryStatus(tr), routing.TryFailure(tr), "", "", "",
+				r.Active && !tr.Done && !tryFailed(tr), tryFailed(tr))
+			row = len(out) - 1
+		} else {
+			out[row].Status = tryStatus(tr)
+			out[row].Note = routing.TryFailure(tr)
+			out[row].Current = r.Active && !tr.Done && !tryFailed(tr)
+			out[row].Failed = tryFailed(tr)
+			if icon := providerIconKey(r, provider, tr); icon != "" && out[row].Icon == "" {
+				out[row].Icon = icon
+			}
+		}
+		if row >= 0 {
+			done := tr.Done
+			failed := tryFailed(tr)
+			out[row].Answered = done && !failed
+			out[row].WentOn = failed && ti+1 < len(r.Tries)
+		}
 	}
 	if len(out) == 0 {
 		provider := r.DisplayProvider()
@@ -904,10 +948,12 @@ type providerNode struct {
 	Failed    bool
 	// Fallback and Rest are actual fields of Magpie's Weighed/Try trace;
 	// they let the stage distinguish fallback members and resting accounts.
-	Fallback bool
-	Rest     bool
-	Answered bool
-	WentOn   bool
+	Fallback  bool
+	Rest      bool
+	RestWhy   string
+	RestUntil time.Time
+	Answered  bool
+	WentOn    bool
 }
 
 func providerOf(model string) string {
