@@ -249,15 +249,6 @@ func (m *Model) replayState(now time.Time) (routing.ReplayTimeline, bool, float6
 	return m.replay.timeline, m.replay.playing, m.replay.speed, m.replay.position, state
 }
 
-// replayPositionAt is the replay cursor at now without committing it to the
-// controller. Painter-only frames use it to keep birds moving at the display
-// cadence while the replay bar and request list rebuild at a much lower rate.
-func (m *Model) replayPositionAt(now time.Time) time.Duration {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.replayPositionAtLocked(now)
-}
-
 func (m *Model) replayPositionAtLocked(now time.Time) time.Duration {
 	position := m.replay.position
 	if !m.replay.playing || m.replay.lastTick.IsZero() {

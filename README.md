@@ -176,7 +176,8 @@ go build -o bin/magpie-native ./cmd/magpie-native
 - 节点列表不再截断到 4 个 Agent / 5 个 Provider；并发升高时压缩节点高度并增高舞台，所有活动飞行都有可见端点。
 - 历史回放的飞行窗口直接由真实 Trace 阶段构建；暂停、重播或直接 Seek 到返回段都从时间轴重建，不依赖之前是否播放过。
 - 飞行动画与静态舞台位于同一原生窗口；动态层只重绘飞鸟、请求圆点和局部反馈，不创建透明子窗口。
-- 动画使用 `Painter.After`：飞行为 60 Hz；等待中的请求圆点与状态只绘制一次，不使用持续帧；暂停回放、空闲、最小化和窗口隐藏时停止请求帧。
+- 飞行与短暂的状态反馈使用 `Painter.AnimationFrame`，跟随显示器刷新出帧，与原版的 `requestAnimationFrame` 一致；等待中的请求圆点与状态只绘制一次，不使用持续帧；Rest 倒计时每秒一帧；暂停回放、空闲、最小化和窗口隐藏时停止请求帧。
+  - 早期版本用 `Painter.After(1/60s)` 定时请求帧。定时器总在刷新稍后到期、再等下一次刷新，2026-10-19 在 60 Hz 内屏上实测只有约 30 fps（帧间隔中位数 33.3 ms）；同一 MyGo 版本下 `AnimationFrame` 实测约 59.5 fps（16.7 ms）。
 - 渲染使用当前帧 `Painter.Now()`，不按固定帧计数推进动画。
 - 静态舞台通过 MyGo 公共 `ui.Render` 按设备像素离屏渲染，再缓存为 `ui.Bitmap`；仅在布局、主题、DPI、静态语义、隐藏账号过渡或 Rest 倒计时整秒变化时重绘。动画帧只采样位图并绘制飞鸟、流动线和局部状态。
 - 静态层与动态层共享一次 Agent / Account / Replay / flight / geometry 解析，不再在每个 retained paint 回调中重复计算同一舞台输入。

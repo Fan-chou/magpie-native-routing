@@ -631,11 +631,3 @@ func prPartTokens(p routing.Prompt, kind string) int {
 	}
 	return 0
 }
-
-func contextStat(c *ui.Context, label, value, detail string, p palette) {
-	ui.Column(c).Gap(3).MinWidth(160).Children(func() {
-		ui.Text(c, label).FontSize(10.5).TextColor(p.Muted)
-		ui.Text(c, value).Bold().FontSize(20).TextColor(p.Text).NoWrap()
-		ui.Text(c, detail).FontSize(11).TextColor(p.Muted).NoWrap()
-	})
-}

@@ -3,7 +3,6 @@ package ui
 import (
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/egoist/mygo/ui"
 
@@ -185,45 +184,4 @@ func themeFor(c *ui.Context, p palette) *ui.Theme {
 	t.Spacing = 4
 	t.FontSize = 13
 	return t
-}
-
-type springValue struct {
-	from  float32
-	to    float32
-	start time.Time
-	dur   time.Duration
-	valid bool
-}
-
-func (s *springValue) value(now time.Time) float32 {
-	if !s.valid {
-		return s.to
-	}
-	if s.dur <= 0 {
-		return s.to
-	}
-	t := float32(now.Sub(s.start)) / float32(s.dur)
-	if t < 0 {
-		return s.from
-	}
-	if t >= 1 {
-		return s.to
-	}
-	// Ease-out cubic, close to Magpie's transform transitions.
-	u := 1 - t
-	return s.from + (s.to-s.from)*(1-u*u*u)
-}
-
-func (s *springValue) set(to float32, now time.Time, dur time.Duration) {
-	if !s.valid || s.to != to {
-		s.from = s.value(now)
-		s.to = to
-		s.start = now
-		s.dur = dur
-		s.valid = true
-	}
-}
-
-func (s *springValue) moving(now time.Time) bool {
-	return s.valid && s.dur > 0 && now.Sub(s.start) < s.dur && s.from != s.to
 }

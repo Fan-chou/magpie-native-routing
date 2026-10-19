@@ -179,12 +179,6 @@ func routeMetricTokens(n int) string {
 	}
 }
 
-func routeCost(rv routing.RouteView) string {
-	// Cost is computed by Magpie's GUI from its private price catalog and
-	// is not part of the public Route or history record. Never invent it.
-	return ""
-}
-
 type routeMetric struct {
 	key, label, value string
 }

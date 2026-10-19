@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"math"
 	"slices"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -148,14 +147,6 @@ type topologyState struct {
 	flightGeometry *flightGeometry
 	reduceMotion   bool
 	layout         topologyFrameLayout
-	// animationCost is a slow estimate of how long one retained-tree
-	// repaint takes. MyGo repaints the whole retained tree for
-	// Painter.After, so spending 60 frames a second on a large history page
-	// can burn CPU even when only a bird moves. The budget keeps the
-	// original cadence when a frame is cheap and lowers it gradually when
-	// the same window cannot paint comfortably.
-	animationCost   time.Duration
-	animationFrames int
 	// staticStage caches the complete non-moving stage (cards, labels,
 	// icons, idle wires) as a device-resolution bitmap. ui.Render draws it
 	// in an independent, correctly scaled view, so the bitmap is safe under
@@ -469,18 +460,6 @@ func (m *Model) contextCardOpen() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.contextOpen
-}
-
-func (m *Model) contextTab() string {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.ctxTab
-}
-
-func (m *Model) setContextTab(tab string) {
-	m.mu.Lock()
-	m.ctxTab = tab
-	m.mu.Unlock()
 }
 
 func (m *Model) contextShowAll() bool {
@@ -851,12 +830,6 @@ func (m *Model) selectedRoute(routes []routing.RouteView) (routing.RouteView, bo
 	return routing.SelectRoute(routes, id)
 }
 
-func (m *Model) selectRoute(id int64) {
-	m.mu.Lock()
-	m.selectedID = id
-	m.mu.Unlock()
-}
-
 func (m *Model) togglePin(id int64) {
 	m.mu.Lock()
 	if m.pinnedID == id {
@@ -867,59 +840,6 @@ func (m *Model) togglePin(id int64) {
 		m.syncListSel = true
 	}
 	m.mu.Unlock()
-}
-
-func (m *Model) visibleAgents(routes []routing.RouteView, live []routing.LiveRequest) []agentNode {
-	var out []agentNode
-	add := func(id, model, folder string, active bool, sessions, requests int) {
-		id = strings.TrimSpace(id)
-		if id == "" {
-			id = "agent"
-		}
-		key := strings.ToLower(id)
-		if i := indexAgent(out, key); i >= 0 {
-			out[i].Active = out[i].Active || active
-			out[i].Requests += requests
-			out[i].Sessions += sessions
-			if out[i].Model == "" {
-				out[i].Model = model
-			}
-			return
-		}
-		out = append(out, agentNode{
-			ID: id, Name: agentName(id), Model: model, Folder: folder, Icon: agentIcon(id),
-			Active: active, Requests: requests, Sessions: sessions, Hue: agentHue(id),
-		})
-	}
-	for _, l := range live {
-		add(l.Agent, l.Model, "", true, 0, 1)
-	}
-	for _, r := range routes {
-		if r.Active {
-			add(r.Agent, r.Model, r.Folder, true, 0, 1)
-			continue
-		}
-		add(r.Agent, r.Model, r.Folder, false, 1, 1)
-	}
-	sort.SliceStable(out, func(i, j int) bool {
-		if out[i].Active != out[j].Active {
-			return out[i].Active
-		}
-		return out[i].Requests > out[j].Requests
-	})
-	if len(out) > 4 {
-		out = out[:4]
-	}
-	return out
-}
-
-func indexAgent(out []agentNode, key string) int {
-	for i := range out {
-		if strings.ToLower(out[i].ID) == key {
-			return i
-		}
-	}
-	return -1
 }
 
 type agentNode struct {
@@ -1210,20 +1130,6 @@ func providerIconKey(r routing.RouteView, provider string, tr routing.Try) strin
 	return ""
 }
 
-func providerMatchesOrder(order []routing.Weighed, provider, model string) bool {
-	for _, w := range order {
-		p := w.Provider
-		if p == "" {
-			p = providerOf(w.Model)
-		}
-		if p != "" && strings.EqualFold(p, provider) &&
-			(model == "" || w.Model == "" || modelMatches(w.Model, model, provider)) {
-			return true
-		}
-	}
-	return false
-}
-
 type providerNode struct {
 	Provider  string
 	Name      string
@@ -1372,43 +1278,6 @@ func shortID(id int64) string {
 	return "#" + itoa(int(id))
 }
 
-func sessionText(s string) string {
-	if strings.TrimSpace(s) == "" {
-		return "—"
-	}
-	if len(s) <= 16 {
-		return s
-	}
-	return s[:8] + "…" + s[len(s)-4:]
-}
-
-func sourceLabels(r routing.RouteView) []string {
-	var out []string
-	if r.Active {
-		out = append(out, "live")
-	}
-	if r.Completeness.SessionTrace {
-		out = append(out, "session")
-	}
-	if r.Completeness.History {
-		out = append(out, "history")
-	}
-	return out
-}
-
-func statusKey(r routing.RouteView) string {
-	switch r.DisplayStatus() {
-	case "active":
-		return "active"
-	case "failed":
-		return "failed"
-	case "completed":
-		return "completed"
-	default:
-		return "observed"
-	}
-}
-
 func selected(loc Localization, key string) string {
 	switch key {
 	case "active":
@@ -1421,14 +1290,4 @@ func selected(loc Localization, key string) string {
 		return loc.T("app.observed")
 	}
 	return key
-}
-
-func elapsedLive(l routing.LiveRequest) int64 {
-	if l.Millis > 0 {
-		return l.Millis
-	}
-	if l.Started.IsZero() {
-		return 0
-	}
-	return time.Since(l.Started).Milliseconds()
 }
